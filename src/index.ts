@@ -260,19 +260,13 @@ async function commandUpstreamActivate(args: string[]): Promise<void> {
     identity: context.identity,
     liveSnapshot,
   });
-  const supportedProof = await saveSupportedProof({
-    stateDir: context.config.stateDir,
-    profile: candidateProfile,
-    profileSha256: activated.receipt.activated.profileSha256,
-    snapshot: liveSnapshot,
-  });
   process.stdout.write(`${JSON.stringify({
     ok: true,
     activatedProfile: activated.receipt.activated,
     previousProfile: activated.receipt.previous,
     backupConfigPath: activated.receipt.backupConfigPath,
     receiptPath: activated.receiptPath,
-    supportedProofPath: supportedProof.path,
+    supportedProofPath: activated.supportedProofPath,
     restartRequired: true,
   }, null, 2)}\n`);
 }

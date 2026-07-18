@@ -2,6 +2,11 @@ import { join } from "node:path";
 import type { ProtocolProfile } from "../protocol/profile.ts";
 import { asSha256, atomicWritePrivate, parseJsonObject } from "../util.ts";
 import type { UpstreamSnapshot } from "./checker.ts";
+import {
+  assertUpstreamStateLock,
+  type UpstreamStateLock,
+  withUpstreamStateLock,
+} from "./state-lock.ts";
 
 export const UPSTREAM_PROOF_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const UPSTREAM_CHECKER_VERSION = 1;
@@ -40,7 +45,7 @@ function assertSnapshotMatchesProfile(snapshot: UpstreamSnapshot, profile: Proto
   }
 }
 
-export async function saveSupportedProof(options: {
+async function saveSupportedProofLocked(options: {
   stateDir: string;
   profile: ProtocolProfile;
   profileSha256: string;
@@ -63,6 +68,23 @@ export async function saveSupportedProof(options: {
   await atomicWritePrivate(path, text);
   await atomicWritePrivate(supportedProofPath(options.stateDir), text);
   return { proof, path };
+}
+
+export async function saveSupportedProof(options: {
+  stateDir: string;
+  profile: ProtocolProfile;
+  profileSha256: string;
+  snapshot: UpstreamSnapshot;
+  now?: number;
+}, lock?: UpstreamStateLock): Promise<{ proof: SupportedUpstreamProof; path: string }> {
+  if (lock) {
+    assertUpstreamStateLock(lock, options.stateDir);
+    return saveSupportedProofLocked(options);
+  }
+  return withUpstreamStateLock(
+    options.stateDir,
+    (heldLock) => saveSupportedProof(options, heldLock),
+  );
 }
 
 export async function requireFreshSupportedProof(options: {

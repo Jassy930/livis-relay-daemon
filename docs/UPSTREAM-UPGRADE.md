@@ -54,9 +54,11 @@ bun run src/index.ts upstream activate \
 
 1. 复制 profile 到 state directory；
 2. 写配置备份；
-3. 原子切换 profile 路径与 SHA pin；
+3. 写新 profile 的 supported proof；
 4. 写审批回执；
-5. 写新 profile 的 supported proof。
+5. 原子切换 profile 路径与 SHA pin，并立即读回验证。
+
+激活、回滚与后台 proof 更新会共用跨进程排他锁；同一 state directory 的两次操作不会交错写配置或撤销对方的 proof。proof、审批回执等前置文件写失败时，live config 保持不变；config 是最后的提交点，所以进程即使在配置原子替换后立即退出，active profile 也已有 proof 与审批回执。若进程在最后提交前被强制终止，可能留下未激活的候选 proof 或回执，仍以 live config 的 profile 与 SHA pin 为准。若 config 已开始切换但读回失败，命令只会在配置仍是本次写入内容时从备份原子恢复旧 config，并再次读回旧 profile 与 SHA pin；如果配置又被其他操作更新，则拒绝覆盖并报告自动恢复失败。失败尝试留下的候选 profile 和配置备份不会成为 active profile。
 
 输出中的 `backupConfigPath` 和 `receiptPath` 必须保留。重启 daemon 后执行：
 
