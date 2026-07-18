@@ -45,6 +45,24 @@ flowchart LR
 - uv 0.11+ 与 Python 3.11–3.13。
 - 本地 Hermes 版本须位于配置中的已审核范围。
 
+### 零基础快速开始
+
+Bun 是本项目使用的 JavaScript/TypeScript 运行时和包管理器，uv 用来管理 Hermes plugin 的 Python 环境。请先从 [Git](https://git-scm.com/downloads)、[Bun](https://bun.sh/docs/installation) 和 [uv](https://docs.astral.sh/uv/getting-started/installation/) 官方安装说明准备这三个工具；项目不提供下载后立即执行的远程安装脚本。
+
+使用 Homebrew 的 macOS 可以先安装 Bun 和 uv：
+
+```bash
+brew install oven-sh/bun/bun uv
+```
+
+确认 `git --version`、`bun --version` 和 `uv --version` 均能正常输出后，复制下面整行即可克隆仓库、按锁文件安装依赖并运行完整自检：
+
+```bash
+git clone https://github.com/Jassy930/livis-relay-daemon.git && cd livis-relay-daemon && bun install --frozen-lockfile && (cd hermes-plugin && uv sync --frozen) && bun run check
+```
+
+这条命令只准备开发环境，不会安装常驻服务，也不会生成连接生产服务所需的 live profile。后续配置步骤见[运行手册](docs/OPERATIONS.md)。
+
 ### 获取与验证
 
 ```bash
