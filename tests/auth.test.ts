@@ -36,7 +36,9 @@ describe("IDaaS OAuth Device Flow", () => {
         expires_in: 60,
         interval: 1,
       }),
-      // LiViS IDaaS production currently uses 428 for the normal pending state.
+      // Preserve the RFC-style 400 path and the HTTP 428 behavior observed
+      // from LiViS IDaaS; the OAuth error value is authoritative in both cases.
+      Response.json({ error: "authorization_pending" }, { status: 400 }),
       Response.json({ error: "authorization_pending" }, { status: 428 }),
       Response.json({
         [profile.oauth.audience]: {
@@ -59,7 +61,7 @@ describe("IDaaS OAuth Device Flow", () => {
     let pending = 0;
     const token = await client.pollForToken(code, { onPending: () => pending += 1 });
     expect(token.accessToken).toBe("access");
-    expect(pending).toBe(1);
+    expect(pending).toBe(2);
     expect((await secrets.get()).refreshToken).toBe("refresh-1");
     expect(await client.getAccessToken(true)).toBe("access-2");
     expect((await secrets.get()).refreshToken).toBe("refresh-2");

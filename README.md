@@ -58,7 +58,7 @@ bun run check
 
 截至 2026-07-18 的本地验收：
 
-- 55 项 Bun 测试通过（含 fake LiViS 端到端、SQLite、UDS connector、Python 跨语言往返、Device Flow 428、更新/回滚、proof 与公开发布门禁）。
+- 57 项 Bun 测试通过（含 fake LiViS 端到端、SQLite、UDS connector、Python 跨语言往返、Device Flow 428、更新/回滚、proof 与公开发布门禁）。
 - 22 项 Hermes plugin pytest 通过，真实 Hermes 0.15.1 package import/runtimeVersion smoke 通过。
 - 使用本地未纳入版本控制的研究 profile，临时目录 `init → upstream check → doctor` 已通过；该 profile 不随公开仓库分发。
 - 状态文件、SQLite、WAL 和 SHM 权限均读回为 `0600`。
