@@ -43,7 +43,9 @@ ping / pong
 
 所有执行消息携带 `jobId + leaseId`。daemon 只接受当前 lease，旧 connector 或迟到结果不能完成新执行。
 
-Hermes `handle_message()` 会在后台完成，lease 必须保持到 `on_processing_complete()`。`send()` 只有收到 daemon 的 `result_stored` 后才向 Hermes 返回成功。
+Hermes 0.18.2 的普通文本 `handle_message()` 会先完成 topic recovery、建立 session guard 并启动后台处理，再返回调用方。因此 job 由 socket reader 建立 job/lease/source 映射并发送 accepted，随后直接等待这一步注册完成，才读取紧邻的 cancel；这样 `/stop` 一定看到原 job 的 active session，而真实结果仍由 Hermes 后台任务生成，reader 可继续处理 ACK/error/ping。`/stop` 取消后台任务时，completion hook 与 connector cancel 路径通过 `jobId + leaseId` 幂等地合并 cancelled 通知。transport session 结束时关闭该代具体 UDS WebSocket 并中断已注册任务；旧 listener 不得清理新一代连接状态。
+
+lease 必须保持到 `on_processing_complete()`；`send()` 只有收到 daemon 的 `result_stored` 后才向 Hermes 返回成功。bridge 设置 `supports_async_delivery=false`，不为当前 turn/job 结束后的后台完成通知保留投递通道。
 
 ## 官方更新分层
 

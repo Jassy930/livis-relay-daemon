@@ -9,6 +9,8 @@ describe("配置与协议 profile", () => {
   test("config.example 与随包 profile 的 SHA pin 一致", async () => {
     const configPath = resolve(import.meta.dir, "..", "config.example.json");
     const loaded = await loadRelayConfig(configPath);
+    expect(loaded.config.hermes.minimumVersion).toBe("0.18.2");
+    expect(loaded.config.hermes.maximumExclusiveVersion).toBe("0.18.3");
     expect((await loadProtocolProfile(
       loaded.config.profile,
       loaded.path,
@@ -64,6 +66,8 @@ describe("配置与协议 profile", () => {
       });
       const loaded = await loadRelayConfig(configPath);
       expect(loaded.config.profile).toStartWith(join(directory.path, "relay", "protocol-profiles"));
+      expect(loaded.config.hermes.minimumVersion).toBe("0.18.2");
+      expect(loaded.config.hermes.maximumExclusiveVersion).toBe("0.18.3");
       expect((await loadProtocolProfile(
         loaded.config.profile,
         loaded.path,

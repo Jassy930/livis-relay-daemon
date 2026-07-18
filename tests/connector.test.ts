@@ -66,8 +66,8 @@ describe("Hermes connector Unix WebSocket", () => {
       resultStoreTimeoutMs: 750,
       maxFrameBytes: 1024 * 1024,
       daemonVersion: "test",
-      hermesMinimumVersion: "0.15.1",
-      hermesMaximumExclusiveVersion: "0.15.2",
+      hermesMinimumVersion: "0.18.2",
+      hermesMaximumExclusiveVersion: "0.18.3",
       bridgeImplementation: "livis-hermes-bridge",
       bridgeMinimumVersion: "0.1.0",
       bridgeMaximumExclusiveVersion: "0.2.0",
@@ -101,7 +101,7 @@ describe("Hermes connector Unix WebSocket", () => {
       protocolVersion: 1,
       connectorId: "hermes-test",
       backend: "hermes",
-      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.15.1" },
+      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.18.2" },
       capabilities: { cancel: true, finalResult: true },
     }));
     const helloAck = await read();
@@ -144,7 +144,7 @@ describe("Hermes connector Unix WebSocket", () => {
       protocolVersion: 99,
       connectorId: "bad",
       backend: "hermes",
-      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.15.1" },
+      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.18.2" },
       capabilities: { cancel: true, finalResult: true },
     }));
     const error = await read();
@@ -166,7 +166,7 @@ describe("Hermes connector Unix WebSocket", () => {
       protocolVersion: 1,
       connectorId: "hermes-reused",
       backend: "hermes",
-      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.15.1" },
+      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.18.2" },
       capabilities: { cancel: true, finalResult: true },
     }));
     expect((await readOld()).type).toBe("hello_ack");
@@ -189,7 +189,7 @@ describe("Hermes connector Unix WebSocket", () => {
       protocolVersion: 1,
       connectorId: "hermes-reused",
       backend: "hermes",
-      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.15.1" },
+      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.18.2" },
       capabilities: { cancel: true, finalResult: true },
     }));
     expect((await readNew()).type).toBe("hello_ack");
@@ -217,7 +217,7 @@ describe("Hermes connector Unix WebSocket", () => {
       protocolVersion: 1,
       connectorId: "old-hermes",
       backend: "hermes",
-      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.14.9" },
+      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.18.1" },
       capabilities: { cancel: true, finalResult: true },
     }));
     expect((await readOld()).code).toBe("hermes_version_unsupported");
@@ -235,7 +235,7 @@ describe("Hermes connector Unix WebSocket", () => {
       protocolVersion: 1,
       connectorId: "future-hermes",
       backend: "hermes",
-      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.15.2" },
+      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.18.3" },
       capabilities: { cancel: true, finalResult: true },
     }));
     expect((await readFuture()).code).toBe("hermes_version_unsupported");
@@ -253,7 +253,7 @@ describe("Hermes connector Unix WebSocket", () => {
       protocolVersion: 1,
       connectorId: "foreign-bridge",
       backend: "hermes",
-      implementation: { name: "another-bridge", version: "0.1.0", runtimeVersion: "0.15.1" },
+      implementation: { name: "another-bridge", version: "0.1.0", runtimeVersion: "0.18.2" },
       capabilities: { cancel: true, finalResult: true },
     }));
     expect((await readForeign()).code).toBe("bridge_implementation_unsupported");
@@ -271,7 +271,7 @@ describe("Hermes connector Unix WebSocket", () => {
       protocolVersion: 1,
       connectorId: "new-hermes",
       backend: "hermes",
-      implementation: { name: "livis-hermes-bridge", version: "0.1.1", runtimeVersion: "0.15.1" },
+      implementation: { name: "livis-hermes-bridge", version: "0.1.1", runtimeVersion: "0.18.2" },
       capabilities: { cancel: true, finalResult: true },
     }));
     expect((await readNew()).type).toBe("hello_ack");

@@ -76,6 +76,7 @@ def test_register_declares_secure_final_only_contract(
     assert isinstance(produced, adapter_module.LivisBridgeAdapter)
     assert produced.platform.value == "livis"
     assert produced.SUPPORTS_MESSAGE_EDITING is False
+    assert produced.supports_async_delivery is False
 
 
 @pytest.mark.parametrize(
@@ -116,6 +117,90 @@ def test_secure_requirements_and_validation_accept_explicit_safe_config(
 
 
 @pytest.mark.asyncio
+async def test_connect_accepts_hermes_018_reconnect_lifecycle_flag(
+    adapter_module,
+    secure_environment,
+    config,
+):
+    adapter = make_adapter(adapter_module, config)
+
+    async def ready_listener():
+        adapter._ready_event.set()
+        await asyncio.Event().wait()
+
+    adapter._listener_loop = ready_listener
+
+    assert await adapter.connect(is_reconnect=True) is True
+    assert adapter.connected is True
+
+    await adapter.disconnect()
+
+    assert adapter.connected is False
+
+
+@pytest.mark.asyncio
+async def test_disconnect_closes_each_socket_before_reconnect(
+    adapter_module,
+    secure_environment,
+    config,
+    monkeypatch,
+):
+    sentinel = object()
+
+    class LoopWebSocket:
+        def __init__(self):
+            self.incoming = asyncio.Queue()
+            self.closed = False
+
+        def feed(self, message):
+            self.incoming.put_nowait(adapter_module.json.dumps(message))
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            message = await self.incoming.get()
+            if message is sentinel:
+                raise StopAsyncIteration
+            return message
+
+        async def send(self, _encoded):
+            return None
+
+        async def close(self):
+            if not self.closed:
+                self.closed = True
+                self.incoming.put_nowait(sentinel)
+
+    first = LoopWebSocket()
+    second = LoopWebSocket()
+    for websocket in (first, second):
+        websocket.feed({
+            "type": "hello_ack",
+            "protocolVersion": 1,
+            "resultStoreTimeoutMs": 5000,
+        })
+    connect = AsyncMock(side_effect=[first, second])
+    monkeypatch.setattr(adapter_module, "_unix_connect", connect)
+    adapter = make_adapter(adapter_module, config)
+
+    assert await adapter.connect() is True
+    assert adapter._ws is first
+    await adapter.disconnect()
+
+    assert first.closed is True
+    assert adapter._ws is None
+
+    assert await adapter.connect(is_reconnect=True) is True
+    assert adapter._ws is second
+    await adapter.disconnect()
+
+    assert second.closed is True
+    assert adapter._ws is None
+    assert connect.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_hello_reports_actual_hermes_runtime_version(
     adapter_module,
     secure_environment,
@@ -123,7 +208,7 @@ async def test_hello_reports_actual_hermes_runtime_version(
     fake_ws,
     monkeypatch,
 ):
-    source_runtime = SimpleNamespace(__version__="0.15.1-source")
+    source_runtime = SimpleNamespace(__version__="0.18.2")
     monkeypatch.setitem(sys.modules, "hermes_cli", source_runtime)
     metadata_version = Mock(side_effect=AssertionError("metadata fallback must not run"))
     monkeypatch.setattr(adapter_module.importlib.metadata, "version", metadata_version)
@@ -141,7 +226,7 @@ async def test_hello_reports_actual_hermes_runtime_version(
             "implementation": {
                 "name": "livis-hermes-bridge",
                 "version": adapter_module.PLUGIN_VERSION,
-                "runtimeVersion": "0.15.1-source",
+                "runtimeVersion": "0.18.2",
             },
             "capabilities": {
                 "cancel": True,
@@ -161,10 +246,10 @@ def test_hermes_version_falls_back_to_distribution_metadata(
     monkeypatch,
 ):
     monkeypatch.delitem(sys.modules, "hermes_cli", raising=False)
-    metadata_version = Mock(return_value="0.15.1-wheel")
+    metadata_version = Mock(return_value="0.18.2")
     monkeypatch.setattr(adapter_module.importlib.metadata, "version", metadata_version)
 
-    assert adapter_module._hermes_version() == "0.15.1-wheel"
+    assert adapter_module._hermes_version() == "0.18.2"
     metadata_version.assert_called_once_with("hermes-agent")
 
 
@@ -214,6 +299,219 @@ async def test_job_preserves_message_job_and_lease_correlation(
     )
     assert result.success is True
     adapter._persist_result.assert_awaited_once_with("job-1", "lease-1", "done")
+
+
+@pytest.mark.asyncio
+async def test_adjacent_job_then_cancel_is_dispatched_in_wire_order(
+    adapter_module,
+    secure_environment,
+    config,
+    fake_ws,
+):
+    adapter = make_adapter(adapter_module, config, fake_ws)
+    job_registered = asyncio.Event()
+    release_background = asyncio.Event()
+    background_tasks = []
+
+    async def process_in_background():
+        await release_background.wait()
+
+    async def handle(event):
+        if event.text == "perform work":
+            # Match Hermes 0.18.2: handle_message may yield for topic recovery,
+            # then establishes the session guard, spawns processing, and returns.
+            await asyncio.sleep(0)
+            job_registered.set()
+            background_tasks.append(asyncio.create_task(process_in_background()))
+        elif event.text == "/stop":
+            assert job_registered.is_set()
+
+    adapter.handle_message = AsyncMock(side_effect=handle)
+    job = {
+        "jobId": "job-1",
+        "leaseId": "lease-1",
+        "messageId": "wire-message-1",
+        "chatId": "livis:trusted-node-1",
+        "text": "perform work",
+        "timestamp": 1_700_000_000_000,
+        "user": {"id": "trusted-node-1", "displayName": "Tester", "trusted": True},
+        "source": {"nodeId": "trusted-node-1", "nodeType": "app"},
+    }
+
+    await adapter._handle_daemon_message({"type": "job", "job": job})
+    assert job_registered.is_set()
+    await adapter._handle_daemon_message({
+        "type": "cancel",
+        "jobId": "job-1",
+        "leaseId": "lease-1",
+    })
+
+    assert [call.args[0].text for call in adapter.handle_message.await_args_list] == [
+        "perform work",
+        "/stop",
+    ]
+    assert fake_ws.sent == [
+        {"type": "accepted", "jobId": "job-1", "leaseId": "lease-1"},
+        {"type": "cancelled", "jobId": "job-1", "leaseId": "lease-1"},
+    ]
+    assert "job-1" in adapter._cancelled_jobs
+    assert release_background.is_set() is False
+
+    release_background.set()
+    await asyncio.gather(*background_tasks)
+
+
+@pytest.mark.asyncio
+async def test_hermes_background_result_does_not_block_result_ack_reader(
+    adapter_module,
+    secure_environment,
+    config,
+    fake_ws,
+):
+    adapter = make_adapter(adapter_module, config, fake_ws)
+    adapter._ready_event.set()
+    background_tasks = []
+
+    async def deliver_result():
+        await adapter._persist_result("job-1", "lease-1", "background result")
+
+    async def handle(_event):
+        # Match Hermes 0.18.2: the public dispatch coroutine returns after it
+        # registers a background task, so the socket reader remains available
+        # to consume the durable-storage ACK that task needs.
+        background_tasks.append(asyncio.create_task(deliver_result()))
+
+    adapter.handle_message = AsyncMock(side_effect=handle)
+    job = {
+        "jobId": "job-1",
+        "leaseId": "lease-1",
+        "chatId": "livis:trusted-node-1",
+        "text": "perform work",
+        "user": {"id": "trusted-node-1", "displayName": "Tester", "trusted": True},
+        "source": {"nodeId": "trusted-node-1", "nodeType": "app"},
+    }
+
+    await adapter._handle_daemon_message({"type": "job", "job": job})
+    for _ in range(10):
+        if "job-1" in adapter._result_waiters:
+            break
+        await asyncio.sleep(0)
+
+    assert "job-1" in adapter._result_waiters
+    assert fake_ws.sent == [
+        {"type": "accepted", "jobId": "job-1", "leaseId": "lease-1"},
+        {
+            "type": "result",
+            "jobId": "job-1",
+            "leaseId": "lease-1",
+            "text": "background result",
+        },
+    ]
+
+    await adapter._handle_daemon_message({
+        "type": "result_stored",
+        "jobId": "job-1",
+        "leaseId": "lease-1",
+    })
+    assert len(background_tasks) == 1
+    await asyncio.wait_for(asyncio.gather(*background_tasks), timeout=0.5)
+
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cancel_signal_is_once_when_processing_hook_runs_during_stop(
+    adapter_module,
+    secure_environment,
+    config,
+    fake_ws,
+):
+    adapter = make_adapter(adapter_module, config, fake_ws)
+    source = SimpleNamespace(chat_id="chat-1", user_id="trusted-node-1")
+    adapter._job_by_message_id["job-1"] = "job-1"
+    adapter._active_job_by_chat["chat-1"] = "job-1"
+    adapter._lease_by_job["job-1"] = "lease-1"
+    adapter._source_by_job["job-1"] = source
+    original_event = adapter_module.MessageEvent(
+        text="perform work",
+        source=source,
+        message_id="job-1",
+    )
+
+    async def handle(event):
+        assert event.text == "/stop"
+        # Hermes cancels the old background task while /stop is in flight. Its
+        # completion hook therefore races the explicit cancel acknowledgement.
+        await adapter.on_processing_complete(
+            original_event,
+            adapter_module.ProcessingOutcome.CANCELLED,
+        )
+
+    adapter.handle_message = AsyncMock(side_effect=handle)
+    await adapter._handle_cancel({
+        "type": "cancel",
+        "jobId": "job-1",
+        "leaseId": "lease-1",
+    })
+
+    assert fake_ws.sent == [
+        {"type": "cancelled", "jobId": "job-1", "leaseId": "lease-1"}
+    ]
+    assert adapter._job_by_message_id == {}
+    assert adapter._active_job_by_chat == {}
+    assert adapter._lease_by_job == {}
+    assert adapter._source_by_job == {}
+    assert adapter._cancelled_notifications == set()
+
+
+@pytest.mark.asyncio
+async def test_transport_drop_retries_cancel_interrupted_during_stop_dispatch(
+    adapter_module,
+    secure_environment,
+    config,
+    fake_ws,
+):
+    adapter = make_adapter(adapter_module, config, fake_ws)
+    source = SimpleNamespace(chat_id="chat-1", user_id="trusted-node-1")
+    adapter._lease_by_job["job-1"] = "lease-1"
+    adapter._source_by_job["job-1"] = source
+    adapter._active_job_by_chat["chat-1"] = "job-1"
+    first_stop_started = asyncio.Event()
+    keep_first_stop_running = asyncio.Event()
+    stop_calls = 0
+
+    async def handle(event):
+        nonlocal stop_calls
+        if event.text == "/stop":
+            stop_calls += 1
+            if stop_calls == 1:
+                first_stop_started.set()
+                await keep_first_stop_running.wait()
+
+    adapter.handle_message = AsyncMock(side_effect=handle)
+    cancel_task = asyncio.create_task(adapter._handle_cancel({
+        "type": "cancel",
+        "jobId": "job-1",
+        "leaseId": "lease-1",
+    }))
+    await first_stop_started.wait()
+
+    cancel_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancel_task
+    interrupted_cancels = adapter._take_interrupted_cancel_jobs()
+    await adapter._interrupt_all_active(
+        "relay IPC disconnected",
+        force_job_ids=interrupted_cancels,
+    )
+
+    assert interrupted_cancels == {"job-1"}
+    assert [call.args[0].text for call in adapter.handle_message.await_args_list] == [
+        "/stop",
+        "/stop",
+    ]
+    assert "job-1" in adapter._cancelled_jobs
+    assert fake_ws.sent == []
 
 
 @pytest.mark.asyncio

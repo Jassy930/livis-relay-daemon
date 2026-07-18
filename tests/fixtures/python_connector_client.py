@@ -58,7 +58,7 @@ async def run(args: argparse.Namespace) -> None:
                     "implementation": {
                         "name": "livis-hermes-bridge",
                         "version": "0.1.0",
-                        "runtimeVersion": "0.15.1",
+                        "runtimeVersion": "0.18.2",
                     },
                     "capabilities": {"cancel": True, "finalResult": True},
                 }

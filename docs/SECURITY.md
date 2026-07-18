@@ -16,7 +16,8 @@
 - `LIVIS_ALLOW_ALL_USERS` 必须为空/false，`LIVIS_ALLOWED_USERS=*` 会被拒绝。
 - `LIVIS_PHASE1_READ_ONLY_ACK=true` 只在专用 Hermes profile 已关闭写工具后设置。
 - Hermes streaming、tool progress、interim message、附件和远程审批全部关闭。
-- Hermes runtime 审核范围默认是 `[0.15.1, 0.15.2)`；bridge 范围是 `[0.1.0, 0.2.0)`。
+- bridge 设置 `supports_async_delivery=false`；一期不承诺 turn 结束后的 background delegation 或进程完成通知。
+- Hermes runtime 审核范围默认是 `[0.18.2, 0.18.3)`；bridge 范围是 `[0.1.0, 0.2.0)`。0.18.2 已通过隔离 `HERMES_HOME` + fake UDS 的有界真实 runtime canary，但该结果不覆盖 LiViS 实网 Relay、真实模型或完整 profile；这些项目完成前不得恢复新 bridge 的生产常驻。
 - 未知版本、哈希、wire protocol 或运行契约变化 fail closed。
 
 ## 本地权限

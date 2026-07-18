@@ -59,10 +59,11 @@ bun run check
 截至 2026-07-18 的本地验收：
 
 - 57 项 Bun 测试通过（含 fake LiViS 端到端、SQLite、UDS connector、Python 跨语言往返、Device Flow 428、更新/回滚、proof 与公开发布门禁）。
-- 22 项 Hermes plugin pytest 通过，真实 Hermes 0.15.1 package import/runtimeVersion smoke 通过。
+- 28 项 Hermes plugin pytest 通过，覆盖 Hermes 0.18.2 重连生命周期签名、旧 socket 关闭、紧邻 `job → cancel` 注册顺序、后台结果 ACK 读取和取消通知幂等；真实 Hermes 0.15.1 package import/runtimeVersion smoke 保留为历史证据。
 - 使用本地未纳入版本控制的研究 profile，临时目录 `init → upstream check → doctor` 已通过；该 profile 不随公开仓库分发。
 - 状态文件、SQLite、WAL 和 SHM 权限均读回为 `0600`。
 - 已使用隔离的 Hermes 0.15.1 profile 完成真实 Device Flow 登录、Agent ID 绑定和 LiViS v2.0.0 消息 canary：入站任务进入 Hermes、模型生成纯文本结果、durable outbox 收到 `ack_send_result` 并进入 `Delivered`。
+- 已在生产主机现有 Hermes 0.18.2 runtime 中，以临时 plugin、隔离 `HERMES_HOME` 和 fake UDS 完成有界 adapter canary：真实 register/create、冷启动 final/ACK、紧邻 cancel 单次通知、旧 socket 关闭及重连 final 均通过，现有服务未停机或改写。该结果不等于 LiViS 实网 Relay、真实模型或完整 profile canary；恢复新 bridge 常驻前仍须补做后者。
 - 首次会话必须先发送 `/sethome`；Hermes 的一次性 home-channel 提示会占用一期协议允许的唯一 final。完整证据、操作顺序和限制见 [`docs/HERMES-CANARY.md`](docs/HERMES-CANARY.md)。
 - 本地 canary 当前以前台进程运行，尚未安装 launchd/systemd 常驻服务；默认 Hermes profile 未被修改。
 

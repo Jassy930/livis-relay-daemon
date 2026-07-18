@@ -98,7 +98,7 @@ bun run src/index.ts connector-token
 
 Hermes 显示配置必须关闭 streaming、tool progress 和 interim assistant messages；工具配置必须为只读，并使用独立工作区。不要在这条远程渠道中启用 manual approval，因为一期没有 approval control lane。
 
-Hermes 0.15.1 建议为 LiViS 使用独立 profile，并在该 profile 的 `config.yaml` 中显式固定：
+Hermes 0.18.2 建议为 LiViS 使用独立 profile，并在该 profile 的 `config.yaml` 中显式固定：
 
 ```yaml
 platform_toolsets:

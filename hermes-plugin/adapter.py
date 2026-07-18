@@ -93,6 +93,7 @@ class LivisBridgeAdapter(BasePlatformAdapter):
     """Hermes platform adapter backed by a local versioned relay daemon."""
 
     SUPPORTS_MESSAGE_EDITING = False
+    supports_async_delivery = False
 
     def __init__(self, config, **_kwargs):
         super().__init__(config=config, platform=Platform("livis"))
@@ -119,13 +120,18 @@ class LivisBridgeAdapter(BasePlatformAdapter):
         self._source_by_job: Dict[str, Any] = {}
         self._final_by_job: Dict[str, str] = {}
         self._cancelled_jobs: set[str] = set()
-        self._background_dispatches: set[asyncio.Task] = set()
+        self._cancelled_notifications: set[tuple[str, str]] = set()
+        self._interrupted_cancel_jobs: set[str] = set()
 
     @property
     def name(self) -> str:
         return "LiViS Relay"
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # Hermes 0.18.2 passes this keyword from both cold-start and reconnect
+        # lifecycle paths. The relay owns replay on its durable daemon side, so
+        # this adapter has no gateway-side queue whose handling depends on it.
+        del is_reconnect
         if not check_requirements():
             self._set_fatal_error(
                 "phase1_config_invalid",
@@ -151,7 +157,12 @@ class LivisBridgeAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         self._running = False
         self._ready_event.clear()
-        await self._interrupt_all_active("adapter disconnect")
+        ws = self._ws
+        if ws:
+            try:
+                await ws.close()
+            except Exception:
+                pass
         if self._listener_task and self._listener_task is not asyncio.current_task():
             self._listener_task.cancel()
             try:
@@ -159,12 +170,12 @@ class LivisBridgeAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._listener_task = None
-        if self._ws:
-            try:
-                await self._ws.close()
-            except Exception:
-                pass
-        self._ws = None
+        await self._interrupt_all_active(
+            "adapter disconnect",
+            force_job_ids=self._take_interrupted_cancel_jobs(),
+        )
+        if self._ws is ws:
+            self._ws = None
         for waiter in self._result_waiters.values():
             if not waiter.done():
                 waiter.set_exception(LocalRelayUnavailable("livis-relayd disconnected"))
@@ -247,7 +258,7 @@ class LivisBridgeAdapter(BasePlatformAdapter):
             if job_id in self._final_by_job:
                 return
             if outcome is ProcessingOutcome.CANCELLED or job_id in self._cancelled_jobs:
-                await self._send_local({"type": "cancelled", "jobId": job_id, "leaseId": lease_id})
+                await self._send_cancelled_once(job_id, lease_id)
                 return
             detail = (
                 "Hermes completed without a final response"
@@ -267,6 +278,7 @@ class LivisBridgeAdapter(BasePlatformAdapter):
     async def _listener_loop(self) -> None:
         backoff = RETRY_INITIAL_SECONDS
         while self._running:
+            ws = None
             try:
                 ws = await _unix_connect(self.socket_path, self.connector_token)
                 self._ws = ws
@@ -288,10 +300,20 @@ class LivisBridgeAdapter(BasePlatformAdapter):
                 if self._running:
                     logger.warning("LiViS relay IPC disconnected: %s", exc)
             finally:
-                self._ready_event.clear()
-                self._ws = None
-                if self._running:
-                    await self._interrupt_all_active("relay IPC disconnected")
+                if ws:
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                owns_session = self._ws is ws
+                if owns_session:
+                    self._ready_event.clear()
+                    self._ws = None
+                    if self._running:
+                        await self._interrupt_all_active(
+                            "relay IPC disconnected",
+                            force_job_ids=self._take_interrupted_cancel_jobs(),
+                        )
             if self._running:
                 await asyncio.sleep(backoff + random.random() * backoff * 0.2)
                 backoff = min(backoff * 2, RETRY_MAX_SECONDS)
@@ -329,9 +351,7 @@ class LivisBridgeAdapter(BasePlatformAdapter):
             self._ready_event.set()
             return
         if message_type == "job":
-            task = asyncio.create_task(self._handle_job(message["job"]))
-            self._background_dispatches.add(task)
-            task.add_done_callback(self._background_dispatches.discard)
+            await self._handle_job(message["job"])
             return
         if message_type == "cancel":
             await self._handle_cancel(message)
@@ -376,6 +396,10 @@ class LivisBridgeAdapter(BasePlatformAdapter):
         self._source_by_job[job_id] = source
         await self._send_local({"type": "accepted", "jobId": job_id, "leaseId": lease_id})
         try:
+            # Hermes 0.18.2 installs the session guard and spawns its background
+            # processing task before this coroutine returns. Awaiting that
+            # registration step keeps a following cancel behind the job while
+            # leaving result delivery in Hermes' background task.
             await self.handle_message(
                 MessageEvent(
                     text=str(job["text"]),
@@ -398,6 +422,11 @@ class LivisBridgeAdapter(BasePlatformAdapter):
                 "retryable": False,
             })
 
+    def _take_interrupted_cancel_jobs(self) -> set[str]:
+        interrupted = set(self._interrupted_cancel_jobs)
+        self._interrupted_cancel_jobs.clear()
+        return interrupted
+
     async def _handle_cancel(self, message: dict) -> None:
         job_id = str(message.get("jobId", ""))
         lease_id = str(message.get("leaseId", ""))
@@ -407,20 +436,44 @@ class LivisBridgeAdapter(BasePlatformAdapter):
         if source is None:
             return
         self._cancelled_jobs.add(job_id)
-        await self.handle_message(
-            MessageEvent(
-                text="/stop",
-                message_type=MessageType.COMMAND,
-                source=source,
-                message_id=f"cancel:{job_id}",
-                raw_message=message,
-                timestamp=datetime.now(tz=timezone.utc),
+        try:
+            await self.handle_message(
+                MessageEvent(
+                    text="/stop",
+                    message_type=MessageType.COMMAND,
+                    source=source,
+                    message_id=f"cancel:{job_id}",
+                    raw_message=message,
+                    timestamp=datetime.now(tz=timezone.utc),
+                )
             )
-        )
-        # This confirms only that /stop was dispatched.  The daemon records
-        # CancelUnknown and quarantines the session until an operator verifies
-        # that non-cooperative tool threads have exited.
-        await self._send_local({"type": "cancelled", "jobId": job_id, "leaseId": lease_id})
+            # This confirms only that /stop was dispatched.  The daemon records
+            # CancelUnknown and quarantines the session until an operator verifies
+            # that non-cooperative tool threads have exited.
+            await self._send_cancelled_once(job_id, lease_id)
+        except asyncio.CancelledError:
+            self._interrupted_cancel_jobs.add(job_id)
+            raise
+
+    async def _send_cancelled_once(self, job_id: str, lease_id: str) -> None:
+        """Emit at most one cancellation signal for the current execution lease."""
+        if self._lease_by_job.get(job_id) != lease_id:
+            return
+        notification = (job_id, lease_id)
+        if notification in self._cancelled_notifications:
+            return
+        self._cancelled_notifications.add(notification)
+        sent = False
+        try:
+            await self._send_local({
+                "type": "cancelled",
+                "jobId": job_id,
+                "leaseId": lease_id,
+            })
+            sent = True
+        finally:
+            if not sent:
+                self._cancelled_notifications.discard(notification)
 
     async def _persist_result(self, job_id: str, lease_id: str, content: str) -> None:
         if not self._ready_event.is_set() or self._ws is None:
@@ -457,10 +510,16 @@ class LivisBridgeAdapter(BasePlatformAdapter):
             raise ValueError("connector frame too large")
         await self._ws.send(encoded)
 
-    async def _interrupt_all_active(self, reason: str) -> None:
+    async def _interrupt_all_active(
+        self,
+        reason: str,
+        *,
+        force_job_ids: Optional[set[str]] = None,
+    ) -> None:
+        forced = force_job_ids or set()
         active = list(self._source_by_job.items())
         for job_id, source in active:
-            if job_id in self._cancelled_jobs:
+            if job_id in self._cancelled_jobs and job_id not in forced:
                 continue
             self._cancelled_jobs.add(job_id)
             try:
@@ -497,6 +556,9 @@ class LivisBridgeAdapter(BasePlatformAdapter):
                 self._active_job_by_chat.pop(chat_id, None)
         self._source_by_job.pop(job_id, None)
         self._lease_by_job.pop(job_id, None)
+        for notification in list(self._cancelled_notifications):
+            if notification[0] == job_id:
+                self._cancelled_notifications.discard(notification)
         self._result_waiters.pop(job_id, None)
         self._final_by_job.pop(job_id, None)
         self._cancelled_jobs.discard(job_id)

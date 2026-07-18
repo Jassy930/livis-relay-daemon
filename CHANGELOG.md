@@ -6,6 +6,11 @@
 
 ### 修复
 
+- Hermes plugin 适配 0.18.2 的 `connect(*, is_reconnect=False)` 生命周期签名，Gateway 重连不再因未知关键字参数失败。
+- listener teardown 捕获并关闭自己持有的具体 UDS WebSocket，只清理同一代连接状态，并在断线后幂等中断已注册任务，避免旧连接残留导致重连 hello 冲突。
+- connector 在完成 job 映射与 accepted 后等待 Hermes 0.18.2 注册会话 guard 和后台处理任务，再读取紧邻的 cancel，避免 `/stop` 抢在原 job 前成为独立 turn；后台结果不会阻塞 socket reader 读取 ACK 与心跳。
+- `/stop` 取消旧后台任务时，Hermes completion hook 与 connector cancel 路径共享按 `jobId + leaseId` 幂等的 cancelled 通知，避免同一取消重复上报。
+- bridge 显式声明不支持 turn 结束后的异步投递，Hermes 不再为一期 job/lease 通道承诺后台任务完成通知。
 - 结果重试不再覆盖旧的投递 ID；首次投递的延迟 ACK 在重试开始后仍能关联原 job。
 - 驱逐失活 connector 后，旧 socket 的延迟 `close` 回调不再误清理复用同一 ID 的新连接。
 - `ack_send_result` 的 `ref_msg_id` 现在会按持久化投递记录回查真实 job，引用投递 `msg_id` 的 ACK 不再丢失。
@@ -17,6 +22,7 @@
 
 ### 变更
 
+- 新初始化配置和公开示例的 Hermes 默认审核范围收紧为 `[0.18.2, 0.18.3)`；0.18.3 及其他未知版本继续失败关闭。
 - `config.connector.resultStoreTimeoutMs` 通过 `hello_ack` 下发给 Hermes plugin，替代 plugin 侧硬编码 5 秒。
 - cancel 竞争获胜后到达的 final/failed 上报改用专用错误码 `cancel_superseded`，plugin 将其按取消成功处理，不再向 Hermes 报告投递失败。
 - upstream 门禁关闭后周期复核继续运行，恢复 `supported` 时自动重连 LiViS relay，不再要求重启进程。
