@@ -401,6 +401,113 @@ describe("RelayClient fake LiViS end-to-end", () => {
     );
   });
 
+  test("重试耗尽后迟到 ACK 可从持久化退避态完成投递", async () => {
+    profile = {
+      ...profile,
+      timing: { ...profile.timing, resultMaxRetries: 1 },
+    };
+    createPendingResult(store, "late-after-failure");
+    const relayClient = createClient(durableHandlers());
+    relayClient.start();
+    const socket = await fakeRelay.handshake(relayClient);
+
+    const first = await fakeRelay.next("send_result");
+    await fakeRelay.next("send_result");
+    await waitFor(
+      () => store.require("late-after-failure").outbox?.status === "AckFailed",
+      1_000,
+      "outbox persistent backoff",
+    );
+    const nextAttemptAt = store.require("late-after-failure").outbox?.nextAttemptAt;
+    expect(nextAttemptAt).toBeNumber();
+    expect(nextAttemptAt!).toBeGreaterThan(Date.now());
+
+    fakeRelay.send(socket, {
+      type: "ack_send_result",
+      metadata: {},
+      payload: { ref_msg_id: first.envelope.metadata?.msg_id },
+    });
+    await waitFor(
+      () => store.require("late-after-failure").outbox?.status === "Delivered",
+      1_000,
+      "late ACK after retry exhaustion",
+    );
+    await Bun.sleep(Math.max(0, nextAttemptAt! - Date.now() + 20));
+    expect(fakeRelay.count("send_result")).toBe(2);
+  });
+
+  test("AckFailed 退避到期后在当前连接自动开启新的重试周期", async () => {
+    profile = {
+      ...profile,
+      timing: { ...profile.timing, resultMaxRetries: 1 },
+    };
+    createPendingResult(store, "online-recovery");
+    const relayClient = createClient(durableHandlers());
+    relayClient.start();
+    const socket = await fakeRelay.handshake(relayClient);
+
+    const first = await fakeRelay.next("send_result");
+    await fakeRelay.next("send_result");
+    await waitFor(
+      () => store.require("online-recovery").outbox?.status === "AckFailed",
+      1_000,
+      "online outbox backoff",
+    );
+    const recovered = await fakeRelay.next("send_result");
+    expect(recovered.envelope.metadata?.job_id).toBe("online-recovery");
+    expect(recovered.envelope.payload?.data).toBe(first.envelope.payload?.data);
+    expect(recovered.envelope.metadata?.msg_id).not.toBe(first.envelope.metadata?.msg_id);
+    expect(store.require("online-recovery").outbox?.retryCount).toBe(0);
+
+    fakeRelay.send(socket, {
+      type: "ack_send_result",
+      metadata: { job_id: "online-recovery" },
+      payload: {},
+    });
+    await waitFor(
+      () => store.require("online-recovery").outbox?.status === "Delivered",
+      1_000,
+      "online recovered result ACK",
+    );
+  });
+
+  test("断线跨过退避期后，重连会恢复 AckFailed 结果", async () => {
+    profile = {
+      ...profile,
+      timing: { ...profile.timing, resultMaxRetries: 1 },
+    };
+    createPendingResult(store, "reconnect-failed");
+    const relayClient = createClient(durableHandlers());
+    relayClient.start();
+    const firstSocket = await fakeRelay.handshake(relayClient);
+
+    const first = await fakeRelay.next("send_result");
+    await fakeRelay.next("send_result");
+    await waitFor(
+      () => store.require("reconnect-failed").outbox?.status === "AckFailed",
+      1_000,
+      "reconnect outbox backoff",
+    );
+    await fakeRelay.disconnect(firstSocket);
+
+    const secondSocket = await fakeRelay.handshake(relayClient, 3_000);
+    const replayed = await fakeRelay.next("send_result");
+    expect(replayed.envelope.metadata?.job_id).toBe("reconnect-failed");
+    expect(replayed.envelope.payload?.data).toBe(first.envelope.payload?.data);
+    expect(replayed.envelope.metadata?.msg_id).not.toBe(first.envelope.metadata?.msg_id);
+
+    fakeRelay.send(secondSocket, {
+      type: "ack_send_result",
+      metadata: { job_id: "reconnect-failed" },
+      payload: {},
+    });
+    await waitFor(
+      () => store.require("reconnect-failed").outbox?.status === "Delivered",
+      1_000,
+      "reconnected failed result ACK",
+    );
+  });
+
   test("cancel-before-message 先持久化意图，后到消息不执行并分别 ACK", async () => {
     let executionCount = 0;
     const relayClient = createClient(durableHandlers((_jobId, inserted) => {

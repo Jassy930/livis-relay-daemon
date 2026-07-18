@@ -73,12 +73,88 @@ describe("durable jobs + outbox", () => {
     store.close();
 
     const legacy = new Database(databasePath);
-    legacy.exec("DROP TABLE outbox_delivery_attempts; PRAGMA user_version=1;");
+    legacy.exec(`
+      DROP INDEX idx_outbox_delivery;
+      DROP TABLE outbox_delivery_attempts;
+      ALTER TABLE outbox DROP COLUMN next_attempt_at;
+      CREATE INDEX idx_outbox_delivery ON outbox(scope_key,status,updated_at);
+      PRAGMA user_version=1;
+    `);
     legacy.close();
 
     store = new JobStore(databasePath, "account:agent");
     expect(store.findJobIdByOutboxMessageId("legacy-result-msg")).toBe("job-migrated");
     expect(store.integrityCheck()).toBe("ok");
+  });
+
+  test("v2 中已失败的 outbox 迁移后立即恢复投递", () => {
+    const databasePath = join(directory.path, "relay.db");
+    store.ingest(incomingJob("legacy-failed"), "session-1");
+    store.markAcked("legacy-failed");
+    store.claimForDispatch("legacy-failed", "connector", "lease-1");
+    store.markRunning("legacy-failed", "connector", "lease-1");
+    store.finishSuccess("legacy-failed", "lease-1", '{"text":"done"}');
+    store.startResultDelivery("legacy-failed", "legacy-failed-msg", false);
+    store.markOutboxAckFailed("legacy-failed", Date.now() + 60_000);
+    store.close();
+
+    const legacy = new Database(databasePath);
+    legacy.exec(`
+      DROP INDEX idx_outbox_delivery;
+      ALTER TABLE outbox DROP COLUMN next_attempt_at;
+      CREATE INDEX idx_outbox_delivery ON outbox(scope_key,status,updated_at);
+      PRAGMA user_version=2;
+    `);
+    legacy.close();
+
+    store = new JobStore(databasePath, "account:agent");
+    const migrated = store.require("legacy-failed").outbox!;
+    expect(migrated.status).toBe("Pending");
+    expect(migrated.retryCount).toBe(0);
+    expect(migrated.nextAttemptAt).toBeNull();
+    expect(store.listPendingOutbox().map((outbox) => outbox.jobId)).toContain("legacy-failed");
+    expect(store.integrityCheck()).toBe("ok");
+  });
+
+  test("AckFailed 是持久化退避态，迟到 ACK 仍可完成投递", () => {
+    store.ingest(incomingJob("delayed-ack"), "session-1");
+    store.markAcked("delayed-ack");
+    store.claimForDispatch("delayed-ack", "connector", "lease-1");
+    store.markRunning("delayed-ack", "connector", "lease-1");
+    store.finishSuccess("delayed-ack", "lease-1", '{"text":"done"}');
+    expect(store.markOutboxDelivered("delayed-ack")?.status).toBe("Pending");
+    store.startResultDelivery("delayed-ack", "result-msg", false);
+    const nextAttemptAt = Date.now() + 60_000;
+    const failed = store.markOutboxAckFailed("delayed-ack", nextAttemptAt)!;
+
+    expect(failed.status).toBe("AckFailed");
+    expect(failed.nextAttemptAt).toBe(nextAttemptAt);
+    expect(store.listPendingOutbox(100, nextAttemptAt - 1)).toHaveLength(0);
+    expect(store.nextOutboxAttemptAt()).toBe(nextAttemptAt);
+    expect(store.markOutboxDelivered("delayed-ack")?.status).toBe("Delivered");
+    expect(store.nextOutboxAttemptAt()).toBeNull();
+  });
+
+  test("重启后到期 AckFailed 从新的重试周期继续", () => {
+    const databasePath = join(directory.path, "relay.db");
+    store.ingest(incomingJob("restart-recovery"), "session-1");
+    store.markAcked("restart-recovery");
+    store.claimForDispatch("restart-recovery", "connector", "lease-1");
+    store.markRunning("restart-recovery", "connector", "lease-1");
+    store.finishSuccess("restart-recovery", "lease-1", '{"text":"done"}');
+    store.startResultDelivery("restart-recovery", "result-msg-1", false);
+    store.startResultDelivery("restart-recovery", "result-msg-2", true);
+    store.markOutboxAckFailed("restart-recovery", Date.now() - 1);
+    store.close();
+
+    store = new JobStore(databasePath, "account:agent");
+    store.recoverAfterRestart();
+    expect(store.listPendingOutbox().map((outbox) => outbox.jobId)).toContain("restart-recovery");
+    const recovered = store.startResultDelivery("restart-recovery", "result-msg-3", false)!;
+    expect(recovered.status).toBe("Delivering");
+    expect(recovered.retryCount).toBe(0);
+    expect(recovered.nextAttemptAt).toBeNull();
+    expect(store.findJobIdByOutboxMessageId("result-msg-1")).toBe("restart-recovery");
   });
 
   test("同 session 单活，不同 session 可并发", () => {

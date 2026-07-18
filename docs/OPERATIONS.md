@@ -144,7 +144,15 @@ bun run src/index.ts doctor --online
 
 替换模板中的绝对路径后再加载服务；daemon 和 Hermes Gateway 必须是两个独立服务。
 
-## 8. Session 隔离恢复
+## 8. 结果 ACK 退避恢复
+
+`status` 中的 `recentJobs[].outboxStatus=AckFailed` 表示结果在本轮 ACK 重试耗尽后进入了持久化退避，`outboxNextAttemptAt` 是下一次尝试的 Unix 毫秒时间。该状态会在到期、重连或重启后自动恢复：
+
+- 不要删除 `relay.db`，也不要重跑 Agent job；至少一次投递会允许结果重复，手工重跑会放大副作用。
+- 退避期间到达的延迟 ACK 会直接将结果收敛为 `Delivered`。
+- 若超过 `outboxNextAttemptAt` 且 relay 已连接后仍长时间没有新投递，运行 `status` 和 `doctor --online` 并保留 daemon 日志；不要直接编辑 SQLite。
+
+## 9. Session 隔离恢复
 
 看到 `CancelUnknown` 后：
 

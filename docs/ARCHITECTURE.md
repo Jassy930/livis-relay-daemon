@@ -20,7 +20,8 @@ Received → Acked → Dispatching → Running → Succeeded | Failed
 
 outbox delivery:
 Pending → Delivering → Delivered
-                    └→ AckFailed
+             └→ AckFailed (backoff) ─到期→ Delivering
+                                      └─迟到 ACK→ Delivered
 ```
 
 `Succeeded` 只表示 Agent final 已持久化；远端完成还要求 outbox 收到 `ack_send_result`。重启时：
@@ -28,6 +29,10 @@ Pending → Delivering → Delivered
 - 未派发 job 可以继续派发。
 - `Dispatching/Running/Cancelling` 属于 ambiguous execution，不自动重跑。
 - 未 ACK 的结果只重发 outbox，每次生成新的 `msg_id`，保留原 `job_id` 和结果内容。
+
+`resultMaxRetries` 只限制一个投递周期内的快速重试。耗尽后 outbox 进入 `AckFailed`，并在 SQLite 中保存 `next_attempt_at`；退避时间按 `resultAckTimeoutMs` 和本周期重试次数指数增长，最长 5 分钟。到期后，当前在线连接、重连或 daemon 重启都会开启新周期；这是持久化退避态，不是死信。
+
+每次投递的 `msg_id` 都持久化在 `outbox_delivery_attempts`。只要结果确实曾投递，引用任一历史 `msg_id` 或原 `job_id` 的迟到 ACK 在 `Pending` / `Delivering` / `AckFailed` 期间都能将它收敛为 `Delivered`；尚未投递过的 `Pending` 结果不接受 ACK。
 
 ## Hermes connector contract
 

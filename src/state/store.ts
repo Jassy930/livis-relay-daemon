@@ -28,6 +28,7 @@ interface JobViewRow {
   result_json: string | null;
   retry_count: number | null;
   last_message_id: string | null;
+  next_attempt_at: number | null;
   outbox_created_at: number | null;
   outbox_updated_at: number | null;
   delivered_at: number | null;
@@ -40,6 +41,7 @@ const JOB_VIEW = `
          o.result_json,
          o.retry_count,
          o.last_message_id,
+         o.next_attempt_at,
          o.created_at AS outbox_created_at,
          o.updated_at AS outbox_updated_at,
          o.delivered_at,
@@ -56,6 +58,7 @@ function rowToJob(row: JobViewRow): StoredJob {
         resultJson: row.result_json,
         retryCount: row.retry_count ?? 0,
         lastMessageId: row.last_message_id,
+        nextAttemptAt: row.next_attempt_at,
         createdAt: row.outbox_created_at ?? row.created_at,
         updatedAt: row.outbox_updated_at ?? row.updated_at,
         deliveredAt: row.delivered_at,
@@ -276,17 +279,40 @@ export class JobStore {
 
   startResultDelivery(jobId: string, messageId: string, retry: boolean): StoredOutbox | null {
     const now = Date.now();
-    const expected: OutboxStatus = retry ? "Delivering" : "Pending";
     let changed = false;
     const transaction = this.database.transaction(() => {
       const result = this.database
-        .query(`UPDATE outbox SET status='Delivering', last_message_id=?, retry_count=retry_count+?, delivered_at=?, updated_at=?
-                WHERE scope_key=? AND job_id=? AND status=?
+        .query(`UPDATE outbox
+                SET status='Delivering',
+                    last_message_id=?,
+                    retry_count=CASE WHEN status='AckFailed' THEN 0 ELSE retry_count+? END,
+                    next_attempt_at=NULL,
+                    delivered_at=?,
+                    updated_at=?
+                WHERE scope_key=? AND job_id=?
+                  AND (
+                    (?=1 AND status='Delivering')
+                    OR
+                    (?=0 AND (
+                      status='Pending'
+                      OR (status='AckFailed' AND next_attempt_at IS NOT NULL AND next_attempt_at<=?)
+                    ))
+                  )
                   AND EXISTS (
                     SELECT 1 FROM jobs
                     WHERE jobs.scope_key=outbox.scope_key AND jobs.job_id=outbox.job_id AND cancel_requested=0
                   )`)
-        .run(messageId, retry ? 1 : 0, now, now, this.scopeKey, jobId, expected);
+        .run(
+          messageId,
+          retry ? 1 : 0,
+          now,
+          now,
+          this.scopeKey,
+          jobId,
+          retry ? 1 : 0,
+          retry ? 1 : 0,
+          now,
+        );
       changed = result.changes === 1;
       if (changed) {
         this.database
@@ -301,7 +327,7 @@ export class JobStore {
 
   resetOutboxPending(jobId: string): StoredOutbox | null {
     this.database
-      .query("UPDATE outbox SET status='Pending', updated_at=? WHERE scope_key=? AND job_id=? AND status='Delivering'")
+      .query("UPDATE outbox SET status='Pending', next_attempt_at=NULL, updated_at=? WHERE scope_key=? AND job_id=? AND status='Delivering'")
       .run(Date.now(), this.scopeKey, jobId);
     return this.require(jobId).outbox;
   }
@@ -309,7 +335,13 @@ export class JobStore {
   markOutboxDelivered(jobId: string): StoredOutbox | null {
     const now = Date.now();
     this.database
-      .query("UPDATE outbox SET status='Delivered', acked_at=?, updated_at=? WHERE scope_key=? AND job_id=? AND status='Delivering'")
+      .query(`UPDATE outbox
+              SET status='Delivered', next_attempt_at=NULL, acked_at=?, updated_at=?
+              WHERE scope_key=? AND job_id=? AND status IN ('Pending','Delivering','AckFailed')
+                AND EXISTS (
+                  SELECT 1 FROM outbox_delivery_attempts attempts
+                  WHERE attempts.scope_key=outbox.scope_key AND attempts.job_id=outbox.job_id
+                )`)
       .run(now, now, this.scopeKey, jobId);
     return this.get(jobId)?.outbox ?? null;
   }
@@ -323,10 +355,10 @@ export class JobStore {
     return row?.job_id ?? null;
   }
 
-  markOutboxAckFailed(jobId: string): StoredOutbox | null {
+  markOutboxAckFailed(jobId: string, nextAttemptAt: number): StoredOutbox | null {
     this.database
-      .query("UPDATE outbox SET status='AckFailed', updated_at=? WHERE scope_key=? AND job_id=? AND status='Delivering'")
-      .run(Date.now(), this.scopeKey, jobId);
+      .query("UPDATE outbox SET status='AckFailed', next_attempt_at=?, updated_at=? WHERE scope_key=? AND job_id=? AND status='Delivering'")
+      .run(nextAttemptAt, Date.now(), this.scopeKey, jobId);
     return this.require(jobId).outbox;
   }
 
@@ -406,14 +438,27 @@ export class JobStore {
       .map(rowToJob);
   }
 
-  listPendingOutbox(limit = 100): StoredOutbox[] {
+  listPendingOutbox(limit = 100, now = Date.now()): StoredOutbox[] {
     return this.database
-      .query<JobViewRow, [string, number]>(`${JOB_VIEW}
-        WHERE j.scope_key=? AND o.status='Pending' AND j.cancel_requested=0
-        ORDER BY o.updated_at ASC LIMIT ?`)
-      .all(this.scopeKey, limit)
+      .query<JobViewRow, [string, number, number]>(`${JOB_VIEW}
+        WHERE j.scope_key=? AND j.cancel_requested=0
+          AND (o.status='Pending' OR (o.status='AckFailed' AND o.next_attempt_at IS NOT NULL AND o.next_attempt_at<=?))
+        ORDER BY CASE WHEN o.status='Pending' THEN o.updated_at ELSE o.next_attempt_at END ASC LIMIT ?`)
+      .all(this.scopeKey, now, limit)
       .map(rowToJob)
       .flatMap((job) => (job.outbox ? [job.outbox] : []));
+  }
+
+  nextOutboxAttemptAt(): number | null {
+    const row = this.database
+      .query<{ next_attempt_at: number | null }, [string]>(`
+        SELECT MIN(o.next_attempt_at) AS next_attempt_at
+        FROM outbox o
+        JOIN jobs j ON j.scope_key=o.scope_key AND j.job_id=o.job_id
+        WHERE o.scope_key=? AND o.status='AckFailed' AND o.next_attempt_at IS NOT NULL AND j.cancel_requested=0
+      `)
+      .get(this.scopeKey);
+    return row?.next_attempt_at ?? null;
   }
 
   listRecent(limit = 50): StoredJob[] {
@@ -488,15 +533,16 @@ export class JobStore {
 
   private migrate(): void {
     const row = this.database.query<{ user_version: number }, []>("PRAGMA user_version").get();
-    const version = row?.user_version ?? 0;
-    if (version !== 0 && version !== 1 && version !== 2) {
+    let version = row?.user_version ?? 0;
+    if (version !== 0 && version !== 1 && version !== 2 && version !== 3) {
       throw new Error(`不支持的数据库 schema 版本：${version}`);
     }
-    if (version === 2) {
+    if (version === 3) {
       return;
     }
     if (version === 1) {
       this.database.exec(`
+        BEGIN IMMEDIATE;
         CREATE TABLE outbox_delivery_attempts (
           scope_key TEXT NOT NULL,
           message_id TEXT NOT NULL,
@@ -509,6 +555,19 @@ export class JobStore {
           SELECT scope_key,last_message_id,job_id,updated_at FROM outbox WHERE last_message_id IS NOT NULL;
         CREATE INDEX idx_outbox_attempt_job ON outbox_delivery_attempts(scope_key,job_id);
         PRAGMA user_version=2;
+        COMMIT;
+      `);
+      version = 2;
+    }
+    if (version === 2) {
+      this.database.exec(`
+        BEGIN IMMEDIATE;
+        ALTER TABLE outbox ADD COLUMN next_attempt_at INTEGER;
+        UPDATE outbox SET status='Pending', retry_count=0 WHERE status='AckFailed';
+        DROP INDEX idx_outbox_delivery;
+        CREATE INDEX idx_outbox_delivery ON outbox(scope_key,status,next_attempt_at,updated_at);
+        PRAGMA user_version=3;
+        COMMIT;
       `);
       return;
     }
@@ -546,6 +605,7 @@ export class JobStore {
         result_json TEXT NOT NULL,
         retry_count INTEGER NOT NULL DEFAULT 0,
         last_message_id TEXT,
+        next_attempt_at INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         delivered_at INTEGER,
@@ -576,9 +636,9 @@ export class JobStore {
       );
       CREATE INDEX idx_jobs_dispatch ON jobs(scope_key,status,cancel_requested,session_key,created_at);
       CREATE INDEX idx_jobs_connector ON jobs(scope_key,connector_id,status);
-      CREATE INDEX idx_outbox_delivery ON outbox(scope_key,status,updated_at);
+      CREATE INDEX idx_outbox_delivery ON outbox(scope_key,status,next_attempt_at,updated_at);
       CREATE INDEX idx_outbox_attempt_job ON outbox_delivery_attempts(scope_key,job_id);
-      PRAGMA user_version=2;
+      PRAGMA user_version=3;
     `);
   }
 }

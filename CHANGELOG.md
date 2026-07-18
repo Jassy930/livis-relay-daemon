@@ -6,6 +6,7 @@
 
 ### 修复
 
+- 结果 ACK 重试耗尽后改为持久化退避并自动恢复；重启、重连不再遗留永久 `AckFailed`，退避期间的迟到 ACK 仍可完成投递。
 - 结果重试不再覆盖旧的投递 ID；首次投递的延迟 ACK 在重试开始后仍能关联原 job。
 - 驱逐失活 connector 后，旧 socket 的延迟 `close` 回调不再误清理复用同一 ID 的新连接。
 - `ack_send_result` 的 `ref_msg_id` 现在会按持久化投递记录回查真实 job，引用投递 `msg_id` 的 ACK 不再丢失。
