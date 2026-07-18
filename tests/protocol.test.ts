@@ -3,6 +3,7 @@ import {
   buildAckEnvelope,
   buildConnectEnvelope,
   buildResultEnvelope,
+  buildTokenRefreshEnvelope,
   parseIncomingRelayJob,
   parseRelayEnvelope,
   resultAckCandidates,
@@ -48,10 +49,19 @@ describe("LiViS wire protocol", () => {
       deviceId: "pc-device",
       nodeName: "电脑",
       accessToken: "access",
-      refreshToken: "refresh",
     });
     expect(connect.payload?.client).toBe(profile.wireIdentity.client);
     expect(connect.payload?.node_desc).toContain("personal-device");
+    expect(connect.payload?.token).toBe("access");
+    expect(connect.payload).not.toHaveProperty("refresh_token");
+    const tokenRefresh = buildTokenRefreshEnvelope({
+      profile,
+      agentId: "test-agent-id",
+      deviceId: "pc-device",
+      accessToken: "access-next",
+    });
+    expect(tokenRefresh.payload?.token).toBe("access-next");
+    expect(tokenRefresh.payload).not.toHaveProperty("refresh_token");
     const ack = buildAckEnvelope(profile, "ack_send_message", "job", "agent", "device");
     expect(ack.metadata?.job_id).toBe("job");
     expect(ack.payload?.nodeType).toBe("personal-device");

@@ -16,7 +16,6 @@ import {
 } from "../protocol/livis.ts";
 import type { IdaasClient } from "../auth/idaas.ts";
 import { TerminalAuthError } from "../auth/idaas.ts";
-import type { SecretStore } from "../secrets.ts";
 import type { JobStore } from "../state/store.ts";
 import type { RelayEnvelope } from "../types.ts";
 import { delay, withJitter } from "../util.ts";
@@ -44,7 +43,6 @@ export class RelayClient {
     private readonly config: RelayConfig,
     private readonly profile: ProtocolProfile,
     private readonly identity: RelayIdentity,
-    private readonly secrets: SecretStore,
     private readonly auth: IdaasClient,
     private readonly store: JobStore,
     private readonly handlers: RelayClientHandlers,
@@ -118,10 +116,6 @@ export class RelayClient {
 
   private async connectOnce(): Promise<void> {
     const accessToken = await this.auth.getAccessToken();
-    const currentSecrets = await this.secrets.get();
-    if (!currentSecrets.refreshToken) {
-      throw new TerminalAuthError("缺少 refresh token");
-    }
     const url = new URL(this.profile.endpoints.relayWebSocketUrl);
     url.searchParams.set("protocol_version", String(this.profile.wireProtocolVersion));
     const socket = new WebSocket(url);
@@ -160,7 +154,6 @@ export class RelayClient {
         deviceId: this.identity.deviceId,
         nodeName: this.config.relay.nodeName,
         accessToken,
-        refreshToken: currentSecrets.refreshToken!,
       });
       socket.send(JSON.stringify(envelope));
     });
@@ -287,16 +280,11 @@ export class RelayClient {
   private async refreshRelayToken(): Promise<void> {
     try {
       const accessToken = await this.auth.getAccessToken(true);
-      const currentSecrets = await this.secrets.get();
-      if (!currentSecrets.refreshToken) {
-        throw new TerminalAuthError("刷新后缺少 refresh token");
-      }
       this.send(buildTokenRefreshEnvelope({
         profile: this.profile,
         agentId: this.identity.agentId,
         deviceId: this.identity.deviceId,
         accessToken,
-        refreshToken: currentSecrets.refreshToken,
       }));
       this.stopTokenRefreshTimer();
       this.tokenRefreshTimer = setTimeout(() => {

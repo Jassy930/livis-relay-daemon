@@ -75,9 +75,8 @@ export function buildConnectEnvelope(input: {
   deviceId: string;
   nodeName: string;
   accessToken: string;
-  refreshToken: string;
 }): RelayEnvelope {
-  const { profile, agentId, deviceId, nodeName, accessToken, refreshToken } = input;
+  const { profile, agentId, deviceId, nodeName, accessToken } = input;
   return {
     type: "connect",
     metadata: {
@@ -92,7 +91,6 @@ export function buildConnectEnvelope(input: {
       node_desc: `${profile.wireIdentity.nodeType} ${nodeName}`,
       client: profile.wireIdentity.client,
       token: accessToken,
-      refresh_token: refreshToken,
     },
   };
 }
@@ -162,14 +160,12 @@ export function buildTokenRefreshEnvelope(input: {
   agentId: string;
   deviceId: string;
   accessToken: string;
-  refreshToken: string;
 }): RelayEnvelope {
   return withWireIdentity(input.profile, {
     type: "token_refresh",
     metadata: metadata("", input.agentId, input.deviceId),
     payload: {
       token: input.accessToken,
-      refresh_token: input.refreshToken,
     },
   });
 }

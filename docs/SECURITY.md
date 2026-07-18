@@ -24,7 +24,8 @@
 - state directory：`0700`。
 - connector socket、配置、身份、secret、proof、candidate 与审批回执：`0600`。
 - connector 使用至少 32 字节随机 Bearer token，并做常量时间比较。
-- refresh token 只由 daemon 持有，不进入 SQLite、argv 或普通日志。
+- refresh token 只保存在 daemon state directory，并仅由 IDaaS client 用于 `/token`、`/revoke`；不进入 Relay `connect` / `token_refresh` 帧、SQLite、argv 或普通日志。
+- Relay 只接收短期 access token。该最小权限帧与官方 v2.0.0 客户端的已观察字段不同；静态客户端源码没有证明 Relay 要求 refresh token，但本项目尚未用真实 Relay 验证省略字段后的握手与在线刷新兼容性。合入正式版本前必须完成非生产 canary，失败时保持 fail closed。
 - 一期不读取或发送文件，因此没有远程文件上传路径。
 
 ## Upstream 门禁
