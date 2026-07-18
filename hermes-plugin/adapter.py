@@ -35,10 +35,15 @@ PLUGIN_VERSION = "0.1.0"
 MAX_FRAME_BYTES = 1024 * 1024
 RETRY_INITIAL_SECONDS = 1.0
 RETRY_MAX_SECONDS = 30.0
+DEFAULT_RESULT_STORE_TIMEOUT_SECONDS = 5.0
 
 
 class LocalRelayUnavailable(RuntimeError):
     """Raised when the daemon didn't durably acknowledge a connector result."""
+
+
+class ResultSupersededByCancel(RuntimeError):
+    """Raised when the daemon dropped a final result because cancel already won."""
 
 
 def _truthy(value: str | None) -> bool:
@@ -105,6 +110,7 @@ class LivisBridgeAdapter(BasePlatformAdapter):
         self._listener_task: Optional[asyncio.Task] = None
         self._ready_event = asyncio.Event()
         self._running = False
+        self._result_store_timeout = DEFAULT_RESULT_STORE_TIMEOUT_SECONDS
         self._send_lock = asyncio.Lock()
         self._result_waiters: Dict[str, asyncio.Future] = {}
         self._job_by_message_id: Dict[str, str] = {}
@@ -192,6 +198,13 @@ class LivisBridgeAdapter(BasePlatformAdapter):
         self._final_by_job[job_id] = content
         try:
             await self._persist_result(job_id, lease_id, content)
+        except ResultSupersededByCancel:
+            # The daemon-side cancel won the race before this final arrived.
+            # Mirror the local cancel path: report success so Hermes doesn't
+            # retry a result that will never be delivered.
+            self._cancelled_jobs.add(job_id)
+            self._cleanup_completed(job_id, chat_id)
+            return SendResult(success=True, message_id=f"cancelled:{job_id}")
         except LocalRelayUnavailable as exc:
             return SendResult(success=False, error=str(exc), retryable=True)
         self._cleanup_completed(job_id, chat_id)
@@ -310,6 +323,9 @@ class LivisBridgeAdapter(BasePlatformAdapter):
         if message_type == "hello_ack":
             if message.get("protocolVersion") != CONNECTOR_PROTOCOL_VERSION:
                 raise ValueError("daemon connector protocol mismatch")
+            timeout_ms = message.get("resultStoreTimeoutMs")
+            if isinstance(timeout_ms, (int, float)) and timeout_ms > 0:
+                self._result_store_timeout = float(timeout_ms) / 1000.0
             self._ready_event.set()
             return
         if message_type == "job":
@@ -329,7 +345,11 @@ class LivisBridgeAdapter(BasePlatformAdapter):
             job_id = str(message.get("jobId", ""))
             waiter = self._result_waiters.get(job_id)
             if waiter and not waiter.done():
-                waiter.set_exception(LocalRelayUnavailable(str(message.get("message", "daemon rejected result"))))
+                detail = str(message.get("message", "daemon rejected result"))
+                if message.get("code") == "cancel_superseded":
+                    waiter.set_exception(ResultSupersededByCancel(detail))
+                else:
+                    waiter.set_exception(LocalRelayUnavailable(detail))
             return
         if message_type == "ping":
             await self._send_local({"type": "pong", "timestamp": message.get("timestamp")})
@@ -418,7 +438,9 @@ class LivisBridgeAdapter(BasePlatformAdapter):
                 "text": content,
             })
         try:
-            acknowledged_lease = await asyncio.wait_for(asyncio.shield(waiter), timeout=5.0)
+            acknowledged_lease = await asyncio.wait_for(
+                asyncio.shield(waiter), timeout=self._result_store_timeout
+            )
         except asyncio.TimeoutError as exc:
             raise LocalRelayUnavailable("livis-relayd didn't acknowledge durable result storage") from exc
         finally:

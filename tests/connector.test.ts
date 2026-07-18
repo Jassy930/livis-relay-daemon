@@ -63,6 +63,7 @@ describe("Hermes connector Unix WebSocket", () => {
       socketPath: join(directory.path, "connector.sock"),
       connectorToken: token,
       helloTimeoutMs: 1000,
+      resultStoreTimeoutMs: 750,
       maxFrameBytes: 1024 * 1024,
       daemonVersion: "test",
       hermesMinimumVersion: "0.15.1",
@@ -103,7 +104,9 @@ describe("Hermes connector Unix WebSocket", () => {
       implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.15.1" },
       capabilities: { cancel: true, finalResult: true },
     }));
-    expect((await read()).type).toBe("hello_ack");
+    const helloAck = await read();
+    expect(helloAck.type).toBe("hello_ack");
+    expect(helloAck.resultStoreTimeoutMs).toBe(750);
     await Bun.sleep(5);
     expect(server.ready).toBeTrue();
     expect(events[0]).toEqual({ type: "ready", jobId: "hermes-test" });

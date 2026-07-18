@@ -151,15 +151,19 @@ export class IdaasClient {
     const response = await this.postForm("/token", {
       grant_type: "refresh_token",
       refresh_token: currentSecrets.refreshToken,
+      client_id: this.profile.oauth.clientId,
     });
     const data = await responseJson(response, "IDaaS refresh /token");
-    if (response.status === 401) {
+    // refresh token 失效的信号以 OAuth error 值为准（invalid_grant 常见于
+    // HTTP 400），只认 401 会让 daemon 拿着死 token 无限重连而不提示重新登录。
+    const oauthError = typeof data.error === "string" ? data.error : null;
+    if (response.status === 401 || oauthError === "invalid_grant") {
       await this.secrets.clearRefreshToken();
       this.accessToken = null;
       throw new TerminalAuthError("refresh token 已失效，请重新登录");
     }
     if (!response.ok) {
-      throw new Error(`刷新 access token 失败：HTTP ${response.status}`);
+      throw new Error(`刷新 access token 失败：${oauthError ?? `HTTP ${response.status}`}`);
     }
     const tokenSet = tokenSetFromResponse(data, this.profile.oauth.audience);
     await this.acceptTokenSet(tokenSet, currentSecrets.refreshToken);

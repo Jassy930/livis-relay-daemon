@@ -43,7 +43,10 @@ describe("durable jobs + outbox", () => {
     expect(completed.outbox?.status).toBe("Pending");
     expect(store.startResultDelivery("job-1", "result-msg-1", false)?.retryCount).toBe(0);
     expect(store.startResultDelivery("job-1", "result-msg-2", true)?.retryCount).toBe(1);
+    expect(store.findJobIdByOutboxMessageId("result-msg-2")).toBe("job-1");
+    expect(store.findJobIdByOutboxMessageId("unknown-msg")).toBeNull();
     expect(store.markOutboxDelivered("job-1")?.status).toBe("Delivered");
+    expect(store.markOutboxDelivered("no-such-job")).toBeNull();
     expect(store.integrityCheck()).toBe("ok");
   });
 
