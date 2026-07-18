@@ -265,6 +265,29 @@ export class RelayDaemon {
       this.connector.rejectJobMessage(message.jobId, "stale_lease", "failed 使用了失效 lease");
       return;
     }
+    if (message.notStarted === true) {
+      const userMessage = "Hermes 暂时无法完成该请求，请稍后重试。";
+      const job = this.store.finishPrestartFailure(
+        message.jobId,
+        message.leaseId,
+        serializeResult(userMessage),
+        message.error,
+      );
+      if (job.status !== "Failed" && job.status !== "Cancelled") {
+        this.connector.rejectJobMessage(
+          message.jobId,
+          "invalid_not_started_state",
+          "notStarted failure 与当前 job 状态不一致",
+        );
+        return;
+      }
+      this.connector.acknowledgeResult(message.jobId, message.leaseId);
+      if (job.outbox) {
+        await this.relay.notifyOutboxPending();
+      }
+      await this.dispatchPending();
+      return;
+    }
     if (before.cancelRequested) {
       this.connector.rejectJobMessage(message.jobId, "cancel_superseded", "cancel 已获胜，failed 上报被丢弃");
       return;

@@ -133,8 +133,11 @@ export class JobStore {
     const now = Date.now();
     const transaction = this.database.transaction(() => {
       this.database.query(`
-        INSERT OR IGNORE INTO session_quarantine(scope_key,session_key,reason,created_at)
-        SELECT scope_key,session_key,'daemon restarted during active execution',?
+        INSERT OR IGNORE INTO session_quarantine(
+          scope_key,session_key,job_id,lease_id,reason,created_at
+        )
+        SELECT scope_key,session_key,job_id,COALESCE(lease_id,''),
+               'daemon restarted during active execution',?
         FROM jobs
         WHERE scope_key=? AND status IN ('Dispatching','Running','Cancelling')
       `).run(now, this.scopeKey);
@@ -260,6 +263,66 @@ export class JobStore {
     return this.finishWithOutbox(jobId, leaseId, "Failed", resultJson, error);
   }
 
+  finishPrestartFailure(jobId: string, leaseId: string, resultJson: string, error: string): StoredJob {
+    const now = Date.now();
+    const transaction = this.database.transaction(() => {
+      const current = this.require(jobId);
+      if (current.leaseId !== leaseId) return;
+      const reconcilesAmbiguousDisconnect = ["Interrupted", "CancelUnknown"].includes(
+        current.status,
+      );
+      let settled = false;
+      if (
+        // accepted marks the durable lease Running before the adapter invokes
+        // Hermes. A verified notStarted proof can therefore legitimately arrive
+        // from that narrow accepted-to-dispatch drain window.
+        ["Dispatching", "Running", "Interrupted"].includes(current.status) &&
+        !current.cancelRequested
+      ) {
+        const result = this.database
+          .query(`UPDATE jobs SET status='Failed', error=?, completed_at=?, updated_at=?
+                  WHERE scope_key=? AND job_id=? AND lease_id=?
+                    AND status IN ('Dispatching','Running','Interrupted')
+                    AND cancel_requested=0`)
+          .run(error, now, now, this.scopeKey, jobId, leaseId);
+        if (result.changes === 1) {
+          this.upsertOutbox(jobId, resultJson, now);
+          settled = true;
+        }
+      } else if (
+        ["Cancelling", "CancelUnknown", "Interrupted", "Cancelled"].includes(current.status) &&
+        current.cancelRequested
+      ) {
+        const result = this.database
+          .query(`UPDATE jobs SET status='Cancelled', error=?, completed_at=?, updated_at=?
+                  WHERE scope_key=? AND job_id=? AND lease_id=?
+                    AND status IN ('Cancelling','CancelUnknown','Interrupted','Cancelled')
+                    AND cancel_requested=1`)
+          .run(error, now, now, this.scopeKey, jobId, leaseId);
+        settled = result.changes === 1;
+      } else if (
+        (current.status === "Failed" && !current.cancelRequested) ||
+        (current.status === "Cancelled" && current.cancelRequested)
+      ) {
+        settled = true;
+      }
+      if (settled && reconcilesAmbiguousDisconnect) {
+        // Disconnect/restart conservatively quarantines Dispatching and
+        // Cancelling jobs before it can know whether a final frame was in
+        // flight. A retained notStarted proof may remove only the quarantine
+        // row created by this exact job and execution lease. Historical jobs
+        // from a manually released quarantine cannot poison a later lease, and
+        // an old terminal proof cannot release a newer real execution.
+        this.database
+          .query(`DELETE FROM session_quarantine
+                  WHERE scope_key=? AND session_key=? AND job_id=? AND lease_id=?`)
+          .run(this.scopeKey, current.sessionKey, jobId, leaseId);
+      }
+    });
+    transaction.immediate();
+    return this.require(jobId);
+  }
+
   reject(jobId: string, resultJson: string, reason: string): StoredJob {
     const now = Date.now();
     const transaction = this.database.transaction(() => {
@@ -331,22 +394,62 @@ export class JobStore {
   }
 
   requestCancel(jobId: string): StoredJob | null {
-    const current = this.get(jobId);
-    if (!current) {
-      this.database
-        .query("INSERT OR IGNORE INTO pending_cancels(scope_key,job_id,created_at) VALUES(?,?,?)")
-        .run(this.scopeKey, jobId, Date.now());
-      return null;
-    }
-    if (["Succeeded", "Failed", "Rejected", "Cancelled", "CancelUnknown"].includes(current.status)) {
-      return current;
-    }
     const now = Date.now();
-    const nextStatus: JobStatus = ["Dispatching", "Running"].includes(current.status) ? "Cancelling" : "Cancelled";
-    this.database
-      .query("UPDATE jobs SET cancel_requested=1, status=?, completed_at=CASE WHEN ?='Cancelled' THEN ? ELSE completed_at END, updated_at=? WHERE scope_key=? AND job_id=?")
-      .run(nextStatus, nextStatus, now, now, this.scopeKey, jobId);
-    return this.require(jobId);
+    const transaction = this.database.transaction(() => {
+      // Cancel may arrive before the job. Keep the intent insert and state
+      // transition in one IMMEDIATE transaction so another process cannot
+      // insert/dispatch between a negative lookup and the durable intent.
+      this.database
+        .query(`INSERT OR IGNORE INTO pending_cancels(scope_key,job_id,created_at)
+                SELECT ?,?,?
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM jobs WHERE scope_key=? AND job_id=?
+                )`)
+        .run(this.scopeKey, jobId, now, this.scopeKey, jobId);
+
+      // Interrupted is already ambiguous. Only this exact transition may create
+      // a new quarantine row; a later duplicate cancel must not resurrect a row
+      // that an operator explicitly released.
+      const interrupted = this.database
+        .query(`UPDATE jobs
+                SET status='CancelUnknown', cancel_requested=1,
+                    error=COALESCE(error, 'cancel requested after interrupted execution'),
+                    completed_at=COALESCE(completed_at, ?), updated_at=?
+                WHERE scope_key=? AND job_id=? AND status='Interrupted'`)
+        .run(now, now, this.scopeKey, jobId);
+      if (interrupted.changes === 1) {
+        this.database
+          .query(`INSERT OR IGNORE INTO session_quarantine(
+                    scope_key,session_key,job_id,lease_id,reason,created_at
+                  )
+                  SELECT scope_key,session_key,job_id,COALESCE(lease_id,''),
+                         'cancel requested after interrupted execution',?
+                  FROM jobs
+                  WHERE scope_key=? AND job_id=?
+                    AND quarantine_released_at IS NULL`)
+          .run(now, this.scopeKey, jobId);
+      }
+
+      // Repeated cancel while /stop is unresolved does not match this UPDATE,
+      // so it remains Cancelling and the daemon resends the same lease.
+      this.database
+        .query(`UPDATE jobs
+                SET cancel_requested=1,
+                    status=CASE
+                      WHEN status IN ('Dispatching','Running') THEN 'Cancelling'
+                      ELSE 'Cancelled'
+                    END,
+                    completed_at=CASE
+                      WHEN status IN ('Received','Acked') THEN ?
+                      ELSE completed_at
+                    END,
+                    updated_at=?
+                WHERE scope_key=? AND job_id=?
+                  AND status IN ('Received','Acked','Dispatching','Running')`)
+        .run(now, now, this.scopeKey, jobId);
+    });
+    transaction.immediate();
+    return this.get(jobId);
   }
 
   markCancelUnknown(jobId: string, leaseId: string, reason: string): StoredJob {
@@ -357,7 +460,11 @@ export class JobStore {
         .run(reason, now, now, this.scopeKey, jobId, leaseId);
       if (result.changes === 1) {
         this.database
-          .query("INSERT OR IGNORE INTO session_quarantine(scope_key,session_key,reason,created_at) SELECT scope_key,session_key,?,? FROM jobs WHERE scope_key=? AND job_id=?")
+          .query(`INSERT OR IGNORE INTO session_quarantine(
+                    scope_key,session_key,job_id,lease_id,reason,created_at
+                  )
+                  SELECT scope_key,session_key,job_id,COALESCE(lease_id,''),?,?
+                  FROM jobs WHERE scope_key=? AND job_id=?`)
           .run(reason, now, this.scopeKey, jobId);
       }
     });
@@ -369,8 +476,11 @@ export class JobStore {
     const now = Date.now();
     const transaction = this.database.transaction(() => {
       this.database.query(`
-        INSERT OR IGNORE INTO session_quarantine(scope_key,session_key,reason,created_at)
-        SELECT scope_key,session_key,'connector disconnected during active execution',?
+        INSERT OR IGNORE INTO session_quarantine(
+          scope_key,session_key,job_id,lease_id,reason,created_at
+        )
+        SELECT scope_key,session_key,job_id,COALESCE(lease_id,''),
+               'connector disconnected during active execution',?
         FROM jobs
         WHERE scope_key=? AND connector_id=? AND status IN ('Dispatching','Running','Cancelling')
       `).run(now, this.scopeKey, connectorId);
@@ -426,16 +536,38 @@ export class JobStore {
   listQuarantinedSessions(): Array<{ sessionKey: string; reason: string; createdAt: number }> {
     return this.database
       .query<{ session_key: string; reason: string; created_at: number }, [string]>(
-        "SELECT session_key,reason,created_at FROM session_quarantine WHERE scope_key=? ORDER BY created_at",
+        `SELECT session_key,
+                GROUP_CONCAT(DISTINCT reason) AS reason,
+                MIN(created_at) AS created_at
+         FROM session_quarantine
+         WHERE scope_key=?
+         GROUP BY session_key
+         ORDER BY created_at`,
       )
       .all(this.scopeKey)
       .map((row) => ({ sessionKey: row.session_key, reason: row.reason, createdAt: row.created_at }));
   }
 
   releaseSessionQuarantine(sessionKey: string): boolean {
-    return this.database
-      .query("DELETE FROM session_quarantine WHERE scope_key=? AND session_key=?")
-      .run(this.scopeKey, sessionKey).changes === 1;
+    const now = Date.now();
+    const transaction = this.database.transaction(() => {
+      this.database
+        .query(`UPDATE jobs
+                SET quarantine_released_at=?, updated_at=?
+                WHERE scope_key=? AND session_key=?
+                  AND EXISTS (
+                    SELECT 1 FROM session_quarantine q
+                    WHERE q.scope_key=jobs.scope_key
+                      AND q.session_key=jobs.session_key
+                      AND q.job_id=jobs.job_id
+                      AND q.lease_id=COALESCE(jobs.lease_id,'')
+                  )`)
+        .run(now, now, this.scopeKey, sessionKey);
+      return this.database
+        .query("DELETE FROM session_quarantine WHERE scope_key=? AND session_key=?")
+        .run(this.scopeKey, sessionKey).changes;
+    });
+    return transaction.immediate() > 0;
   }
 
   getMeta(key: string): string | null {
@@ -489,30 +621,149 @@ export class JobStore {
   private migrate(): void {
     const row = this.database.query<{ user_version: number }, []>("PRAGMA user_version").get();
     const version = row?.user_version ?? 0;
-    if (version !== 0 && version !== 1 && version !== 2) {
+    if (![0, 1, 2, 3].includes(version)) {
       throw new Error(`不支持的数据库 schema 版本：${version}`);
     }
-    if (version === 2) {
+    if (version === 3) {
       return;
     }
     if (version === 1) {
-      this.database.exec(`
-        CREATE TABLE outbox_delivery_attempts (
-          scope_key TEXT NOT NULL,
-          message_id TEXT NOT NULL,
-          job_id TEXT NOT NULL,
-          created_at INTEGER NOT NULL,
-          PRIMARY KEY(scope_key,message_id),
-          FOREIGN KEY(scope_key,job_id) REFERENCES outbox(scope_key,job_id) ON DELETE CASCADE
-        );
-        INSERT INTO outbox_delivery_attempts(scope_key,message_id,job_id,created_at)
-          SELECT scope_key,last_message_id,job_id,updated_at FROM outbox WHERE last_message_id IS NOT NULL;
-        CREATE INDEX idx_outbox_attempt_job ON outbox_delivery_attempts(scope_key,job_id);
-        PRAGMA user_version=2;
-      `);
+      this.database.transaction(() => {
+        this.database.exec(`
+          CREATE TABLE outbox_delivery_attempts (
+            scope_key TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(scope_key,message_id),
+            FOREIGN KEY(scope_key,job_id) REFERENCES outbox(scope_key,job_id) ON DELETE CASCADE
+          );
+          INSERT INTO outbox_delivery_attempts(scope_key,message_id,job_id,created_at)
+            SELECT scope_key,last_message_id,job_id,updated_at FROM outbox WHERE last_message_id IS NOT NULL;
+          CREATE INDEX idx_outbox_attempt_job ON outbox_delivery_attempts(scope_key,job_id);
+          PRAGMA user_version=2;
+        `);
+      }).immediate();
+    }
+    if (version === 1 || version === 2) {
+      this.database.transaction(() => {
+        this.database.exec(`
+          ALTER TABLE jobs ADD COLUMN quarantine_released_at INTEGER;
+          ALTER TABLE session_quarantine RENAME TO session_quarantine_v2;
+          -- Schema v2 wrote the session-level quarantine row and its terminal
+          -- ambiguity with the same transaction timestamp. Bind that row only
+          -- to matching ambiguity epochs; otherwise a later quarantine in a
+          -- reused session would be copied onto every historic Interrupted job.
+          -- If millisecond timestamps collide, retain every exact match rather
+          -- than guessing which execution created the row. If there is no exact
+          -- match, leave all ambiguous jobs unreleased so the sentinel rows
+          -- below require an explicit operator decision. Every other terminal
+          -- ambiguity was already released in v2 and receives a preservation
+          -- marker. updated_at is a marker value, not a claimed exact
+          -- operator-release timestamp.
+          UPDATE jobs AS legacy_job
+          SET quarantine_released_at=legacy_job.updated_at
+          WHERE legacy_job.status IN ('Interrupted','CancelUnknown')
+            AND NOT EXISTS (
+              SELECT 1 FROM session_quarantine_v2 q
+              WHERE q.scope_key=legacy_job.scope_key
+                AND q.session_key=legacy_job.session_key
+                AND (
+                  legacy_job.completed_at=q.created_at
+                  OR NOT EXISTS (
+                    SELECT 1 FROM jobs exact_job
+                    WHERE exact_job.scope_key=q.scope_key
+                      AND exact_job.session_key=q.session_key
+                      AND exact_job.status IN ('Interrupted','CancelUnknown')
+                      AND exact_job.completed_at=q.created_at
+                  )
+                )
+            );
+          CREATE TABLE session_quarantine (
+            scope_key TEXT NOT NULL,
+            session_key TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            lease_id TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(scope_key,session_key,job_id,lease_id)
+          );
+          INSERT OR IGNORE INTO session_quarantine(
+            scope_key,session_key,job_id,lease_id,reason,created_at
+          )
+            SELECT q.scope_key,q.session_key,j.job_id,COALESCE(j.lease_id,''),
+                   q.reason,q.created_at
+            FROM session_quarantine_v2 q
+            JOIN jobs j
+              ON j.scope_key=q.scope_key AND j.session_key=q.session_key
+            WHERE j.status IN ('Interrupted','CancelUnknown')
+              AND j.completed_at=q.created_at;
+          -- A malformed/orphan v2 row has no writer-proven source. Retain a
+          -- sentinel so exact proofs cannot auto-release it, and also bind all
+          -- ambiguous jobs in the session so an explicit release persists a
+          -- marker for their later cancel transitions.
+          INSERT OR IGNORE INTO session_quarantine(
+            scope_key,session_key,job_id,lease_id,reason,created_at
+          )
+            SELECT q.scope_key,q.session_key,j.job_id,COALESCE(j.lease_id,''),
+                   q.reason,q.created_at
+            FROM session_quarantine_v2 q
+            JOIN jobs j
+              ON j.scope_key=q.scope_key AND j.session_key=q.session_key
+            WHERE j.status IN ('Interrupted','CancelUnknown')
+              AND NOT EXISTS (
+                SELECT 1 FROM jobs exact_job
+                WHERE exact_job.scope_key=q.scope_key
+                  AND exact_job.session_key=q.session_key
+                  AND exact_job.status IN ('Interrupted','CancelUnknown')
+                  AND exact_job.completed_at=q.created_at
+              );
+          -- v2 requestCancel(Interrupted) changed the source job to a leased
+          -- Cancelled row and overwrote completed_at without deleting the old
+          -- quarantine. Such a row is a possible current origin even if some
+          -- historic ambiguity happens to match q.created_at. Bind it for
+          -- operator visibility and force the sentinel below; no proof may
+          -- heuristically unlock this state.
+          INSERT OR IGNORE INTO session_quarantine(
+            scope_key,session_key,job_id,lease_id,reason,created_at
+          )
+            SELECT q.scope_key,q.session_key,j.job_id,COALESCE(j.lease_id,''),
+                   q.reason,q.created_at
+            FROM session_quarantine_v2 q
+            JOIN jobs j
+              ON j.scope_key=q.scope_key AND j.session_key=q.session_key
+            WHERE j.status='Cancelled'
+              AND j.cancel_requested=1
+              AND j.connector_id IS NOT NULL
+              AND j.lease_id IS NOT NULL;
+          INSERT OR IGNORE INTO session_quarantine(
+            scope_key,session_key,job_id,lease_id,reason,created_at
+          )
+            SELECT q.scope_key,q.session_key,'','',q.reason,q.created_at
+            FROM session_quarantine_v2 q
+            WHERE NOT EXISTS (
+                    SELECT 1 FROM jobs j
+                    WHERE j.scope_key=q.scope_key AND j.session_key=q.session_key
+                      AND j.status IN ('Interrupted','CancelUnknown')
+                      AND j.completed_at=q.created_at
+                  )
+               OR EXISTS (
+                    SELECT 1 FROM jobs drifted
+                    WHERE drifted.scope_key=q.scope_key
+                      AND drifted.session_key=q.session_key
+                      AND drifted.status='Cancelled'
+                      AND drifted.cancel_requested=1
+                      AND drifted.connector_id IS NOT NULL
+                      AND drifted.lease_id IS NOT NULL
+                  );
+          DROP TABLE session_quarantine_v2;
+          PRAGMA user_version=3;
+        `);
+      }).immediate();
       return;
     }
-    this.database.exec(`
+    this.database.transaction(() => {
+      this.database.exec(`
       CREATE TABLE meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -537,6 +788,7 @@ export class JobStore {
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         completed_at INTEGER,
+        quarantine_released_at INTEGER,
         PRIMARY KEY(scope_key,job_id)
       );
       CREATE TABLE outbox (
@@ -564,9 +816,11 @@ export class JobStore {
       CREATE TABLE session_quarantine (
         scope_key TEXT NOT NULL,
         session_key TEXT NOT NULL,
+        job_id TEXT NOT NULL,
+        lease_id TEXT NOT NULL,
         reason TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        PRIMARY KEY(scope_key,session_key)
+        PRIMARY KEY(scope_key,session_key,job_id,lease_id)
       );
       CREATE TABLE pending_cancels (
         scope_key TEXT NOT NULL,
@@ -578,7 +832,8 @@ export class JobStore {
       CREATE INDEX idx_jobs_connector ON jobs(scope_key,connector_id,status);
       CREATE INDEX idx_outbox_delivery ON outbox(scope_key,status,updated_at);
       CREATE INDEX idx_outbox_attempt_job ON outbox_delivery_attempts(scope_key,job_id);
-      PRAGMA user_version=2;
-    `);
+      PRAGMA user_version=3;
+      `);
+    }).immediate();
   }
 }

@@ -45,14 +45,14 @@ async def connect(socket_path: str, token: str):
 async def run(args: argparse.Namespace) -> None:
     async with await connect(args.socket, args.token) as websocket:
         hello_required = await receive_json(websocket, "hello_required", args.timeout)
-        if hello_required.get("protocolVersion") != 1:
+        if hello_required.get("protocolVersion") != 2:
             raise AssertionError(f"不兼容的 hello protocol：{hello_required!r}")
 
         await websocket.send(
             json.dumps(
                 {
                     "type": "hello",
-                    "protocolVersion": 1,
+                    "protocolVersion": 2,
                     "connectorId": args.connector_id,
                     "backend": "hermes",
                     "implementation": {
@@ -60,7 +60,12 @@ async def run(args: argparse.Namespace) -> None:
                         "version": "0.1.0",
                         "runtimeVersion": "0.18.2",
                     },
-                    "capabilities": {"cancel": True, "finalResult": True},
+                    "capabilities": {
+                        "cancel": True,
+                        "finalResult": True,
+                        "prestartFailure": True,
+                        "draining": True,
+                    },
                 }
             )
         )
@@ -68,15 +73,16 @@ async def run(args: argparse.Namespace) -> None:
         hello_ack = await receive_json(websocket, "hello_ack", args.timeout)
         if hello_ack != {
             "type": "hello_ack",
-            "protocolVersion": 1,
+            "protocolVersion": 2,
             "connectorId": args.connector_id,
             "daemonVersion": "test",
             "resultStoreTimeoutMs": 5000,
+            "capabilities": {"prestartFailure": True, "draining": True},
         }:
             raise AssertionError(f"hello_ack 字段不匹配：{hello_ack!r}")
 
         offered = await receive_json(websocket, "job", args.timeout)
-        if offered.get("protocolVersion") != 1:
+        if offered.get("protocolVersion") != 2:
             raise AssertionError(f"不兼容的 job protocol：{offered!r}")
         job = offered.get("job")
         if not isinstance(job, dict):

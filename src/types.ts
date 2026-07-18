@@ -1,4 +1,4 @@
-export const CONNECTOR_PROTOCOL_VERSION = 1 as const;
+export const CONNECTOR_PROTOCOL_VERSION = 2 as const;
 
 export type JobStatus =
   | "Received"
@@ -79,6 +79,8 @@ export interface ConnectorImplementation {
 export interface ConnectorCapabilities {
   cancel: boolean;
   finalResult: boolean;
+  prestartFailure: boolean;
+  draining: boolean;
 }
 
 export interface ConnectorHello {
@@ -124,8 +126,16 @@ export type ConnectorInboundMessage =
   | ConnectorHello
   | { type: "accepted"; jobId: string; leaseId: string }
   | { type: "result"; jobId: string; leaseId: string; text: string }
-  | { type: "failed"; jobId: string; leaseId: string; error: string; retryable?: boolean }
+  | {
+      type: "failed";
+      jobId: string;
+      leaseId: string;
+      error: string;
+      retryable?: boolean;
+      notStarted?: boolean;
+    }
   | { type: "cancelled"; jobId: string; leaseId: string }
+  | { type: "draining" }
   | { type: "pong"; timestamp?: number };
 
 export type ConnectorOutboundMessage =
@@ -136,10 +146,12 @@ export type ConnectorOutboundMessage =
       connectorId: string;
       daemonVersion: string;
       resultStoreTimeoutMs: number;
+      capabilities: { prestartFailure: true; draining: true };
     }
   | ConnectorJobMessage
   | ConnectorCancelMessage
   | { type: "result_stored"; jobId: string; leaseId: string }
+  | { type: "draining_ack" }
   | { type: "error"; code: string; message: string; jobId?: string }
   | { type: "ping"; timestamp: number };
 

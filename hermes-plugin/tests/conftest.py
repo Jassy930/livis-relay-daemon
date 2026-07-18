@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from enum import Enum
 import importlib.util
 from pathlib import Path
+import re
 from types import ModuleType, SimpleNamespace
 import sys
 from typing import Any
@@ -69,12 +70,24 @@ class BasePlatformAdapter:
         self.connected = False
         self.fatal_error = None
         self.handled_events: list[MessageEvent] = []
+        self._active_sessions: dict[str, object] = {}
+        self._session_tasks: dict[str, object] = {}
 
     def build_source(self, **kwargs):
         return SimpleNamespace(platform=self.platform, **kwargs)
 
     async def handle_message(self, event: MessageEvent) -> None:
         self.handled_events.append(event)
+
+    def _heal_stale_session_lock(self, session_key: str) -> bool:
+        if session_key not in self._active_sessions:
+            return False
+        owner = self._session_tasks.get(session_key)
+        if owner is not None and not owner.done():
+            return False
+        self._active_sessions.pop(session_key, None)
+        self._session_tasks.pop(session_key, None)
+        return True
 
     def _mark_connected(self) -> None:
         self.connected = True
@@ -86,6 +99,41 @@ class BasePlatformAdapter:
         self.fatal_error = (code, message, retryable)
 
 
+_PLAINTEXT_GATEWAY_RESTART_PATTERNS = (
+    re.compile(r"^(?:please\s+)?restart\s+(?:the\s+)?gateway[.!?\s]*$", re.IGNORECASE),
+    re.compile(
+        r"^(?:please\s+)?restart\s+(?:the\s+)?hermes\s+gateway[.!?\s]*$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^(?:please\s+)?restart\s+hermes[.!?\s]*$", re.IGNORECASE),
+)
+
+
+def coerce_plaintext_gateway_command(event: MessageEvent) -> None:
+    if event.message_type is not MessageType.TEXT:
+        return
+    text = (event.text or "").strip()
+    if not text or text.startswith("/"):
+        return
+    if getattr(event.source, "chat_type", None) != "dm":
+        return
+    if any(pattern.match(text) for pattern in _PLAINTEXT_GATEWAY_RESTART_PATTERNS):
+        event.text = "/restart"
+
+
+def has_blocking_approval(_session_key: str) -> bool:
+    return False
+
+
+def build_session_key(
+    source,
+    group_sessions_per_user: bool = True,
+    thread_sessions_per_user: bool = False,
+):
+    del group_sessions_per_user, thread_sessions_per_user
+    return f"agent:main:{source.platform.value}:{source.chat_type}:{source.chat_id}"
+
+
 def _install_gateway_stubs() -> None:
     gateway = ModuleType("gateway")
     gateway.__path__ = []
@@ -93,17 +141,27 @@ def _install_gateway_stubs() -> None:
     config.Platform = Platform
     platforms = ModuleType("gateway.platforms")
     platforms.__path__ = []
+    session = ModuleType("gateway.session")
+    session.build_session_key = build_session_key
     base = ModuleType("gateway.platforms.base")
     base.BasePlatformAdapter = BasePlatformAdapter
     base.MessageEvent = MessageEvent
     base.MessageType = MessageType
     base.ProcessingOutcome = ProcessingOutcome
     base.SendResult = SendResult
+    base.coerce_plaintext_gateway_command = coerce_plaintext_gateway_command
+    tools = ModuleType("tools")
+    tools.__path__ = []
+    approval = ModuleType("tools.approval")
+    approval.has_blocking_approval = has_blocking_approval
 
     sys.modules["gateway"] = gateway
     sys.modules["gateway.config"] = config
+    sys.modules["gateway.session"] = session
     sys.modules["gateway.platforms"] = platforms
     sys.modules["gateway.platforms.base"] = base
+    sys.modules["tools"] = tools
+    sys.modules["tools.approval"] = approval
 
 
 @pytest.fixture(scope="session")
@@ -127,6 +185,8 @@ def clean_livis_environment(monkeypatch):
         "LIVIS_ALLOW_ALL_USERS",
         "LIVIS_PHASE1_READ_ONLY_ACK",
         "LIVIS_RELAY_CONNECT_TIMEOUT",
+        "LIVIS_HOME_CHANNEL",
+        "LIVIS_HOME_CHANNEL_THREAD_ID",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -146,7 +206,7 @@ def secure_environment(monkeypatch, tmp_path):
 
 @pytest.fixture
 def config():
-    return SimpleNamespace(extra={})
+    return SimpleNamespace(extra={}, home_channel=None)
 
 
 @pytest.fixture
