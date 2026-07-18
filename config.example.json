@@ -22,6 +22,10 @@
     "maxOutputChars": 1048576,
     "unauthorizedMessage": "当前 LiViS 节点未获授权。"
   },
+  "routing": {
+    "defaultBackend": "hermes",
+    "nodeBackends": {}
+  },
   "hermes": {
     "command": "hermes",
     "minimumVersion": "0.15.1",

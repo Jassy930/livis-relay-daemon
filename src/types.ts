@@ -85,7 +85,7 @@ export interface ConnectorHello {
   type: "hello";
   protocolVersion: number;
   connectorId: string;
-  backend: "hermes";
+  backend: string;
   implementation: ConnectorImplementation;
   capabilities: ConnectorCapabilities;
 }

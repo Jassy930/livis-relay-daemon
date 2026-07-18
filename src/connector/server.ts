@@ -21,13 +21,24 @@ import { dirname } from "node:path";
 
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_TIMEOUT_MS = 45_000;
+const CONNECTOR_PATH_PREFIX = "/v1/connectors/";
 
 interface ConnectorSocketData {
   authenticated: true;
+  expectedBackend: string;
   connectorId: string | null;
-  backend: "hermes" | null;
+  backend: string | null;
   ready: boolean;
   lastPongAt: number;
+}
+
+export interface ConnectorBackendSpec {
+  backend: string;
+  implementation: string;
+  bridgeMinimumVersion: string;
+  bridgeMaximumExclusiveVersion: string;
+  runtimeMinimumVersion: string;
+  runtimeMaximumExclusiveVersion: string;
 }
 
 export interface ConnectorServerHandlers {
@@ -47,11 +58,7 @@ export interface ConnectorServerOptions {
   resultStoreTimeoutMs: number;
   maxFrameBytes: number;
   daemonVersion: string;
-  hermesMinimumVersion: string;
-  hermesMaximumExclusiveVersion: string;
-  bridgeImplementation: string;
-  bridgeMinimumVersion: string;
-  bridgeMaximumExclusiveVersion: string;
+  backends: ConnectorBackendSpec[];
 }
 
 function parseConnectorMessage(raw: string): ConnectorInboundMessage {
@@ -64,7 +71,8 @@ function parseConnectorMessage(raw: string): ConnectorInboundMessage {
       data.protocolVersion !== CONNECTOR_PROTOCOL_VERSION ||
       typeof data.connectorId !== "string" ||
       data.connectorId.trim() === "" ||
-      data.backend !== "hermes" ||
+      typeof data.backend !== "string" ||
+      data.backend.trim() === "" ||
       data.implementation === null ||
       typeof data.implementation !== "object" ||
       data.capabilities === null ||
@@ -105,7 +113,8 @@ function parseConnectorMessage(raw: string): ConnectorInboundMessage {
 
 export class ConnectorServer {
   private server: Bun.Server<ConnectorSocketData> | null = null;
-  private activeSocket: Bun.ServerWebSocket<ConnectorSocketData> | null = null;
+  private readonly activeSockets = new Map<string, Bun.ServerWebSocket<ConnectorSocketData>>();
+  private readonly registry = new Map<string, ConnectorBackendSpec>();
   private readonly helloTimers = new Map<Bun.ServerWebSocket<ConnectorSocketData>, ReturnType<typeof setTimeout>>();
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -113,18 +122,40 @@ export class ConnectorServer {
     private readonly options: ConnectorServerOptions,
     private readonly handlers: ConnectorServerHandlers,
     private readonly logger: Logger,
-  ) {}
+  ) {
+    for (const spec of options.backends) {
+      if (this.registry.has(spec.backend)) {
+        throw new Error(`connector backend 重复注册：${spec.backend}`);
+      }
+      this.registry.set(spec.backend, spec);
+    }
+    if (this.registry.size === 0) {
+      throw new Error("connector server 至少需要一个已注册 backend");
+    }
+  }
 
   get socketPath(): string {
     return this.options.socketPath;
   }
 
-  get connectorId(): string | null {
-    return this.activeSocket?.data.connectorId ?? null;
+  registeredBackends(): string[] {
+    return [...this.registry.keys()];
   }
 
-  get ready(): boolean {
-    return this.activeSocket?.data.ready === true;
+  ready(backend: string): boolean {
+    return this.activeSockets.get(backend)?.data.ready === true;
+  }
+
+  connectorId(backend: string): string | null {
+    return this.activeSockets.get(backend)?.data.connectorId ?? null;
+  }
+
+  connectorsStatus(): Array<{ backend: string; connectorId: string | null; ready: boolean }> {
+    return this.registeredBackends().map((backend) => ({
+      backend,
+      connectorId: this.connectorId(backend),
+      ready: this.ready(backend),
+    }));
   }
 
   start(): void {
@@ -147,7 +178,7 @@ export class ConnectorServer {
       fetch: (request, server) => {
         const url = new URL(request.url);
         if (url.pathname === "/healthz") {
-          return Response.json({ ok: true, connectorReady: this.ready });
+          return Response.json({ ok: true, connectors: this.connectorsStatus() });
         }
         if (url.pathname === "/v1/status") {
           if (!this.authorized(request)) {
@@ -155,12 +186,16 @@ export class ConnectorServer {
           }
           return Response.json({
             ok: true,
-            connector: this.activeSocket?.data ?? null,
+            connectors: this.connectorsStatus(),
             daemon: handlers.status(),
           });
         }
-        if (url.pathname !== "/v1/connectors/hermes") {
+        if (!url.pathname.startsWith(CONNECTOR_PATH_PREFIX)) {
           return new Response("Not Found", { status: 404 });
+        }
+        const requestedBackend = url.pathname.slice(CONNECTOR_PATH_PREFIX.length);
+        if (!this.registry.has(requestedBackend)) {
+          return new Response("Unknown connector backend", { status: 404 });
         }
         if (!this.authorized(request)) {
           return new Response("Unauthorized", { status: 401 });
@@ -168,6 +203,7 @@ export class ConnectorServer {
         const upgraded = server.upgrade(request, {
           data: {
             authenticated: true,
+            expectedBackend: requestedBackend,
             connectorId: null,
             backend: null,
             ready: false,
@@ -206,9 +242,10 @@ export class ConnectorServer {
           if (timer) clearTimeout(timer);
           this.helloTimers.delete(socket);
           const connectorId = socket.data.connectorId;
-          const wasActive = this.activeSocket === socket;
-          if (wasActive) {
-            this.activeSocket = null;
+          const backend = socket.data.backend;
+          const wasActive = backend !== null && this.activeSockets.get(backend) === socket;
+          if (backend && wasActive) {
+            this.activeSockets.delete(backend);
           }
           if (connectorId && wasActive) {
             void handlers.onDisconnected(connectorId).catch((error) => {
@@ -220,22 +257,26 @@ export class ConnectorServer {
     });
     chmodSync(options.socketPath, 0o600);
     this.heartbeatTimer = setInterval(() => {
-      const socket = this.activeSocket;
-      if (!socket?.data.ready) return;
-      if (Date.now() - socket.data.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
-        socket.close(1001, "connector heartbeat timeout");
-        return;
+      for (const socket of this.activeSockets.values()) {
+        if (!socket.data.ready) continue;
+        if (Date.now() - socket.data.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
+          socket.close(1001, "connector heartbeat timeout");
+          continue;
+        }
+        this.send(socket, { type: "ping", timestamp: Date.now() });
       }
-      this.send(socket, { type: "ping", timestamp: Date.now() });
     }, HEARTBEAT_INTERVAL_MS);
-    this.logger.info("connector server 已启动", { socketPath: options.socketPath });
+    this.logger.info("connector server 已启动", {
+      socketPath: options.socketPath,
+      backends: this.registeredBackends(),
+    });
   }
 
   stop(): void {
-    if (this.activeSocket) {
-      this.activeSocket.close(1001, "daemon stopping");
-      this.activeSocket = null;
+    for (const socket of this.activeSockets.values()) {
+      socket.close(1001, "daemon stopping");
     }
+    this.activeSockets.clear();
     this.server?.stop(true);
     this.server = null;
     if (existsSync(this.options.socketPath) && lstatSync(this.options.socketPath).isSocket()) {
@@ -247,8 +288,9 @@ export class ConnectorServer {
     this.heartbeatTimer = null;
   }
 
-  sendJob(job: StoredJob): boolean {
-    if (!this.activeSocket?.data.ready || !job.leaseId) {
+  sendJob(job: StoredJob, backend: string): boolean {
+    const socket = this.activeSockets.get(backend);
+    if (!socket?.data.ready || !job.leaseId) {
       return false;
     }
     const message: ConnectorJobMessage = {
@@ -273,11 +315,14 @@ export class ConnectorServer {
         },
       },
     };
-    return this.send(this.activeSocket, message);
+    return this.send(socket, message);
   }
 
   sendCancel(job: StoredJob): boolean {
-    if (!this.activeSocket?.data.ready || !job.leaseId) {
+    // cancel 必须送达持有 lease 的那个 connector 实例，而不是当前 backend
+    // 在线的任意实例。
+    const socket = job.connectorId ? this.findByConnectorId(job.connectorId) : null;
+    if (!socket?.data.ready || !job.leaseId) {
       return false;
     }
     const message: ConnectorCancelMessage = {
@@ -286,19 +331,30 @@ export class ConnectorServer {
       jobId: job.jobId,
       leaseId: job.leaseId,
     };
-    return this.send(this.activeSocket, message);
+    return this.send(socket, message);
   }
 
-  acknowledgeResult(jobId: string, leaseId: string): void {
-    if (this.activeSocket?.data.ready) {
-      this.send(this.activeSocket, { type: "result_stored", jobId, leaseId });
+  acknowledgeResult(jobId: string, leaseId: string, connectorId: string): void {
+    const socket = this.findByConnectorId(connectorId);
+    if (socket?.data.ready) {
+      this.send(socket, { type: "result_stored", jobId, leaseId });
     }
   }
 
-  rejectJobMessage(jobId: string, code: string, message: string): void {
-    if (this.activeSocket?.data.ready) {
-      this.send(this.activeSocket, { type: "error", code, message, jobId });
+  rejectJobMessage(jobId: string, code: string, message: string, connectorId: string): void {
+    const socket = this.findByConnectorId(connectorId);
+    if (socket?.data.ready) {
+      this.send(socket, { type: "error", code, message, jobId });
     }
+  }
+
+  private findByConnectorId(connectorId: string): Bun.ServerWebSocket<ConnectorSocketData> | null {
+    for (const socket of this.activeSockets.values()) {
+      if (socket.data.connectorId === connectorId) {
+        return socket;
+      }
+    }
+    return null;
   }
 
   private authorized(request: Request): boolean {
@@ -313,34 +369,51 @@ export class ConnectorServer {
       if (socket.data.ready) {
         throw new Error("重复 hello");
       }
-      if (this.activeSocket && this.activeSocket !== socket) {
-        // Hermes 重启后旧 socket 可能还没被心跳超时（最长 45 秒）回收。
+      const spec = this.registry.get(message.backend);
+      if (!spec || message.backend !== socket.data.expectedBackend) {
+        this.send(socket, {
+          type: "error",
+          code: "backend_unsupported",
+          message: `未注册或与连接路径不符的 connector backend：${message.backend}`,
+        });
+        socket.close(1008, "unsupported backend");
+        return;
+      }
+      const existing = this.activeSockets.get(message.backend);
+      if (existing && existing !== socket) {
+        // 同 backend 重启后旧 socket 可能还没被心跳超时（最长 45 秒）回收。
         // 旧连接已错过一个完整心跳周期时按失活处理，把位置让给新连接。
-        if (Date.now() - this.activeSocket.data.lastPongAt > HEARTBEAT_INTERVAL_MS * 2) {
+        if (Date.now() - existing.data.lastPongAt > HEARTBEAT_INTERVAL_MS * 2) {
           this.logger.warn("驱逐失活的旧 connector，接受新 hello", {
-            staleConnectorId: this.activeSocket.data.connectorId,
+            backend: message.backend,
+            staleConnectorId: existing.data.connectorId,
           });
-          const staleSocket = this.activeSocket;
-          this.activeSocket = null;
-          staleSocket.close(1001, "replaced by new connector");
+          // 先撤销 backend 的 active 身份，再关闭旧 socket。这样旧连接迟到的
+          // close 回调不会清理复用同一 connectorId 的新连接所持有的 job。
+          this.activeSockets.delete(message.backend);
+          existing.close(1001, "replaced by new connector");
         } else {
-          this.send(socket, { type: "error", code: "connector_conflict", message: "已有 Hermes connector 在线" });
+          this.send(socket, {
+            type: "error",
+            code: "connector_conflict",
+            message: `backend ${message.backend} 已有 connector 在线`,
+          });
           socket.close(1008, "connector conflict");
           return;
         }
       }
-      if (message.implementation.name !== this.options.bridgeImplementation) {
+      if (message.implementation.name !== spec.implementation) {
         this.send(socket, {
           type: "error",
           code: "bridge_implementation_unsupported",
-          message: `connector implementation 必须是 ${this.options.bridgeImplementation}`,
+          message: `connector implementation 必须是 ${spec.implementation}`,
         });
         socket.close(1008, "unsupported bridge implementation");
         return;
       }
       const bridgeVersion = parseSemverTriplet(message.implementation.version);
-      const bridgeMinimum = parseSemverTriplet(this.options.bridgeMinimumVersion);
-      const bridgeMaximum = parseSemverTriplet(this.options.bridgeMaximumExclusiveVersion);
+      const bridgeMinimum = parseSemverTriplet(spec.bridgeMinimumVersion);
+      const bridgeMaximum = parseSemverTriplet(spec.bridgeMaximumExclusiveVersion);
       if (
         !bridgeVersion || !bridgeMinimum || !bridgeMaximum ||
         !versionAtLeast(bridgeVersion, bridgeMinimum) ||
@@ -349,14 +422,14 @@ export class ConnectorServer {
         this.send(socket, {
           type: "error",
           code: "bridge_version_unsupported",
-          message: `bridge ${message.implementation.version} 不在已审核范围 [${this.options.bridgeMinimumVersion}, ${this.options.bridgeMaximumExclusiveVersion})`,
+          message: `bridge ${message.implementation.version} 不在已审核范围 [${spec.bridgeMinimumVersion}, ${spec.bridgeMaximumExclusiveVersion})`,
         });
         socket.close(1008, "unsupported bridge version");
         return;
       }
       const runtimeVersion = parseSemverTriplet(message.implementation.runtimeVersion ?? "");
-      const minimumVersion = parseSemverTriplet(this.options.hermesMinimumVersion);
-      const maximumVersion = parseSemverTriplet(this.options.hermesMaximumExclusiveVersion);
+      const minimumVersion = parseSemverTriplet(spec.runtimeMinimumVersion);
+      const maximumVersion = parseSemverTriplet(spec.runtimeMaximumExclusiveVersion);
       if (
         !runtimeVersion || !minimumVersion || !maximumVersion ||
         !versionAtLeast(runtimeVersion, minimumVersion) ||
@@ -365,15 +438,15 @@ export class ConnectorServer {
         this.send(socket, {
           type: "error",
           code: "hermes_version_unsupported",
-          message: `Hermes runtime ${message.implementation.runtimeVersion ?? "unknown"} 不在已审核范围 [${this.options.hermesMinimumVersion}, ${this.options.hermesMaximumExclusiveVersion})`,
+          message: `${message.backend} runtime ${message.implementation.runtimeVersion ?? "unknown"} 不在已审核范围 [${spec.runtimeMinimumVersion}, ${spec.runtimeMaximumExclusiveVersion})`,
         });
-        socket.close(1008, "unsupported Hermes version");
+        socket.close(1008, "unsupported runtime version");
         return;
       }
       socket.data.connectorId = message.connectorId;
       socket.data.backend = message.backend;
       socket.data.ready = true;
-      this.activeSocket = socket;
+      this.activeSockets.set(message.backend, socket);
       const timer = this.helloTimers.get(socket);
       if (timer) clearTimeout(timer);
       this.helloTimers.delete(socket);
@@ -385,7 +458,8 @@ export class ConnectorServer {
         resultStoreTimeoutMs: this.options.resultStoreTimeoutMs,
       });
       await this.handlers.onReady(message);
-      this.logger.info("Hermes connector 已就绪", {
+      this.logger.info("connector 已就绪", {
+        backend: message.backend,
         connectorId: message.connectorId,
         implementation: message.implementation,
       });

@@ -16,135 +16,13 @@ import {
 import { SecretStore } from "../src/secrets.ts";
 import { JobStore } from "../src/state/store.ts";
 import type { RelayEnvelope } from "../src/types.ts";
+import { FakeLivisRelay, bounded, waitFor } from "./fake_livis.ts";
 import {
   incomingJob,
   temporaryDirectory,
   testConfig,
   testProfile,
 } from "./helpers.ts";
-
-interface CapturedEnvelope {
-  socket: Bun.ServerWebSocket<FakeSocketData>;
-  envelope: RelayEnvelope;
-}
-
-interface FakeSocketData {
-  connectionId: string;
-}
-
-interface EnvelopeWaiter {
-  type: string;
-  resolve: (captured: CapturedEnvelope) => void;
-  reject: (error: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
-}
-
-class FakeLivisRelay {
-  private server: Bun.Server<FakeSocketData> | null = null;
-  private readonly sockets = new Set<Bun.ServerWebSocket<FakeSocketData>>();
-  private readonly queued: CapturedEnvelope[] = [];
-  private readonly waiters: EnvelopeWaiter[] = [];
-  readonly history: CapturedEnvelope[] = [];
-  url = "";
-
-  async start(): Promise<void> {
-    const relay = this;
-    this.server = Bun.serve<FakeSocketData>({
-      hostname: "127.0.0.1",
-      port: 0,
-      fetch(request, server) {
-        if (server.upgrade(request, { data: { connectionId: crypto.randomUUID() } })) {
-          return undefined;
-        }
-        return new Response("WebSocket upgrade required", { status: 426 });
-      },
-      websocket: {
-        open(socket) {
-          relay.sockets.add(socket);
-        },
-        message(socket, data) {
-          const envelope = JSON.parse(data.toString()) as RelayEnvelope;
-          const captured = { socket, envelope };
-          relay.history.push(captured);
-          const waiterIndex = relay.waiters.findIndex((waiter) => waiter.type === envelope.type);
-          if (waiterIndex >= 0) {
-            const [waiter] = relay.waiters.splice(waiterIndex, 1);
-            clearTimeout(waiter!.timer);
-            waiter!.resolve(captured);
-          } else {
-            relay.queued.push(captured);
-          }
-        },
-        close(socket) {
-          relay.sockets.delete(socket);
-        },
-      },
-    });
-    this.url = `ws://${this.server.hostname}:${this.server.port}/api/v1/ws`;
-  }
-
-  async stop(): Promise<void> {
-    for (const waiter of this.waiters.splice(0)) {
-      clearTimeout(waiter.timer);
-      waiter.reject(new Error("fake LiViS relay stopped"));
-    }
-    for (const socket of this.sockets) {
-      socket.close(1001, "fake relay stopping");
-    }
-    this.sockets.clear();
-    const server = this.server;
-    this.server = null;
-    server?.stop(true);
-  }
-
-  async next(type: string, timeoutMs = 2_000): Promise<CapturedEnvelope> {
-    const queuedIndex = this.queued.findIndex((captured) => captured.envelope.type === type);
-    if (queuedIndex >= 0) {
-      return this.queued.splice(queuedIndex, 1)[0]!;
-    }
-    return new Promise<CapturedEnvelope>((resolve, reject) => {
-      const waiter: EnvelopeWaiter = {
-        type,
-        resolve,
-        reject,
-        timer: setTimeout(() => {
-          const index = this.waiters.indexOf(waiter);
-          if (index >= 0) this.waiters.splice(index, 1);
-          reject(new Error(`timed out waiting for fake LiViS ${type}`));
-        }, timeoutMs),
-      };
-      this.waiters.push(waiter);
-    });
-  }
-
-  send(socket: Bun.ServerWebSocket<FakeSocketData>, envelope: RelayEnvelope): void {
-    socket.send(JSON.stringify(envelope));
-  }
-
-  async handshake(
-    client: RelayClient,
-    timeoutMs = 2_000,
-  ): Promise<Bun.ServerWebSocket<FakeSocketData>> {
-    const connect = await this.next("connect", timeoutMs);
-    this.send(connect.socket, {
-      type: "connected",
-      metadata: { job_id: connect.envelope.metadata?.job_id },
-      payload: {},
-    });
-    await waitFor(() => client.connected, timeoutMs, "RelayClient handshake");
-    return connect.socket;
-  }
-
-  async disconnect(socket: Bun.ServerWebSocket<FakeSocketData>): Promise<void> {
-    if (!this.sockets.has(socket)) return;
-    socket.close(1012, "fake relay disconnect");
-    await waitFor(() => !this.sockets.has(socket), 1_000, "fake relay socket close");
-  }
-
-  count(type: string): number {
-    return this.history.filter((captured) => captured.envelope.type === type).length;
-  }
-}
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -154,34 +32,6 @@ function deferred<T>() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
-}
-
-async function waitFor(
-  predicate: () => boolean,
-  timeoutMs = 2_000,
-  label = "condition",
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() >= deadline) {
-      throw new Error(`timed out waiting for ${label}`);
-    }
-    await Bun.sleep(5);
-  }
-}
-
-async function bounded<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
 }
 
 function messageEnvelope(jobId: string, messageId = `msg-${jobId}`): RelayEnvelope {
@@ -314,7 +164,7 @@ describe("RelayClient fake LiViS end-to-end", () => {
     };
     const relayClient = createClient(handlers);
     relayClient.start();
-    const socket = await fakeRelay.handshake(relayClient);
+    const socket = await fakeRelay.handshake(() => relayClient.connected);
 
     fakeRelay.send(socket, messageEnvelope("durable-job"));
     await Bun.sleep(25);
@@ -334,7 +184,7 @@ describe("RelayClient fake LiViS end-to-end", () => {
       if (inserted) executionCount += 1;
     }));
     relayClient.start();
-    const socket = await fakeRelay.handshake(relayClient);
+    const socket = await fakeRelay.handshake(() => relayClient.connected);
 
     fakeRelay.send(socket, messageEnvelope("duplicate-job", "wire-message-1"));
     const firstAck = await fakeRelay.next("ack_send_message");
@@ -352,7 +202,7 @@ describe("RelayClient fake LiViS end-to-end", () => {
     createPendingResult(store, "result-job");
     const relayClient = createClient(durableHandlers());
     relayClient.start();
-    const socket = await fakeRelay.handshake(relayClient);
+    const socket = await fakeRelay.handshake(() => relayClient.connected);
 
     const first = await fakeRelay.next("send_result");
     const retry = await fakeRelay.next("send_result");
@@ -381,7 +231,7 @@ describe("RelayClient fake LiViS end-to-end", () => {
     createPendingResult(store, "ref-ack-job");
     const relayClient = createClient(durableHandlers());
     relayClient.start();
-    const socket = await fakeRelay.handshake(relayClient);
+    const socket = await fakeRelay.handshake(() => relayClient.connected);
 
     const firstDelivery = await fakeRelay.next("send_result");
     const deliveryMessageId = firstDelivery.envelope.metadata?.msg_id;
@@ -407,7 +257,7 @@ describe("RelayClient fake LiViS end-to-end", () => {
       if (inserted && store.require(_jobId).status === "Acked") executionCount += 1;
     }));
     relayClient.start();
-    const socket = await fakeRelay.handshake(relayClient);
+    const socket = await fakeRelay.handshake(() => relayClient.connected);
 
     fakeRelay.send(socket, cancelEnvelope("future-job"));
     const cancelAck = await fakeRelay.next("ack_cancel_chat");
@@ -429,7 +279,7 @@ describe("RelayClient fake LiViS end-to-end", () => {
     handlers.onConnected = async () => { connectedCount += 1; };
     const relayClient = createClient(handlers);
     relayClient.start();
-    const firstSocket = await fakeRelay.handshake(relayClient);
+    const firstSocket = await fakeRelay.handshake(() => relayClient.connected);
 
     const firstResult = await fakeRelay.next("send_result");
     expect(store.require("recover-job").outbox?.status).toBe("Delivering");
@@ -440,7 +290,7 @@ describe("RelayClient fake LiViS end-to-end", () => {
       "outbox reset after disconnect",
     );
 
-    const secondSocket = await fakeRelay.handshake(relayClient, 3_000);
+    const secondSocket = await fakeRelay.handshake(() => relayClient.connected, 3_000);
     const replayed = await fakeRelay.next("send_result");
     expect(replayed.envelope.metadata?.job_id).toBe("recover-job");
     expect(replayed.envelope.payload?.data).toBe(firstResult.envelope.payload?.data);

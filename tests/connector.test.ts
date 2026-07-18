@@ -66,11 +66,14 @@ describe("Hermes connector Unix WebSocket", () => {
       resultStoreTimeoutMs: 750,
       maxFrameBytes: 1024 * 1024,
       daemonVersion: "test",
-      hermesMinimumVersion: "0.15.1",
-      hermesMaximumExclusiveVersion: "0.15.2",
-      bridgeImplementation: "livis-hermes-bridge",
-      bridgeMinimumVersion: "0.1.0",
-      bridgeMaximumExclusiveVersion: "0.2.0",
+      backends: [{
+        backend: "hermes",
+        implementation: "livis-hermes-bridge",
+        bridgeMinimumVersion: "0.1.0",
+        bridgeMaximumExclusiveVersion: "0.2.0",
+        runtimeMinimumVersion: "0.15.1",
+        runtimeMaximumExclusiveVersion: "0.15.2",
+      }],
     }, handlers, new Logger("test.connector", "error"));
     server.start();
   });
@@ -108,13 +111,13 @@ describe("Hermes connector Unix WebSocket", () => {
     expect(helloAck.type).toBe("hello_ack");
     expect(helloAck.resultStoreTimeoutMs).toBe(750);
     await Bun.sleep(5);
-    expect(server.ready).toBeTrue();
+    expect(server.ready("hermes")).toBeTrue();
     expect(events[0]).toEqual({ type: "ready", jobId: "hermes-test" });
 
     store.ingest(incomingJob("job-1"), "session-1");
     store.markAcked("job-1");
     const job = store.claimForDispatch("job-1", "hermes-test", "lease-1")!;
-    expect(server.sendJob(job)).toBeTrue();
+    expect(server.sendJob(job, "hermes")).toBeTrue();
     const offered = await read();
     expect(offered.type).toBe("job");
     expect((offered.job as Record<string, unknown>).leaseId).toBe("lease-1");
@@ -124,10 +127,38 @@ describe("Hermes connector Unix WebSocket", () => {
     await Bun.sleep(5);
     expect(events.some((event) => event.type === "accepted")).toBeTrue();
     expect(events.some((event) => event.type === "result")).toBeTrue();
-    server.acknowledgeResult("job-1", "lease-1");
+    server.acknowledgeResult("job-1", "lease-1", "hermes-test");
     expect(await read()).toEqual({ type: "result_stored", jobId: "job-1", leaseId: "lease-1" });
 
     client.close();
+    await new Promise((resolve) => client.once("close", resolve));
+  });
+
+  test("拒绝未注册的 connector backend", async () => {
+    const unknownPath = await fetch("http://localhost/v1/connectors/aion", {
+      unix: server.socketPath,
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(unknownPath.status).toBe(404);
+
+    const client = openWebSocket(server.socketPath, token);
+    const read = messageReader(client);
+    await new Promise<void>((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    await read();
+    client.send(JSON.stringify({
+      type: "hello",
+      protocolVersion: 1,
+      connectorId: "aion-test",
+      backend: "aion",
+      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.15.1" },
+      capabilities: { cancel: true, finalResult: true },
+    }));
+    const error = await read();
+    expect(error.type).toBe("error");
+    expect(error.code).toBe("backend_unsupported");
     await new Promise((resolve) => client.once("close", resolve));
   });
 

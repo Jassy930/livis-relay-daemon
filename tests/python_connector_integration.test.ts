@@ -112,11 +112,14 @@ test("Python websockets 与 Bun ConnectorServer 完成真实 UDS job/result 往�
       resultStoreTimeoutMs: 5000,
       maxFrameBytes: 1024 * 1024,
       daemonVersion: "test",
-      hermesMinimumVersion: "0.15.1",
-      hermesMaximumExclusiveVersion: "0.15.2",
-      bridgeImplementation: "livis-hermes-bridge",
-      bridgeMinimumVersion: "0.1.0",
-      bridgeMaximumExclusiveVersion: "0.2.0",
+      backends: [{
+        backend: "hermes",
+        implementation: "livis-hermes-bridge",
+        bridgeMinimumVersion: "0.1.0",
+        bridgeMaximumExclusiveVersion: "0.2.0",
+        runtimeMinimumVersion: "0.15.1",
+        runtimeMaximumExclusiveVersion: "0.15.2",
+      }],
     }, handlers, new Logger("test.python-connector", "error"));
     server = activeServer;
     activeServer.start();
@@ -176,7 +179,7 @@ test("Python websockets 与 Bun ConnectorServer 完成真实 UDS job/result 往�
     activeStore.markAcked(jobId);
     const job = activeStore.claimForDispatch(jobId, connectorId, leaseId);
     expect(job).not.toBeNull();
-    expect(activeServer.sendJob(job!)).toBeTrue();
+    expect(activeServer.sendJob(job!, "hermes")).toBeTrue();
 
     expect(await waitWhileProcessRuns(
       accepted.promise,
@@ -197,7 +200,7 @@ test("Python websockets 与 Bun ConnectorServer 完成真实 UDS job/result 往�
       connectorId,
     });
 
-    activeServer.acknowledgeResult(jobId, leaseId);
+    activeServer.acknowledgeResult(jobId, leaseId, connectorId);
     expect(await bounded(pythonProcess.exited, MESSAGE_TIMEOUT_MS, "Python connector exit")).toBe(0);
     expect(await bounded(disconnected.promise, DISCONNECT_TIMEOUT_MS, "Python connector disconnect")).toBe(connectorId);
     expect(JSON.parse((await stdoutText).trim())).toEqual({

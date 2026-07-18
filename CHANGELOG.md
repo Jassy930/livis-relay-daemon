@@ -17,6 +17,9 @@
 
 ### 变更
 
+- connector 层引入后端注册表：`hello.backend` 泛化为字符串并按 `/v1/connectors/<backend>` 路径校验，入站 job 按 `config.routing`（`defaultBackend`/`nodeBackends`）路由，为接入 Hermes 之外的 agent 预留扩展点；回复消息按持有 lease 的 connector 实例路由。
+- 结果投递重构为由 outbox 持久化状态驱动的单一 pump：Pending 启动、Delivering 超时重试或 AckFailed、断开批量重置，不再为单个 job 维护内存定时器。
+- 新增 daemon 编排级测试：fake LiViS relay + 真实 UDS connector + 真 RelayDaemon 的端到端闭环、cancel 竞争、connector 断开隔离、未授权 node、upstream 门禁关闭与自动恢复。
 - `config.connector.resultStoreTimeoutMs` 通过 `hello_ack` 下发给 Hermes plugin，替代 plugin 侧硬编码 5 秒。
 - cancel 竞争获胜后到达的 final/failed 上报改用专用错误码 `cancel_superseded`，plugin 将其按取消成功处理，不再向 Hermes 报告投递失败。
 - upstream 门禁关闭后周期复核继续运行，恢复 `supported` 时自动重连 LiViS relay，不再要求重启进程。

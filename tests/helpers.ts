@@ -43,6 +43,10 @@ export function testConfig(stateDir: string): RelayConfig {
       maxOutputChars: 1_048_576,
       unauthorizedMessage: "unauthorized",
     },
+    routing: {
+      defaultBackend: "hermes",
+      nodeBackends: {},
+    },
     hermes: {
       command: "hermes",
       minimumVersion: "0.15.1",

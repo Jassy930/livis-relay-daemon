@@ -29,9 +29,11 @@ Pending → Delivering → Delivered
 - `Dispatching/Running/Cancelling` 属于 ambiguous execution，不自动重跑。
 - 未 ACK 的结果只重发 outbox，每次生成新的 `msg_id`，保留原 `job_id` 和结果内容。
 
-## Hermes connector contract
+结果投递由单一 outbox pump 驱动，完全以持久化状态为准：`Pending` 启动投递、`Delivering` 超时后重试或转入 `AckFailed`；连接建立、新结果入库、收到 ACK 都只是触发 pump 重新扫描，不为单个 job 维护内存定时器。连接断开或 daemon 停止时把 `Delivering` 批量重置为 `Pending`，重连后自然重放。
 
-一期 connector protocol 固定为 v1，关键消息为：
+## Connector contract 与后端路由
+
+connector protocol 固定为 v1，关键消息为：
 
 ```text
 hello / hello_ack
@@ -40,6 +42,10 @@ cancel → cancelled
 result_stored
 ping / pong
 ```
+
+daemon 侧维护一个 connector 注册表：每个后端（一期只有 `hermes`）各自声明实现名、bridge 与 runtime 的已审核版本区间。connector 通过 `/v1/connectors/<backend>` 连接并在 `hello.backend` 中声明身份，未注册或与连接路径不符的后端会被 `backend_unsupported` 拒绝；同一后端同时只允许一个 connector 在线（失活旧连接会被驱逐）。
+
+入站 job 由 `config.routing` 决定去向：`nodeBackends` 按 `from_node_id` 精确路由，未命中时落到 `defaultBackend`（缺省 `hermes`）。路由在派发时根据配置计算，不写入持久化状态；`cancel`、`result_stored` 与错误回复按持有 lease 的 connector 实例路由，而不是按后端在线实例。
 
 所有执行消息携带 `jobId + leaseId`。daemon 只接受当前 lease，旧 connector 或迟到结果不能完成新执行。
 

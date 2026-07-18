@@ -20,6 +20,7 @@ import type { SecretStore } from "../secrets.ts";
 import type { JobStore } from "../state/store.ts";
 import type { RelayEnvelope } from "../types.ts";
 import { delay, withJitter } from "../util.ts";
+import { OutboxPump } from "./outbox_pump.ts";
 
 export interface RelayClientHandlers {
   onIncoming(envelope: RelayEnvelope): Promise<void>;
@@ -38,7 +39,7 @@ export class RelayClient {
   private handshakeComplete = false;
   private terminalFailure: string | null = null;
   private messageChain: Promise<void> = Promise.resolve();
-  private readonly resultAckTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly pump: OutboxPump;
 
   constructor(
     private readonly config: RelayConfig,
@@ -49,7 +50,27 @@ export class RelayClient {
     private readonly store: JobStore,
     private readonly handlers: RelayClientHandlers,
     private readonly logger: Logger,
-  ) {}
+  ) {
+    this.pump = new OutboxPump({
+      store,
+      timing: {
+        resultAckTimeoutMs: profile.timing.resultAckTimeoutMs,
+        resultMaxRetries: profile.timing.resultMaxRetries,
+      },
+      isConnected: () => this.connected,
+      deliver: (outbox, messageId) => {
+        this.send(buildResultEnvelope({
+          profile: this.profile,
+          jobId: outbox.jobId,
+          agentId: this.identity.agentId,
+          deviceId: this.identity.deviceId,
+          resultJson: outbox.resultJson,
+          messageId,
+        }));
+      },
+      logger: logger.child("outbox"),
+    });
+  }
 
   get connected(): boolean {
     return this.handshakeComplete && this.socket?.readyState === WebSocket.OPEN;
@@ -80,16 +101,15 @@ export class RelayClient {
     this.abortController.abort(new Error("relay client stopping"));
     this.stopHeartbeat();
     this.stopTokenRefreshTimer();
-    this.clearResultTimers(true);
+    this.pump.stop();
+    this.store.resetDeliveringOutbox();
     this.socket?.close(1000, "daemon stopping");
     await this.runPromise?.catch(() => undefined);
     this.runPromise = null;
   }
 
   async notifyOutboxPending(): Promise<void> {
-    if (this.connected) {
-      await this.replayOutbox();
-    }
+    this.pump.kick();
   }
 
   private async runLoop(): Promise<void> {
@@ -199,7 +219,7 @@ export class RelayClient {
       this.startHeartbeat();
       this.logger.info("LiViS relay 已完成握手", { profile: this.profile.id });
       await this.handlers.onConnected();
-      await this.replayOutbox();
+      this.pump.kick();
       const closed = await socketClosed;
       if (!this.abortController.signal.aborted) {
         throw new Error(`LiViS WebSocket 断开：${closed.code} ${closed.reason}`);
@@ -208,7 +228,8 @@ export class RelayClient {
       clearTimeout(handshakeTimer);
       this.stopHeartbeat();
       this.stopTokenRefreshTimer();
-      this.clearResultTimers(true);
+      this.pump.stop();
+      this.store.resetDeliveringOutbox();
       this.handshakeComplete = false;
       if (this.socket === socket) {
         this.socket = null;
@@ -261,13 +282,9 @@ export class RelayClient {
           this.logger.warn("ack_send_result 无法关联任何 outbox", { candidates });
           break;
         }
-        const timer = this.resultAckTimers.get(jobId);
-        if (timer) {
-          clearTimeout(timer);
-          this.resultAckTimers.delete(jobId);
-        }
         this.store.markOutboxDelivered(jobId);
         this.logger.info("LiViS 结果已确认", { jobId });
+        this.pump.kick();
         break;
       }
       case "token_expiring":
@@ -316,54 +333,6 @@ export class RelayClient {
     }
   }
 
-  private async replayOutbox(): Promise<void> {
-    for (const outbox of this.store.listPendingOutbox()) {
-      await this.deliverResult(outbox.jobId, false);
-    }
-  }
-
-  private async deliverResult(jobId: string, retry: boolean): Promise<void> {
-    if (!this.connected) {
-      if (retry) this.store.resetOutboxPending(jobId);
-      return;
-    }
-    const messageId = crypto.randomUUID();
-    const outbox = this.store.startResultDelivery(jobId, messageId, retry);
-    if (!outbox) {
-      return;
-    }
-    this.send(buildResultEnvelope({
-      profile: this.profile,
-      jobId,
-      agentId: this.identity.agentId,
-      deviceId: this.identity.deviceId,
-      resultJson: outbox.resultJson,
-      messageId,
-    }));
-    const previousTimer = this.resultAckTimers.get(jobId);
-    if (previousTimer) clearTimeout(previousTimer);
-    const timer = setTimeout(() => {
-      try {
-        this.resultAckTimers.delete(jobId);
-        const current = this.store.get(jobId)?.outbox;
-        if (!current || current.status !== "Delivering") return;
-        if (!this.connected) {
-          this.store.resetOutboxPending(jobId);
-          return;
-        }
-        if (current.retryCount < this.profile.timing.resultMaxRetries) {
-          void this.deliverResult(jobId, true);
-        } else {
-          this.store.markOutboxAckFailed(jobId);
-          this.logger.error("LiViS 结果 ACK 重试耗尽", { jobId, retries: current.retryCount });
-        }
-      } catch (error) {
-        this.logger.error("结果重试定时器处理失败", { jobId, error: errorMessage(error) });
-      }
-    }, this.profile.timing.resultAckTimeoutMs);
-    this.resultAckTimers.set(jobId, timer);
-  }
-
   private resolveAckJobId(candidates: string[]): string | null {
     for (const candidate of candidates) {
       if (this.store.get(candidate)) {
@@ -403,16 +372,6 @@ export class RelayClient {
       clearTimeout(this.tokenRefreshTimer);
       this.tokenRefreshTimer = null;
     }
-  }
-
-  private clearResultTimers(resetPending: boolean): void {
-    for (const [jobId, timer] of this.resultAckTimers) {
-      clearTimeout(timer);
-      if (resetPending) {
-        this.store.resetOutboxPending(jobId);
-      }
-    }
-    this.resultAckTimers.clear();
   }
 
   private send(envelope: RelayEnvelope): void {

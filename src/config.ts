@@ -36,6 +36,10 @@ export interface RelayConfig {
     maxOutputChars: number;
     unauthorizedMessage: string;
   };
+  routing: {
+    defaultBackend: string;
+    nodeBackends: Record<string, string>;
+  };
   hermes: {
     command: string;
     minimumVersion: string;
@@ -61,6 +65,29 @@ function stringArray(value: unknown, label: string): string[] {
     throw new Error(`${label} 必须是非空字符串数组`);
   }
   return [...value] as string[];
+}
+
+// routing 可选，缺省全部路由到一期唯一的 hermes 后端；后端是否真实存在由
+// daemon 启动时对照 connector 注册表校验。
+function parseRouting(root: Record<string, unknown>): RelayConfig["routing"] {
+  if (root.routing === undefined) {
+    return { defaultBackend: "hermes", nodeBackends: {} };
+  }
+  const routing = objectAt(root, "routing");
+  const defaultBackend = routing.defaultBackend === undefined
+    ? "hermes"
+    : asNonEmptyString(routing.defaultBackend, "config.routing.defaultBackend");
+  const nodeBackends: Record<string, string> = {};
+  if (routing.nodeBackends !== undefined) {
+    const raw = routing.nodeBackends;
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error("config.routing.nodeBackends 必须是对象");
+    }
+    for (const [nodeId, backend] of Object.entries(raw as Record<string, unknown>)) {
+      nodeBackends[nodeId] = asNonEmptyString(backend, `config.routing.nodeBackends.${nodeId}`);
+    }
+  }
+  return { defaultBackend, nodeBackends };
 }
 
 export function parseRelayConfig(text: string, configPath: string): RelayConfig {
@@ -132,6 +159,7 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
         "config.security.unauthorizedMessage",
       ),
     },
+    routing: parseRouting(root),
     hermes: {
       command: asNonEmptyString(hermes.command, "config.hermes.command"),
       minimumVersion: hermesMinimumVersion,
@@ -201,6 +229,10 @@ export async function initializeConfig(options: {
       maxInputChars: 32_768,
       maxOutputChars: 1_048_576,
       unauthorizedMessage: "当前 LiViS 节点未获授权。",
+    },
+    routing: {
+      defaultBackend: "hermes",
+      nodeBackends: {},
     },
     hermes: {
       command: "hermes",

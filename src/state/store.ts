@@ -416,6 +416,22 @@ export class JobStore {
       .flatMap((job) => (job.outbox ? [job.outbox] : []));
   }
 
+  listDeliveringOutbox(limit = 100): StoredOutbox[] {
+    return this.database
+      .query<JobViewRow, [string, number]>(`${JOB_VIEW}
+        WHERE j.scope_key=? AND o.status='Delivering' AND j.cancel_requested=0
+        ORDER BY o.updated_at ASC LIMIT ?`)
+      .all(this.scopeKey, limit)
+      .map(rowToJob)
+      .flatMap((job) => (job.outbox ? [job.outbox] : []));
+  }
+
+  resetDeliveringOutbox(): number {
+    return this.database
+      .query("UPDATE outbox SET status='Pending', updated_at=? WHERE scope_key=? AND status='Delivering'")
+      .run(Date.now(), this.scopeKey).changes;
+  }
+
   listRecent(limit = 50): StoredJob[] {
     return this.database
       .query<JobViewRow, [string, number]>(`${JOB_VIEW} WHERE j.scope_key=? ORDER BY j.updated_at DESC LIMIT ?`)

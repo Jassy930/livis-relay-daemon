@@ -25,6 +25,9 @@ export interface RelayDaemonDependencies {
   secretValues: RelaySecrets;
   upstreamProofExpiresAt: number;
   logger?: Logger;
+  auth?: IdaasClient;
+  upstreamChecker?: UpstreamChecker;
+  upstreamRecheckIntervalMs?: number;
 }
 
 export class RelayDaemon {
@@ -43,13 +46,14 @@ export class RelayDaemon {
     private readonly logger: Logger,
     private upstreamProofExpiresAt: number,
     private readonly upstreamChecker: UpstreamChecker,
+    private readonly upstreamRecheckIntervalMs: number,
   ) {}
 
   static create(dependencies: RelayDaemonDependencies): RelayDaemon {
     const logger = dependencies.logger ?? new Logger("livis-relayd");
     const scopeKey = IdentityStore.scopeKey(dependencies.identity);
     const store = new JobStore(join(dependencies.config.stateDir, "relay.db"), scopeKey);
-    const auth = new IdaasClient(dependencies.profile, dependencies.secrets);
+    const auth = dependencies.auth ?? new IdaasClient(dependencies.profile, dependencies.secrets);
     let daemon!: RelayDaemon;
 
     const connectorHandlers: ConnectorServerHandlers = {
@@ -61,6 +65,25 @@ export class RelayDaemon {
       onDisconnected: (connectorId) => daemon.onConnectorDisconnected(connectorId),
       status: () => daemon.status(),
     };
+    // 一期注册表只有 hermes 一个后端；将来接入其他 agent 时在这里追加
+    // spec，并通过 config.routing 决定消息去向。
+    const backends = [{
+      backend: "hermes",
+      implementation: dependencies.config.hermes.bridgeImplementation,
+      bridgeMinimumVersion: dependencies.config.hermes.bridgeMinimumVersion,
+      bridgeMaximumExclusiveVersion: dependencies.config.hermes.bridgeMaximumExclusiveVersion,
+      runtimeMinimumVersion: dependencies.config.hermes.minimumVersion,
+      runtimeMaximumExclusiveVersion: dependencies.config.hermes.maximumExclusiveVersion,
+    }];
+    const backendNames = new Set(backends.map((spec) => spec.backend));
+    if (!backendNames.has(dependencies.config.routing.defaultBackend)) {
+      throw new Error(`config.routing.defaultBackend 未注册：${dependencies.config.routing.defaultBackend}`);
+    }
+    for (const [nodeId, backend] of Object.entries(dependencies.config.routing.nodeBackends)) {
+      if (!backendNames.has(backend)) {
+        throw new Error(`config.routing.nodeBackends.${nodeId} 指向未注册的 backend：${backend}`);
+      }
+    }
     const connector = new ConnectorServer(
       {
         socketPath: dependencies.config.connector.socketPath,
@@ -69,11 +92,7 @@ export class RelayDaemon {
         resultStoreTimeoutMs: dependencies.config.connector.resultStoreTimeoutMs,
         maxFrameBytes: dependencies.config.connector.maxFrameBytes,
         daemonVersion: DAEMON_VERSION,
-        hermesMinimumVersion: dependencies.config.hermes.minimumVersion,
-        hermesMaximumExclusiveVersion: dependencies.config.hermes.maximumExclusiveVersion,
-        bridgeImplementation: dependencies.config.hermes.bridgeImplementation,
-        bridgeMinimumVersion: dependencies.config.hermes.bridgeMinimumVersion,
-        bridgeMaximumExclusiveVersion: dependencies.config.hermes.bridgeMaximumExclusiveVersion,
+        backends,
       },
       connectorHandlers,
       logger.child("connector"),
@@ -103,7 +122,8 @@ export class RelayDaemon {
       relay,
       logger,
       dependencies.upstreamProofExpiresAt,
-      new UpstreamChecker(),
+      dependencies.upstreamChecker ?? new UpstreamChecker(),
+      dependencies.upstreamRecheckIntervalMs ?? UPSTREAM_RECHECK_INTERVAL_MS,
     );
     return daemon;
   }
@@ -120,7 +140,7 @@ export class RelayDaemon {
     this.relay.start();
     this.upstreamTimer = setInterval(() => {
       void this.recheckUpstream();
-    }, UPSTREAM_RECHECK_INTERVAL_MS);
+    }, this.upstreamRecheckIntervalMs);
     this.upstreamTimer.unref?.();
   }
 
@@ -145,9 +165,8 @@ export class RelayDaemon {
       },
       relay: this.relay.status(),
       connector: {
-        ready: this.connector.ready,
-        connectorId: this.connector.connectorId,
         socketPath: this.connector.socketPath,
+        backends: this.connector.connectorsStatus(),
       },
       quarantinedSessions: this.store.listQuarantinedSessions(),
       recentJobs: this.store.listRecent(20).map((job) => ({
@@ -224,55 +243,55 @@ export class RelayDaemon {
   ): Promise<void> {
     const job = this.store.markRunning(message.jobId, connectorId, message.leaseId);
     if (job.status !== "Running" || job.leaseId !== message.leaseId) {
-      this.connector.rejectJobMessage(message.jobId, "stale_lease", "accepted 使用了失效 lease");
+      this.connector.rejectJobMessage(message.jobId, "stale_lease", "accepted 使用了失效 lease", connectorId);
     }
   }
 
   private async onConnectorResult(
     message: Extract<ConnectorInboundMessage, { type: "result" }>,
-    _connectorId: string,
+    connectorId: string,
   ): Promise<void> {
     if (message.text.length > this.config.security.maxOutputChars) {
-      this.connector.rejectJobMessage(message.jobId, "output_too_large", "Hermes 输出超过 daemon 上限");
+      this.connector.rejectJobMessage(message.jobId, "output_too_large", "Agent 输出超过 daemon 上限", connectorId);
       return;
     }
     const resultJson = serializeResult(message.text);
     const before = this.store.get(message.jobId);
     if (!before || before.leaseId !== message.leaseId) {
-      this.connector.rejectJobMessage(message.jobId, "stale_lease", "result 使用了失效 lease");
+      this.connector.rejectJobMessage(message.jobId, "stale_lease", "result 使用了失效 lease", connectorId);
       return;
     }
     if (before.cancelRequested) {
-      this.connector.rejectJobMessage(message.jobId, "cancel_superseded", "cancel 已获胜，final result 被丢弃");
+      this.connector.rejectJobMessage(message.jobId, "cancel_superseded", "cancel 已获胜，final result 被丢弃", connectorId);
       return;
     }
     const job = this.store.finishSuccess(message.jobId, message.leaseId, resultJson);
     if (job.outbox?.resultJson !== resultJson) {
-      this.connector.rejectJobMessage(message.jobId, "result_conflict", "同一 job 收到不同 final result");
+      this.connector.rejectJobMessage(message.jobId, "result_conflict", "同一 job 收到不同 final result", connectorId);
       return;
     }
-    this.connector.acknowledgeResult(message.jobId, message.leaseId);
+    this.connector.acknowledgeResult(message.jobId, message.leaseId, connectorId);
     await this.relay.notifyOutboxPending();
     await this.dispatchPending();
   }
 
   private async onConnectorFailed(
     message: Extract<ConnectorInboundMessage, { type: "failed" }>,
-    _connectorId: string,
+    connectorId: string,
   ): Promise<void> {
     const before = this.store.get(message.jobId);
     if (!before || before.leaseId !== message.leaseId) {
-      this.connector.rejectJobMessage(message.jobId, "stale_lease", "failed 使用了失效 lease");
+      this.connector.rejectJobMessage(message.jobId, "stale_lease", "failed 使用了失效 lease", connectorId);
       return;
     }
     if (before.cancelRequested) {
-      this.connector.rejectJobMessage(message.jobId, "cancel_superseded", "cancel 已获胜，failed 上报被丢弃");
+      this.connector.rejectJobMessage(message.jobId, "cancel_superseded", "cancel 已获胜，failed 上报被丢弃", connectorId);
       return;
     }
-    const userMessage = "Hermes 暂时无法完成该请求，请稍后重试。";
+    const userMessage = "Agent 暂时无法完成该请求，请稍后重试。";
     const job = this.store.finishFailure(message.jobId, message.leaseId, serializeResult(userMessage), message.error);
     if (job.outbox) {
-      this.connector.acknowledgeResult(message.jobId, message.leaseId);
+      this.connector.acknowledgeResult(message.jobId, message.leaseId, connectorId);
       await this.relay.notifyOutboxPending();
     }
     await this.dispatchPending();
@@ -301,16 +320,23 @@ export class RelayDaemon {
   }
 
   private async dispatchPending(): Promise<void> {
-    if (!this.connector.ready || this.upstreamBlocked) return;
+    if (this.upstreamBlocked) return;
     for (const candidate of this.store.listDispatchable()) {
+      const backend = this.routeBackend(candidate);
+      const connectorId = this.connector.connectorId(backend);
+      if (!connectorId || !this.connector.ready(backend)) continue;
       const leaseId = crypto.randomUUID();
-      const claimed = this.store.claimForDispatch(candidate.jobId, this.connector.connectorId!, leaseId);
+      const claimed = this.store.claimForDispatch(candidate.jobId, connectorId, leaseId);
       if (!claimed) continue;
-      if (!this.connector.sendJob(claimed)) {
+      if (!this.connector.sendJob(claimed, backend)) {
         this.store.resetUnsentDispatch(claimed.jobId, leaseId);
         break;
       }
     }
+  }
+
+  private routeBackend(job: StoredJob): string {
+    return this.config.routing.nodeBackends[job.fromNodeId] ?? this.config.routing.defaultBackend;
   }
 
   private isNodeAuthorized(nodeId: string): boolean {
