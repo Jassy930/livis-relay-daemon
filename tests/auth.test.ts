@@ -76,4 +76,16 @@ describe("IDaaS OAuth Device Flow", () => {
     await expect(client.getAccessToken(true)).rejects.toBeInstanceOf(TerminalAuthError);
     expect((await secrets.get()).refreshToken).toBeUndefined();
   });
+
+  test("refresh 400 invalid_grant 同样删除本地 refresh token", async () => {
+    const profile = await testProfile();
+    await secrets.setRefreshToken("revoked");
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const client = new IdaasClient(profile, secrets, {
+      fetch: queuedFetch([Response.json({ error: "invalid_grant" }, { status: 400 })], requests),
+    });
+    await expect(client.getAccessToken(true)).rejects.toBeInstanceOf(TerminalAuthError);
+    expect((await secrets.get()).refreshToken).toBeUndefined();
+    expect(String(requests[0]?.init?.body)).toContain(`client_id=${profile.oauth.clientId}`);
+  });
 });

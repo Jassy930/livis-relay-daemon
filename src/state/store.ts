@@ -300,7 +300,16 @@ export class JobStore {
     this.database
       .query("UPDATE outbox SET status='Delivered', acked_at=?, updated_at=? WHERE scope_key=? AND job_id=? AND status='Delivering'")
       .run(now, now, this.scopeKey, jobId);
-    return this.require(jobId).outbox;
+    return this.get(jobId)?.outbox ?? null;
+  }
+
+  findJobIdByOutboxMessageId(messageId: string): string | null {
+    const row = this.database
+      .query<{ job_id: string }, [string, string]>(
+        "SELECT job_id FROM outbox WHERE scope_key=? AND last_message_id=?",
+      )
+      .get(this.scopeKey, messageId);
+    return row?.job_id ?? null;
   }
 
   markOutboxAckFailed(jobId: string): StoredOutbox | null {

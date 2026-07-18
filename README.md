@@ -27,7 +27,7 @@ flowchart LR
 
 ## 可靠性与安全特性
 
-- `(account, agent, job_id)` 幂等和 payload hash 冲突检测。
+- `(agent, job_id)` 幂等和 payload hash 冲突检测（一期单账号，account 维度固定为本地占位值）。
 - SQLite durable outbox；Agent 至多执行一次，ACK/结果至少投递一次。
 - `lease_id + run_generation` fencing，同 session 单活。
 - cancel/final 使用 CAS 决定唯一赢家；ambiguous execution 不自动重跑。
