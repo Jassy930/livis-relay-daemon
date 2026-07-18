@@ -17,6 +17,7 @@
 
 ### 变更
 
+- macOS launchd 模板补齐 `HOME`/`PATH`、`077` umask 与启动节流；运行手册明确使用稳定部署 checkout 和独立的命名 Hermes LaunchAgent，canary 文档同步记录服务级复验与待完成的消息闭环。
 - `config.connector.resultStoreTimeoutMs` 通过 `hello_ack` 下发给 Hermes plugin，替代 plugin 侧硬编码 5 秒。
 - cancel 竞争获胜后到达的 final/failed 上报改用专用错误码 `cancel_superseded`，plugin 将其按取消成功处理，不再向 Hermes 报告投递失败。
 - upstream 门禁关闭后周期复核继续运行，恢复 `supported` 时自动重连 LiViS relay，不再要求重启进程。

@@ -144,6 +144,52 @@ bun run src/index.ts doctor --online
 
 替换模板中的绝对路径后再加载服务；daemon 和 Hermes Gateway 必须是两个独立服务。
 
+### macOS LaunchAgent
+
+常驻服务应使用独立、干净且路径稳定的部署 checkout，不要绑定正在开发或含未提交改动的工作树：
+
+```bash
+git clone https://github.com/Jassy930/livis-relay-daemon.git \
+  "$HOME/.local/share/livis-relay-daemon"
+cd "$HOME/.local/share/livis-relay-daemon"
+bun install --frozen-lockfile
+bun run check
+```
+
+从 `packaging/launchd/com.local.livis-relayd.plist.example` 生成本机 plist 时，必须替换 `__BUN__`、`__PROJECT_DIR__` 与 `__HOME__`，然后先验证再加载：
+
+```bash
+plutil -lint /绝对路径/com.local.livis-relayd.plist
+install -m 0644 /绝对路径/com.local.livis-relayd.plist \
+  "$HOME/Library/LaunchAgents/com.local.livis-relayd.plist"
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.local.livis-relayd.plist"
+```
+
+模板显式提供可找到 Bun 与 Hermes CLI 的 `PATH`，并使用 `077` umask，避免 launchd 的最小环境导致版本检查失败或新日志权限过宽。
+
+Hermes plist 必须由当前 Hermes runtime 生成，不要复制仓库模板或手写冻结版本：
+
+```bash
+HERMES_HOME="$LIVIS_HERMES_HOME" hermes gateway install
+```
+
+命名 profile 会生成独立的 `ai.hermes.gateway-livis-test`；默认 profile 仍使用 `ai.hermes.gateway`。所有安装、状态、启停和卸载命令都必须保留正确的 `HERMES_HOME`。
+
+加载后验证两个服务、在线 proof 与 connector：
+
+```bash
+launchctl print "gui/$(id -u)/com.local.livis-relayd"
+launchctl print "gui/$(id -u)/ai.hermes.gateway-livis-test"
+bun run src/index.ts doctor --online
+bun run src/index.ts status
+HERMES_HOME="$LIVIS_HERMES_HOME" hermes gateway status
+```
+
+最后必须重新发送唯一 LiViS canary，并读回 job `Succeeded` 与 outbox `Delivered`。仅看到 launchd PID 或 WebSocket 握手不能替代端到端验收。
+
+升级部署时先停止隔离 Hermes Gateway，再 bootout Relay；更新 checkout、锁文件依赖与 plugin 后必须重新运行完整门禁，最后按 Relay → Hermes 顺序加载并复验。Hermes runtime 的版本窗仍为 fail closed；多 profile 共用同一 Hermes checkout 时，不得从 LiViS 通道执行 `/update`，也不要在其他 Gateway 运行期间直接执行全局 `hermes update`。
+
 ## 8. Session 隔离恢复
 
 看到 `CancelUnknown` 后：

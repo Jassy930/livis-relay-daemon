@@ -64,7 +64,7 @@ bun run check
 - 状态文件、SQLite、WAL 和 SHM 权限均读回为 `0600`。
 - 已使用隔离的 Hermes 0.15.1 profile 完成真实 Device Flow 登录、Agent ID 绑定和 LiViS v2.0.0 消息 canary：入站任务进入 Hermes、模型生成纯文本结果、durable outbox 收到 `ack_send_result` 并进入 `Delivered`。
 - 首次会话必须先发送 `/sethome`；Hermes 的一次性 home-channel 提示会占用一期协议允许的唯一 final。完整证据、操作顺序和限制见 [`docs/HERMES-CANARY.md`](docs/HERMES-CANARY.md)。
-- 本地 canary 当前以前台进程运行，尚未安装 launchd/systemd 常驻服务；默认 Hermes profile 未被修改。
+- 本地验证环境已切换为两个独立的用户级 LaunchAgent：`com.local.livis-relayd` 与隔离 profile 的 `ai.hermes.gateway-livis-test`。服务存活、在线 doctor、relay handshake 和 connector ready 已复验；launchd 常驻模式下的普通文本 canary 仍待目标消息真正入站后完成。默认 Hermes profile 与 Gateway 未被修改。
 
 ## 使用入口
 
