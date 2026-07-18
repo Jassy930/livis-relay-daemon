@@ -1,0 +1,50 @@
+---
+name: Bug 报告
+description: 报告可复现的 daemon、connector 或更新门禁问题
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。安全漏洞请不要使用公开 issue，请改用仓库 Security 页面私下报告。
+  - type: input
+    id: version
+    attributes:
+      label: 项目版本
+      placeholder: 例如 0.1.0 或 commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      options:
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 请使用脱敏 fixture，不要粘贴 token、真实消息或身份文件。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: checks
+    attributes:
+      label: 已执行的检查
+      placeholder: bun run check / doctor --online / 其他脱敏输出

@@ -1,0 +1,51 @@
+{
+  "name": "livis-relay-daemon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "使用版本化协议配置与可插拔 Agent connector 的 LiViS 共享 Relay Daemon",
+  "license": "MIT",
+  "author": {
+    "name": "Jassy",
+    "url": "https://github.com/Jassy930"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jassy930/livis-relay-daemon.git"
+  },
+  "homepage": "https://github.com/Jassy930/livis-relay-daemon#readme",
+  "bugs": {
+    "url": "https://github.com/Jassy930/livis-relay-daemon/issues"
+  },
+  "keywords": [
+    "livis",
+    "hermes",
+    "relay-daemon",
+    "bun",
+    "typescript"
+  ],
+  "packageManager": "bun@1.3.14",
+  "scripts": {
+    "start": "bun run src/index.ts serve",
+    "cli": "bun run src/index.ts",
+    "version:check": "bun run scripts/check-versions.ts",
+    "docs:check": "bun run scripts/check-doc-links.ts",
+    "release:check": "bun run scripts/check-public-release.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "test:hermes": "cd hermes-plugin && uv lock --check && PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider -q",
+    "test:coverage": "bun test --coverage",
+    "check": "bun run version:check && bun run docs:check && bun run release:check && bun run typecheck && bun test && bun run test:hermes"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.22",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "bun": ">=1.3.14"
+  }
+}

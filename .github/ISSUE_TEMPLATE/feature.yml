@@ -1,0 +1,31 @@
+---
+name: 功能建议
+description: 建议新的能力、connector 或兼容改进
+title: "[Feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决的问题
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      description: 请说明状态所有权、权限、取消与升级兼容影响。
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 协议或实现证据
+      description: 如果涉及上游行为，请提供官方来源与版本，不要贴反编译代码。
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 边界确认
+      options:
+        - label: 我没有在 issue 中提交秘密、真实数据或未获许可的上游代码
+          required: true

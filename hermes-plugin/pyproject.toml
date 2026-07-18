@@ -1,0 +1,26 @@
+[project]
+name = "livis-hermes-bridge"
+version = "0.1.0"
+description = "Hermes 到本地 livis-relayd 的薄平台适配器"
+requires-python = ">=3.11,<3.14"
+license = "MIT"
+authors = [
+  { name = "Jassy930" }
+]
+keywords = ["livis", "hermes", "relay"]
+dependencies = [
+  "websockets>=15,<16"
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.24,<1"
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.uv]
+package = false

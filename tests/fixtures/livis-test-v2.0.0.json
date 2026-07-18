@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "id": "livis-test-v2.0.0",
+  "officialPluginVersion": "2.0.0",
+  "wireProtocolVersion": 1,
+  "endpoints": {
+    "idaasBaseUrl": "https://idaas.test/api",
+    "relayWebSocketUrl": "wss://relay.test/api/v1/ws",
+    "relayHttpUrl": "https://relay.test"
+  },
+  "oauth": {
+    "clientId": "test-client-id",
+    "audience": "test-audience",
+    "scope": "test-scope",
+    "logoutRedirectUri": "https://docs.test/logout"
+  },
+  "wireIdentity": {
+    "client": "test-client",
+    "agentIdPrefix": "test-agent-",
+    "deviceIdPrefix": "test-device-",
+    "nodeType": "personal-device"
+  },
+  "timing": {
+    "heartbeatIntervalMs": 30000,
+    "pongTimeoutMs": 60000,
+    "resultAckTimeoutMs": 30000,
+    "resultMaxRetries": 3,
+    "tokenRefreshAckTimeoutMs": 30000,
+    "tokenRefreshMaxFailures": 3
+  },
+  "upstream": {
+    "setupUrl": "https://cdn.test/setup.sh",
+    "setupSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "installPluginUrl": "https://cdn.test/install.sh",
+    "installPluginSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "packageUrl": "https://cdn.test/plugin.tgz",
+    "packageSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "requiredBundleMarkers": [
+      "protocol_version=1",
+      "ack_send_message",
+      "ack_send_result",
+      "ack_cancel_chat",
+      "token_refresh",
+      "personal-device"
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+---
+changelog:
+  categories:
+    - title: 安全与可靠性
+      labels: [security, reliability]
+    - title: 新功能
+      labels: [enhancement]
+    - title: 修复
+      labels: [bug]
+    - title: 其他变更
+      labels: ["*"]

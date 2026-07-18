@@ -1,0 +1,6 @@
+---
+blank_issues_enabled: false
+contact_links:
+  - name: 私下报告安全漏洞
+    url: https://github.com/Jassy930/livis-relay-daemon/security/advisories/new
+    about: 请勿在公开 issue 中披露可利用漏洞或真实凭据

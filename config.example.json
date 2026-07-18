@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "profile": "./protocol-profiles/livis-authorized.example.json",
+  "profileSha256": "33eb80fdff60cff69ea3b3858bb9e586aa77cabb2f70616d2e4daee362768ff4",
+  "stateDir": "~/.livis-relay",
+  "relay": {
+    "nodeName": "我的电脑",
+    "handshakeTimeoutMs": 15000,
+    "reconnectMaxMs": 60000
+  },
+  "connector": {
+    "socketPath": "~/.livis-relay/connector.sock",
+    "helloTimeoutMs": 10000,
+    "resultStoreTimeoutMs": 5000,
+    "maxFrameBytes": 1048576
+  },
+  "security": {
+    "acknowledgeUnofficialProtocol": false,
+    "allowAllNodes": false,
+    "allowedNodeIds": [],
+    "maxInputChars": 32768,
+    "maxOutputChars": 1048576,
+    "unauthorizedMessage": "当前 LiViS 节点未获授权。"
+  },
+  "hermes": {
+    "command": "hermes",
+    "minimumVersion": "0.15.1",
+    "maximumExclusiveVersion": "0.15.2",
+    "bridgeImplementation": "livis-hermes-bridge",
+    "bridgeMinimumVersion": "0.1.0",
+    "bridgeMaximumExclusiveVersion": "0.2.0"
+  }
+}

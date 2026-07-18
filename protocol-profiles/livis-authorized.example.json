@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "id": "livis-authorized-profile-example",
+  "officialPluginVersion": "0.0.0",
+  "wireProtocolVersion": 1,
+  "endpoints": {
+    "idaasBaseUrl": "https://idaas.example.invalid/api",
+    "relayWebSocketUrl": "wss://relay.example.invalid/api/v1/ws",
+    "relayHttpUrl": "https://relay.example.invalid"
+  },
+  "oauth": {
+    "clientId": "replace-with-your-authorized-client-id",
+    "audience": "replace-with-your-authorized-audience",
+    "scope": "replace-with-your-authorized-scope",
+    "logoutRedirectUri": "https://docs.example.invalid/logout"
+  },
+  "wireIdentity": {
+    "client": "replace-with-your-authorized-client-name",
+    "agentIdPrefix": "community-agent-",
+    "deviceIdPrefix": "community-device-",
+    "nodeType": "personal-device"
+  },
+  "timing": {
+    "heartbeatIntervalMs": 30000,
+    "pongTimeoutMs": 60000,
+    "resultAckTimeoutMs": 30000,
+    "resultMaxRetries": 3,
+    "tokenRefreshAckTimeoutMs": 30000,
+    "tokenRefreshMaxFailures": 3
+  },
+  "upstream": {
+    "setupUrl": "https://downloads.example.invalid/latest/setup.sh",
+    "setupSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "installPluginUrl": "https://downloads.example.invalid/latest/install-plugin.sh",
+    "installPluginSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "packageUrl": "https://downloads.example.invalid/versions/v0.0.0/plugin.tar.gz",
+    "packageSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "requiredBundleMarkers": [
+      "protocol_version=1",
+      "ack_send_message",
+      "ack_send_result",
+      "ack_cancel_chat",
+      "token_refresh"
+    ]
+  }
+}

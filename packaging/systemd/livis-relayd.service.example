@@ -1,0 +1,21 @@
+[Unit]
+Description=LiViS 共享 Relay Daemon（Hermes connector）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 安装前将 __BUN__ 与 __PROJECT_DIR__ 替换为绝对路径。
+WorkingDirectory=__PROJECT_DIR__
+ExecStart=__BUN__ run src/index.ts serve --config %h/.livis-relay/config.json
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.livis-relay
+UMask=0077
+
+[Install]
+WantedBy=default.target
