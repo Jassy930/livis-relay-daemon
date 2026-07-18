@@ -1,0 +1,138 @@
+---
+name: Auto-merge Policy
+
+"on":
+  pull_request_target:
+    branches: [main]
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+      - closed
+      - labeled
+      - unlabeled
+      - review_requested
+      - review_request_removed
+      - ready_for_review
+      - converted_to_draft
+      - auto_merge_enabled
+      - auto_merge_disabled
+  issue_comment:
+    types: [created, edited, deleted]
+  issues:
+    types: [opened, edited, closed, reopened, labeled, unlabeled, deleted]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+# 每个互斥 job 单独签发最小权限 token；顶层不继承仓库默认权限。
+permissions: {}
+
+concurrency:
+  # 所有触发器共享同一把仓库锁；enforce 每个 run 最多处理一笔候选。
+  group: livis-relay-daemon-automerge-policy
+  cancel-in-progress: false
+
+jobs:
+  dry-run:
+    if: ${{ vars.AUTOMERGE_POLICY_MODE != 'audit' && vars.AUTOMERGE_POLICY_MODE != 'enforce' }}
+    name: Auto-merge Policy (dry-run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - name: 检出可信 main 代码
+        timeout-minutes: 5
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: 安装 Bun
+        timeout-minutes: 5
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.3.14
+      - name: 执行低风险 Auto-merge 门禁
+        timeout-minutes: 10
+        env:
+          AUTOMERGE_POLICY_MODE: dry-run
+          AUTOMERGE_TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun run scripts/check-automerge-policy.ts
+
+  audit:
+    if: ${{ vars.AUTOMERGE_POLICY_MODE == 'audit' }}
+    name: Auto-merge Policy (audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      actions: read
+      checks: write
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - name: 检出可信 main 代码
+        timeout-minutes: 5
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: 安装 Bun
+        timeout-minutes: 5
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.3.14
+      - name: 执行低风险 Auto-merge 门禁
+        timeout-minutes: 10
+        env:
+          AUTOMERGE_POLICY_MODE: audit
+          AUTOMERGE_TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun run scripts/check-automerge-policy.ts
+
+  enforce:
+    if: ${{ vars.AUTOMERGE_POLICY_MODE == 'enforce' }}
+    name: Auto-merge Policy (enforce)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      actions: read
+      checks: write
+      contents: write
+      issues: read
+      pull-requests: write
+    steps:
+      - name: 检出可信 main 代码
+        timeout-minutes: 5
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: 安装 Bun
+        timeout-minutes: 5
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.3.14
+      - name: 执行低风险 Auto-merge 门禁
+        timeout-minutes: 10
+        env:
+          AUTOMERGE_POLICY_MODE: enforce
+          AUTOMERGE_TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun run scripts/check-automerge-policy.ts
