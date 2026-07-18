@@ -6,7 +6,8 @@
   "relay": {
     "nodeName": "我的电脑",
     "handshakeTimeoutMs": 15000,
-    "reconnectMaxMs": 60000
+    "reconnectMaxMs": 60000,
+    "maxFrameBytes": 1048576
   },
   "connector": {
     "socketPath": "~/.livis-relay/connector.sock",

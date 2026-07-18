@@ -1,4 +1,4 @@
-import WebSocket from "ws";
+import WebSocket, { type RawData } from "ws";
 import type { RelayConfig } from "../config.ts";
 import type { RelayIdentity } from "../identity.ts";
 import type { Logger } from "../logger.ts";
@@ -25,6 +25,22 @@ export interface RelayClientHandlers {
   onIncoming(envelope: RelayEnvelope): Promise<void>;
   onCancel(jobId: string): Promise<void>;
   onConnected(): Promise<void>;
+}
+
+type RelayRawData = RawData | string;
+
+export function relayFrameByteLength(data: RelayRawData): number {
+  if (typeof data === "string") return Buffer.byteLength(data, "utf8");
+  if (data instanceof ArrayBuffer) return data.byteLength;
+  if (Array.isArray(data)) return data.reduce((total, part) => total + part.byteLength, 0);
+  return data.byteLength;
+}
+
+function relayFrameText(data: RelayRawData): string {
+  if (typeof data === "string") return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8");
+  if (Array.isArray(data)) return Buffer.concat(data).toString("utf8");
+  return data.toString("utf8");
 }
 
 export class RelayClient {
@@ -124,7 +140,7 @@ export class RelayClient {
     }
     const url = new URL(this.profile.endpoints.relayWebSocketUrl);
     url.searchParams.set("protocol_version", String(this.profile.wireProtocolVersion));
-    const socket = new WebSocket(url);
+    const socket = new WebSocket(url, { maxPayload: this.config.relay.maxFrameBytes });
     this.socket = socket;
     this.handshakeComplete = false;
     this.messageChain = Promise.resolve();
@@ -168,7 +184,17 @@ export class RelayClient {
       this.lastPongAt = Date.now();
     });
     socket.on("message", (data) => {
-      const raw = typeof data === "string" ? data : data.toString();
+      const frameBytes = relayFrameByteLength(data);
+      if (frameBytes > this.config.relay.maxFrameBytes) {
+        this.logger.warn("LiViS 消息被拒绝", {
+          error: "WebSocket frame 超过配置的字节上限",
+          frameBytes,
+          maxFrameBytes: this.config.relay.maxFrameBytes,
+        });
+        socket.close(1009, "frame too large");
+        return;
+      }
+      const raw = relayFrameText(data);
       this.messageChain = this.messageChain
         .then(async () => {
           const envelope = parseRelayEnvelope(raw);
@@ -238,7 +264,7 @@ export class RelayClient {
       }
       case "cancel_chat": {
         const jobId = envelope.metadata?.job_id;
-        if (typeof jobId !== "string" || jobId === "") {
+        if (typeof jobId !== "string" || jobId.trim() === "") {
           throw new Error("cancel_chat 缺少 job_id");
         }
         await this.handlers.onCancel(jobId);

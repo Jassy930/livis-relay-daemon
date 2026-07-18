@@ -2,8 +2,24 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { statSync } from "node:fs";
 import { Database } from "bun:sqlite";
-import { JobConflictError, JobStore } from "../src/state/store.ts";
+import {
+  JobConflictError,
+  JobStore,
+  PENDING_CANCEL_MAX_ROWS,
+  PendingCancelCapacityError,
+  PENDING_CANCEL_TTL_MS,
+} from "../src/state/store.ts";
 import { incomingJob, temporaryDirectory } from "./helpers.ts";
+
+function pendingCancelCount(databasePath: string): number {
+  const database = new Database(databasePath, { readonly: true });
+  try {
+    return database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM pending_cancels")
+      .get()?.count ?? 0;
+  } finally {
+    database.close();
+  }
+}
 
 describe("durable jobs + outbox", () => {
   let directory: Awaited<ReturnType<typeof temporaryDirectory>>;
@@ -92,10 +108,141 @@ describe("durable jobs + outbox", () => {
   });
 
   test("cancel intent 可先于消息到达", () => {
+    const databasePath = join(directory.path, "relay.db");
     expect(store.requestCancel("future-job")).toBeNull();
+    expect(pendingCancelCount(databasePath)).toBe(1);
     const ingested = store.ingest(incomingJob("future-job"), "session-1").job;
     expect(ingested.status).toBe("Cancelled");
     expect(ingested.cancelRequested).toBeTrue();
+    expect(pendingCancelCount(databasePath)).toBe(0);
+  });
+
+  test("重复 job 入库和启动 GC 都会先应用再消费历史匹配的 cancel intent", () => {
+    const databasePath = join(directory.path, "relay.db");
+    store.ingest(incomingJob("duplicate-job"), "session-duplicate");
+    store.markAcked("duplicate-job");
+    store.ingest(incomingJob("startup-job"), "session-startup");
+    store.markAcked("startup-job");
+
+    let legacy = new Database(databasePath);
+    legacy.query("INSERT INTO pending_cancels(scope_key,job_id,created_at) VALUES(?,?,?)")
+      .run("account:agent", "duplicate-job", Date.now());
+    legacy.close();
+    expect(store.ingest(incomingJob("duplicate-job"), "session-duplicate").job.status).toBe("Cancelled");
+    expect(pendingCancelCount(databasePath)).toBe(0);
+
+    legacy = new Database(databasePath);
+    legacy.query("INSERT INTO pending_cancels(scope_key,job_id,created_at) VALUES(?,?,?)")
+      .run("account:agent", "startup-job", Date.now());
+    legacy.close();
+    store.close();
+    store = new JobStore(databasePath, "account:agent");
+    expect(pendingCancelCount(databasePath)).toBe(0);
+    expect(store.require("startup-job").status).toBe("Cancelled");
+  });
+
+  test("启动 GC 将 active job 的历史 intent 应用为 Cancelling，恢复时隔离为 CancelUnknown", () => {
+    const databasePath = join(directory.path, "relay.db");
+    store.ingest(incomingJob("active-job"), "session-active");
+    store.markAcked("active-job");
+    store.claimForDispatch("active-job", "connector", "lease-active");
+    store.markRunning("active-job", "connector", "lease-active");
+    store.close();
+
+    const legacy = new Database(databasePath);
+    legacy.query("INSERT INTO pending_cancels(scope_key,job_id,created_at) VALUES(?,?,?)")
+      .run("account:agent", "active-job", Date.now());
+    legacy.close();
+
+    store = new JobStore(databasePath, "account:agent");
+    expect(store.require("active-job").status).toBe("Cancelling");
+    expect(pendingCancelCount(databasePath)).toBe(0);
+    const recovery = store.recoverAfterRestart();
+    expect(recovery.cancelUnknown).toBe(1);
+    expect(store.require("active-job").status).toBe("CancelUnknown");
+    expect(store.listQuarantinedSessions().map((entry) => entry.sessionKey))
+      .toContain("session-active");
+  });
+
+  test("过期 cancel 不影响迟到 job，TTL 边界内 intent 仍生效且都会被删除", () => {
+    const databasePath = join(directory.path, "relay.db");
+    const fixedNow = 1_800_000_000_000;
+    const originalNow = Date.now;
+    Date.now = () => fixedNow;
+    try {
+      store.requestCancel("expired-job");
+      store.requestCancel("boundary-job");
+      const database = new Database(databasePath);
+      database.query("UPDATE pending_cancels SET created_at=? WHERE scope_key=? AND job_id=?")
+        .run(fixedNow - PENDING_CANCEL_TTL_MS - 1, "account:agent", "expired-job");
+      database.query("UPDATE pending_cancels SET created_at=? WHERE scope_key=? AND job_id=?")
+        .run(fixedNow - PENDING_CANCEL_TTL_MS, "account:agent", "boundary-job");
+      database.close();
+
+      expect(store.ingest(incomingJob("expired-job"), "session-expired").job.status).toBe("Received");
+      expect(store.ingest(incomingJob("boundary-job"), "session-boundary").job.status).toBe("Cancelled");
+      expect(pendingCancelCount(databasePath)).toBe(0);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  test("未知 cancel 达到总量上限后拒绝新 ID，但允许刷新旧 intent 和取消已有 job", () => {
+    const databasePath = join(directory.path, "relay.db");
+    const database = new Database(databasePath);
+    const insert = database.query(
+      "INSERT INTO pending_cancels(scope_key,job_id,created_at) VALUES(?,?,?)",
+    );
+    const now = Date.now();
+    const fill = database.transaction(() => {
+      for (let index = 0; index < PENDING_CANCEL_MAX_ROWS; index += 1) {
+        insert.run("account:agent", `unknown-${index}`, now);
+      }
+    });
+    fill.immediate();
+    database.close();
+
+    expect(pendingCancelCount(databasePath)).toBe(PENDING_CANCEL_MAX_ROWS);
+    expect(() => store.requestCancel("overflow")).toThrow(PendingCancelCapacityError);
+    expect(pendingCancelCount(databasePath)).toBe(PENDING_CANCEL_MAX_ROWS);
+    expect(store.requestCancel("unknown-0")).toBeNull();
+
+    store.ingest(incomingJob("known-job"), "session-known");
+    store.markAcked("known-job");
+    expect(store.requestCancel("known-job")?.status).toBe("Cancelled");
+    expect(pendingCancelCount(databasePath)).toBe(PENDING_CANCEL_MAX_ROWS);
+  });
+
+  test("schema v2 幂等补 GC 索引，并在启动时清除过期、匹配和旧库溢出 intent", () => {
+    const databasePath = join(directory.path, "relay.db");
+    store.ingest(incomingJob("matched-job"), "session-1");
+    store.close();
+
+    const legacy = new Database(databasePath);
+    legacy.exec("DROP INDEX idx_pending_cancels_gc; PRAGMA user_version=2;");
+    const insert = legacy.query(
+      "INSERT INTO pending_cancels(scope_key,job_id,created_at) VALUES(?,?,?)",
+    );
+    insert.run("account:agent", "matched-job", Date.now());
+    insert.run("account:agent", "expired-job", Date.now() - PENDING_CANCEL_TTL_MS - 1);
+    const fill = legacy.transaction(() => {
+      for (let index = 0; index <= PENDING_CANCEL_MAX_ROWS; index += 1) {
+        insert.run("account:agent", `fresh-${index}`, Date.now() + index);
+      }
+    });
+    fill.immediate();
+    legacy.close();
+
+    store = new JobStore(databasePath, "account:agent");
+    expect(pendingCancelCount(databasePath)).toBe(PENDING_CANCEL_MAX_ROWS);
+    expect(store.require("matched-job").status).toBe("Cancelled");
+    const migrated = new Database(databasePath, { readonly: true });
+    const indexes = migrated.query<{ name: string }, []>("PRAGMA index_list('pending_cancels')")
+      .all().map((row) => row.name);
+    const version = migrated.query<{ user_version: number }, []>("PRAGMA user_version").get();
+    migrated.close();
+    expect(indexes).toContain("idx_pending_cancels_gc");
+    expect(version?.user_version).toBe(2);
   });
 
   test("cancel 和 final 由 CAS 决定先后", () => {

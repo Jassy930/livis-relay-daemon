@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { join, resolve } from "node:path";
-import { initializeConfig, loadRelayConfig, parseRelayConfig } from "../src/config.ts";
+import {
+  DEFAULT_RELAY_MAX_FRAME_BYTES,
+  initializeConfig,
+  loadRelayConfig,
+  MAX_RELAY_MAX_FRAME_BYTES,
+  parseRelayConfig,
+} from "../src/config.ts";
 import { loadProtocolProfile, parseProtocolProfile } from "../src/protocol/profile.ts";
 import { atomicWritePrivate } from "../src/util.ts";
 import { temporaryDirectory, testConfig, testProfile } from "./helpers.ts";
@@ -53,6 +59,25 @@ describe("配置与协议 profile", () => {
     expect(() => parseRelayConfig(JSON.stringify(invalidHermesRange), "/tmp/config.json")).toThrow("版本范围");
   });
 
+  test("旧配置兼容 relay 帧默认上限，并拒绝无效或过大的显式值", () => {
+    const config = testConfig("/tmp/test-state");
+    const legacy = structuredClone(config) as unknown as Record<string, unknown>;
+    delete (legacy.relay as Record<string, unknown>).maxFrameBytes;
+    expect(parseRelayConfig(JSON.stringify(legacy), "/tmp/config.json").relay.maxFrameBytes)
+      .toBe(DEFAULT_RELAY_MAX_FRAME_BYTES);
+
+    expect(parseRelayConfig(JSON.stringify({
+      ...config,
+      relay: { ...config.relay, maxFrameBytes: 512 },
+    }), "/tmp/config.json").relay.maxFrameBytes).toBe(512);
+    for (const maxFrameBytes of [0, -1, MAX_RELAY_MAX_FRAME_BYTES + 1]) {
+      expect(() => parseRelayConfig(JSON.stringify({
+        ...config,
+        relay: { ...config.relay, maxFrameBytes },
+      }), "/tmp/config.json")).toThrow("maxFrameBytes");
+    }
+  });
+
   test("init 把已审核 profile 复制到状态目录并锁定 SHA-256", async () => {
     const directory = await temporaryDirectory();
     try {
@@ -63,6 +88,7 @@ describe("配置与协议 profile", () => {
         acknowledgeUnofficialProtocol: true,
       });
       const loaded = await loadRelayConfig(configPath);
+      expect(loaded.config.relay.maxFrameBytes).toBe(DEFAULT_RELAY_MAX_FRAME_BYTES);
       expect(loaded.config.profile).toStartWith(join(directory.path, "relay", "protocol-profiles"));
       expect((await loadProtocolProfile(
         loaded.config.profile,
