@@ -9,7 +9,7 @@ authors = [
 ]
 keywords = ["livis", "hermes", "relay"]
 dependencies = [
-  "websockets>=15,<16"
+  "websockets>=15,<17"
 ]
 
 [dependency-groups]
