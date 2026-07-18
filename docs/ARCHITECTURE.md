@@ -29,6 +29,12 @@ Pending → Delivering → Delivered
 - `Dispatching/Running/Cancelling` 属于 ambiguous execution，不自动重跑。
 - 未 ACK 的结果只重发 outbox，每次生成新的 `msg_id`，保留原 `job_id` 和结果内容。
 
+## 在线 token 刷新
+
+服务端发送 `token_expiring` 后，daemon 会在当前 WebSocket 连接代际内刷新 IDaaS access token，并等待 `token_refreshed` ACK。临时 IDaaS 错误和 ACK 超时都会有限次退避重试；重试耗尽只关闭当前 socket，由外层连接循环继续重连，不把 daemon 标记为永久失败。
+
+每次新建连接或停止 daemon 都会使旧代际的刷新任务失效，因此旧 socket 的迟到 ACK、定时器或异步刷新结果不能改变新连接。只有 `invalid_grant` 等确定性凭据失效会清除凭据并进入终止状态，需要重新完成 Device Flow。
+
 ## Hermes connector contract
 
 一期 connector protocol 固定为 v1，关键消息为：
