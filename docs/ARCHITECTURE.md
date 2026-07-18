@@ -45,6 +45,14 @@ ping / pong
 
 Hermes `handle_message()` 会在后台完成，lease 必须保持到 `on_processing_complete()`。`send()` 只有收到 daemon 的 `result_stored` 后才向 Hermes 返回成功。
 
+daemon 在 job 入库前按 account、agent 和 `from_node_id` 生成固定格式 session key：
+
+```text
+livis:account:<sha256(accountId)>:agent:<sha256(agentId)>:node:<sha256(from_node_id)>
+```
+
+connector 将该 key 原样映射为 Hermes `chatId`。同一节点重连或重启后仍命中同一会话，不同节点则在 Hermes 历史、单 session 执行锁和 quarantine 上完全分离。启动时会幂等重建旧数据库中的共享 session key，并把旧隔离记录展开到受影响节点；Hermes 旧共享历史不会迁移，因为无法判断其中每段上下文属于哪个节点，升级会有意切断这段历史连续性。
+
 ## 官方更新分层
 
 LiViS 与 Hermes 使用不同门禁：

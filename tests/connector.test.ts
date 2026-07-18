@@ -2,9 +2,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import WebSocket from "ws";
 import { ConnectorServer, type ConnectorServerHandlers } from "../src/connector/server.ts";
+import { buildHermesSessionKey } from "../src/session.ts";
 import { Logger } from "../src/logger.ts";
 import { JobStore } from "../src/state/store.ts";
 import type { ConnectorHello, ConnectorInboundMessage } from "../src/types.ts";
+import { sha256 } from "../src/util.ts";
 import { incomingJob, temporaryDirectory } from "./helpers.ts";
 
 function openWebSocket(path: string, token: string): WebSocket {
@@ -126,6 +128,60 @@ describe("Hermes connector Unix WebSocket", () => {
     expect(events.some((event) => event.type === "result")).toBeTrue();
     server.acknowledgeResult("job-1", "lease-1");
     expect(await read()).toEqual({ type: "result_stored", jobId: "job-1", leaseId: "lease-1" });
+
+    client.close();
+    await new Promise((resolve) => client.once("close", resolve));
+  });
+
+  test("不同 LiViS 节点使用不同 Hermes chatId，同一节点保持稳定", async () => {
+    const client = openWebSocket(server.socketPath, token);
+    const read = messageReader(client);
+    await new Promise<void>((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    await read();
+    client.send(JSON.stringify({
+      type: "hello",
+      protocolVersion: 1,
+      connectorId: "hermes-session-test",
+      backend: "hermes",
+      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.15.1" },
+      capabilities: { cancel: true, finalResult: true },
+    }));
+    expect((await read()).type).toBe("hello_ack");
+
+    const identity = {
+      schemaVersion: 1 as const,
+      accountId: "account-test",
+      agentId: "agent-test",
+      deviceId: "device-test",
+      createdAt: "2026-07-18T00:00:00.000Z",
+    };
+    const chatIds: string[] = [];
+    for (const [jobId, nodeId] of [
+      ["job-node-a-1", "node-a"],
+      ["job-node-a-2", "node-a"],
+      ["job-node-b", "node-b"],
+    ] as const) {
+      const sessionKey = buildHermesSessionKey(identity, nodeId);
+      store.ingest(incomingJob(jobId, "hello", nodeId), sessionKey);
+      store.markAcked(jobId);
+      const leaseId = `lease-${jobId}`;
+      const job = store.claimForDispatch(jobId, "hermes-session-test", leaseId)!;
+      expect(server.sendJob(job)).toBeTrue();
+      const offered = await read();
+      expect(offered.type).toBe("job");
+      chatIds.push((offered.job as { chatId: string }).chatId);
+      store.finishSuccess(jobId, leaseId, '{"text":"done"}');
+    }
+
+    const prefix = `livis:account:${sha256(identity.accountId)}:agent:${sha256(identity.agentId)}:node:`;
+    expect(chatIds[0]).toBe(`${prefix}${sha256("node-a")}`);
+    expect(chatIds[1]).toBe(chatIds[0]);
+    expect(chatIds[2]).toBe(`${prefix}${sha256("node-b")}`);
+    expect(chatIds[2]).not.toBe(chatIds[0]);
+    expect(chatIds.every((chatId) => !chatId.includes("node-a") && !chatId.includes("node-b"))).toBeTrue();
 
     client.close();
     await new Promise((resolve) => client.once("close", resolve));

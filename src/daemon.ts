@@ -9,6 +9,7 @@ import { parseIncomingRelayJob, serializeResult } from "./protocol/livis.ts";
 import type { ProtocolProfile } from "./protocol/profile.ts";
 import { RelayClient, type RelayClientHandlers } from "./relay/client.ts";
 import { SecretStore, type RelaySecrets } from "./secrets.ts";
+import { buildHermesSessionKey } from "./session.ts";
 import { JobConflictError, JobStore } from "./state/store.ts";
 import type { ConnectorHello, ConnectorInboundMessage, RelayEnvelope, StoredJob } from "./types.ts";
 import { UpstreamChecker } from "./upstream/checker.ts";
@@ -114,8 +115,11 @@ export class RelayDaemon {
         "尚未确认 LiViS 第三方兼容协议边界；请审阅文档后设置 security.acknowledgeUnofficialProtocol=true",
       );
     }
+    const sessionMigration = this.store.migrateSessionKeys((fromNodeId) =>
+      buildHermesSessionKey(this.identity, fromNodeId)
+    );
     const recovery = this.store.recoverAfterRestart();
-    this.logger.info("SQLite 恢复完成", recovery);
+    this.logger.info("SQLite 恢复完成", { ...recovery, sessionMigration });
     this.connector.start();
     this.relay.start();
     this.upstreamTimer = setInterval(() => {
@@ -166,7 +170,7 @@ export class RelayDaemon {
 
   private async onRelayIncoming(envelope: RelayEnvelope): Promise<void> {
     const incoming = parseIncomingRelayJob(envelope, this.config.security.maxInputChars);
-    const sessionKey = `livis:${this.identity.agentId}`;
+    const sessionKey = buildHermesSessionKey(this.identity, incoming.fromNodeId);
     let job: StoredJob;
     try {
       const ingested = this.store.ingest(incoming, sessionKey);

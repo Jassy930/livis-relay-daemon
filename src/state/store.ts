@@ -123,6 +123,56 @@ export class JobStore {
     return row?.integrity_check ?? "unknown";
   }
 
+  migrateSessionKeys(resolveSessionKey: (fromNodeId: string) => string): { jobs: number; quarantines: number } {
+    const jobs = this.database
+      .query<{ job_id: string; from_node_id: string; session_key: string }, [string]>(
+        "SELECT job_id,from_node_id,session_key FROM jobs WHERE scope_key=?",
+      )
+      .all(this.scopeKey);
+    const quarantines = this.database
+      .query<{ session_key: string; reason: string; created_at: number }, [string]>(
+        "SELECT session_key,reason,created_at FROM session_quarantine WHERE scope_key=? ORDER BY created_at",
+      )
+      .all(this.scopeKey);
+
+    const transaction = this.database.transaction(() => {
+      let migratedJobs = 0;
+      let migratedQuarantines = 0;
+
+      // 旧版会把所有节点放在同一个 session。隔离记录也必须先展开到对应节点，
+      // 否则 rekey 后可能绕过一次尚未确认已停止的 Hermes 执行。
+      for (const quarantine of quarantines) {
+        const replacementKeys = new Set(
+          jobs
+            .filter((job) => job.session_key === quarantine.session_key)
+            .map((job) => resolveSessionKey(job.from_node_id)),
+        );
+        for (const sessionKey of replacementKeys) {
+          if (sessionKey === quarantine.session_key) continue;
+          migratedQuarantines += this.database
+            .query(`INSERT OR IGNORE INTO session_quarantine(scope_key,session_key,reason,created_at)
+                    VALUES(?,?,?,?)`)
+            .run(this.scopeKey, sessionKey, quarantine.reason, quarantine.created_at).changes;
+        }
+        if (replacementKeys.size > 0 && !replacementKeys.has(quarantine.session_key)) {
+          this.database
+            .query("DELETE FROM session_quarantine WHERE scope_key=? AND session_key=?")
+            .run(this.scopeKey, quarantine.session_key);
+        }
+      }
+
+      for (const job of jobs) {
+        const sessionKey = resolveSessionKey(job.from_node_id);
+        if (sessionKey === job.session_key) continue;
+        migratedJobs += this.database
+          .query("UPDATE jobs SET session_key=? WHERE scope_key=? AND job_id=?")
+          .run(sessionKey, this.scopeKey, job.job_id).changes;
+      }
+      return { jobs: migratedJobs, quarantines: migratedQuarantines };
+    });
+    return transaction.immediate();
+  }
+
   private enforcePrivatePermissions(): void {
     for (const candidate of [this.path, `${this.path}-wal`, `${this.path}-shm`]) {
       if (existsSync(candidate)) chmodSync(candidate, 0o600);

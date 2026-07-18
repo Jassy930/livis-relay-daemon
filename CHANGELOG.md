@@ -14,6 +14,7 @@
 - Device Flow 依据 OAuth error 处理 `authorization_pending` / `slow_down`，兼容 LiViS IDaaS 对 pending 返回 HTTP 428 的实际行为。
 - relay 心跳判活改为任何可解析的服务端消息都刷新，不再仅依赖 WS 协议层 pong。
 - `parseSemverTriplet` 拒绝预发布版本（如 `0.15.1-beta`），预发布 Hermes/bridge 不再落入已审核区间。
+- Hermes `chatId` 按 account、agent 和 LiViS 来源节点的 SHA-256 命名空间隔离；升级时重建旧共享 session 与 quarantine，并有意切断无法安全拆分的既有共享历史。
 
 ### 变更
 

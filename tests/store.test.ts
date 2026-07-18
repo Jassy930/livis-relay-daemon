@@ -91,6 +91,28 @@ describe("durable jobs + outbox", () => {
     expect(store.claimForDispatch("c", "connector", "lease-c")).not.toBeNull();
   });
 
+  test("升级时把旧共享 session 和隔离记录按来源节点重建", () => {
+    store.ingest(incomingJob("job-node-a", "hello", "node-a"), "legacy-shared-session");
+    store.markAcked("job-node-a");
+    store.claimForDispatch("job-node-a", "connector", "lease-a");
+    store.markRunning("job-node-a", "connector", "lease-a");
+
+    store.ingest(incomingJob("job-node-b", "hello", "node-b"), "legacy-shared-session");
+    store.markAcked("job-node-b");
+    store.recoverAfterRestart();
+    expect(store.listQuarantinedSessions().map((entry) => entry.sessionKey)).toEqual(["legacy-shared-session"]);
+
+    const migrated = store.migrateSessionKeys((nodeId) => `isolated-${nodeId}`);
+    expect(migrated).toEqual({ jobs: 2, quarantines: 2 });
+    expect(store.require("job-node-a").sessionKey).toBe("isolated-node-a");
+    expect(store.require("job-node-b").sessionKey).toBe("isolated-node-b");
+    expect(store.listQuarantinedSessions().map((entry) => entry.sessionKey)).toEqual([
+      "isolated-node-a",
+      "isolated-node-b",
+    ]);
+    expect(store.migrateSessionKeys((nodeId) => `isolated-${nodeId}`)).toEqual({ jobs: 0, quarantines: 0 });
+  });
+
   test("cancel intent 可先于消息到达", () => {
     expect(store.requestCancel("future-job")).toBeNull();
     const ingested = store.ingest(incomingJob("future-job"), "session-1").job;

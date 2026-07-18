@@ -40,6 +40,18 @@
 
 Hermes `/stop` 不能证明不合作的工具线程已退出。因此 connector 返回 `cancelled` 后，daemon 仍记录 `CancelUnknown` 并隔离 session。只有在重启专用 Hermes Gateway、确认旧工具进程已结束后，才允许人工执行 `session release`。
 
+## Hermes 会话隔离
+
+每个 LiViS 来源节点使用独立 Hermes `chatId`：
+
+```text
+livis:account:<sha256(accountId)>:agent:<sha256(agentId)>:node:<sha256(from_node_id)>
+```
+
+三个身份段均使用固定长度 SHA-256 和显式标签，保留 account/agent 命名空间并避免分隔符碰撞；原始节点 ID 不直接进入 `chatId`。哈希只用于稳定编码，不是加密或匿名化。不同节点不会共享 Hermes 对话历史、单 session 执行锁或 session quarantine。
+
+从旧版升级时，daemon 会把已落盘作业从旧共享 session 重建到各节点 session；旧共享 session 上已有的隔离记录会保守地展开到其中出现过的所有节点。Hermes 中既有的共享对话历史无法安全拆分，因此升级后会被有意切断，不会由任一节点继承；各节点的下一条消息从新的独立 `chatId` 开始。
+
 ## 数据落盘与保留
 
 SQLite 默认明文保存 `from_node_id`、输入文本、原始 payload、job/lease 状态和最终结果。数据库依赖 state directory 的 `0700` 与数据库/WAL/SHM 的 `0600` 权限保护，不提供静态加密。
