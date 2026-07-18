@@ -36,7 +36,8 @@ describe("IDaaS OAuth Device Flow", () => {
         expires_in: 60,
         interval: 1,
       }),
-      Response.json({ error: "authorization_pending" }, { status: 400 }),
+      // LiViS IDaaS production currently uses 428 for the normal pending state.
+      Response.json({ error: "authorization_pending" }, { status: 428 }),
       Response.json({
         [profile.oauth.audience]: {
           access_token: "access",
@@ -65,6 +66,32 @@ describe("IDaaS OAuth Device Flow", () => {
     const auxBody = String(requests[0]?.init?.body);
     expect(auxBody).toContain(`scope=${profile.oauth.scope}+offline_access`);
     expect(auxBody).toContain(`audience=${profile.oauth.audience}`);
+  });
+
+  test("slow_down 不依赖特定 HTTP 状态并增加后续轮询间隔", async () => {
+    const profile = await testProfile();
+    const sleeps: number[] = [];
+    const client = new IdaasClient(profile, secrets, {
+      fetch: queuedFetch([
+        Response.json({ error: "slow_down" }, { status: 429 }),
+        Response.json({
+          [profile.oauth.audience]: {
+            access_token: "access",
+            refresh_token: "refresh",
+            expires_in: 3600,
+          },
+        }),
+      ], []),
+      sleep: async (milliseconds) => { sleeps.push(milliseconds); },
+    });
+    const token = await client.pollForToken({
+      device_code: "device-code",
+      verification_uri_complete: "https://example.test/login",
+      expires_in: 60,
+      interval: 1,
+    });
+    expect(token.accessToken).toBe("access");
+    expect(sleeps).toEqual([1000, 6000]);
   });
 
   test("refresh 401 删除本地 refresh token", async () => {

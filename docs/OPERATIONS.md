@@ -47,10 +47,18 @@ bun run src/index.ts login
 
 ## 6. 安装 Hermes plugin
 
-插件目录必须同时包含三个文件：
+先创建不复制默认凭据、skills、会话或 Gateway 状态的隔离 profile：
+
+```bash
+hermes profile create livis-test --no-skills --no-alias \
+  --description "LiViS Relay 一期隔离测试 profile"
+export LIVIS_HERMES_HOME="$HOME/.hermes/profiles/livis-test"
+```
+
+不要使用 `--clone` / `--clone-all`，也不要把插件启用到正在承载其他渠道的默认 Gateway。插件目录必须同时包含三个文件：
 
 ```text
-~/.hermes/plugins/livis-bridge/
+$LIVIS_HERMES_HOME/plugins/livis-bridge/
 ├── plugin.yaml
 ├── __init__.py
 └── adapter.py
@@ -59,21 +67,21 @@ bun run src/index.ts login
 从仓库根目录复制：
 
 ```bash
-install -d -m 0700 "$HOME/.hermes/plugins/livis-bridge"
+install -d -m 0700 "$LIVIS_HERMES_HOME/plugins/livis-bridge"
 install -m 0644 \
   hermes-plugin/plugin.yaml \
   hermes-plugin/__init__.py \
   hermes-plugin/adapter.py \
-  "$HOME/.hermes/plugins/livis-bridge/"
+  "$LIVIS_HERMES_HOME/plugins/livis-bridge/"
 ```
 
 复制后显式启用：
 
 ```bash
-hermes plugins enable livis-bridge
+HERMES_HOME="$LIVIS_HERMES_HOME" hermes plugins enable livis-bridge
 ```
 
-在专用 Hermes profile 的环境中设置：
+在专用 Hermes profile 的 `.env` 中以 `0600` 权限设置：
 
 ```bash
 LIVIS_RELAY_SOCKET=$HOME/.livis-relay/connector.sock
@@ -89,6 +97,31 @@ bun run src/index.ts connector-token
 ```
 
 Hermes 显示配置必须关闭 streaming、tool progress 和 interim assistant messages；工具配置必须为只读，并使用独立工作区。不要在这条远程渠道中启用 manual approval，因为一期没有 approval control lane。
+
+Hermes 0.15.1 建议为 LiViS 使用独立 profile，并在该 profile 的 `config.yaml` 中显式固定：
+
+```yaml
+platform_toolsets:
+  livis:
+    - no_mcp
+display:
+  streaming: false
+  interim_assistant_messages: false
+  platforms:
+    livis:
+      streaming: false
+      tool_progress: "off"
+      interim_assistant_messages: false
+      long_running_notifications: false
+      busy_ack_detail: false
+      show_reasoning: false
+streaming:
+  enabled: false
+gateway:
+  strict: true
+```
+
+`tool_progress` 的关闭值是字符串 `"off"`，不是 `none` 或 YAML 布尔值；必须保留引号。`no_mcp` 让该平台即使以后配置了全局 MCP，也仍保持零工具面。所有 `hermes plugins` / `hermes gateway` 命令都必须带该 profile 的 `HERMES_HOME`，普通命令会误操作默认 profile。
 
 该目录不是 wheel，也不能直接通过 monorepo 根执行 `hermes plugins install owner/repo`；开发、升级和卸载边界见 [`hermes-plugin/README.md`](../hermes-plugin/README.md)。
 

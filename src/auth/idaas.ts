@@ -121,11 +121,15 @@ export class IdaasClient {
         return tokenSet;
       }
       const oauthError = typeof data.error === "string" ? data.error : `http_${response.status}`;
-      if (response.status === 400 && oauthError === "authorization_pending") {
+      // LiViS IDaaS currently returns HTTP 428 for authorization_pending,
+      // although RFC 8628 examples commonly use HTTP 400. The OAuth error
+      // value is authoritative; coupling polling semantics to one status code
+      // makes a normal pending response terminate the Device Flow.
+      if (oauthError === "authorization_pending") {
         options.onPending?.();
         continue;
       }
-      if (response.status === 400 && oauthError === "slow_down") {
+      if (oauthError === "slow_down") {
         intervalMs += 5000;
         continue;
       }
@@ -135,7 +139,7 @@ export class IdaasClient {
       if (oauthError === "access_denied") {
         throw new TerminalAuthError("用户拒绝了授权");
       }
-      throw new Error(`设备授权失败：${oauthError}`);
+      throw new Error(`设备授权失败：${oauthError}（HTTP ${response.status}）`);
     }
     throw new TerminalAuthError("设备授权等待超时");
   }
