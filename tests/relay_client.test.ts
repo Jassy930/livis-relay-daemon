@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
-import type { IdaasClient } from "../src/auth/idaas.ts";
+import { TerminalAuthError, type IdaasClient } from "../src/auth/idaas.ts";
 import type { RelayConfig } from "../src/config.ts";
 import type { RelayIdentity } from "../src/identity.ts";
 import { Logger } from "../src/logger.ts";
@@ -252,6 +252,8 @@ describe("RelayClient fake LiViS end-to-end", () => {
         pongTimeoutMs: 20_000,
         resultAckTimeoutMs: 40,
         resultMaxRetries: 3,
+        tokenRefreshAckTimeoutMs: 40,
+        tokenRefreshMaxFailures: 2,
       },
     };
     config = testConfig(directory.path);
@@ -278,10 +280,12 @@ describe("RelayClient fake LiViS end-to-end", () => {
     await directory.cleanup();
   });
 
-  function createClient(handlers: RelayClientHandlers): RelayClient {
-    const auth = {
+  function createClient(
+    handlers: RelayClientHandlers,
+    auth: IdaasClient = {
       getAccessToken: async () => "access-test",
-    } as unknown as IdaasClient;
+    } as unknown as IdaasClient,
+  ): RelayClient {
     client = new RelayClient(
       config,
       profile,
@@ -542,10 +546,19 @@ describe("RelayClient fake LiViS end-to-end", () => {
     const relayClient = createClient(durableHandlers());
     const internals = relayClient as unknown as {
       handshakeComplete: boolean;
+      socket: unknown;
+      connectionGeneration: number;
       resultAckTimers: Map<string, ReturnType<typeof setTimeout>>;
-      handleEnvelope: (envelope: RelayEnvelope) => Promise<void>;
+      handleEnvelope: (
+        envelope: RelayEnvelope,
+        socket: unknown,
+        connectionGeneration: number,
+      ) => Promise<void>;
     };
     internals.handshakeComplete = true;
+    const socket = { readyState: 0, close: () => undefined };
+    internals.socket = socket;
+    internals.connectionGeneration = 1;
     const timer = setTimeout(() => undefined, 10_000);
     internals.resultAckTimers.set("never-delivered", timer);
     try {
@@ -553,7 +566,7 @@ describe("RelayClient fake LiViS end-to-end", () => {
         type: "ack_send_result",
         metadata: { job_id: "never-delivered" },
         payload: {},
-      });
+      }, socket, 1);
       expect(store.require("never-delivered").outbox?.status).toBe("Pending");
       expect(internals.resultAckTimers.get("never-delivered")).toBe(timer);
     } finally {
@@ -785,6 +798,83 @@ describe("RelayClient fake LiViS end-to-end", () => {
     expect(store.require("future-job").status).toBe("Cancelled");
     expect(store.require("future-job").cancelRequested).toBeTrue();
     expect(executionCount).toBe(0);
+  });
+
+  test("在线 token refresh 首次临时失败后自动重试并成功", async () => {
+    let forcedRefreshes = 0;
+    const auth = {
+      getAccessToken: async (force = false) => {
+        if (!force) return "access-initial";
+        forcedRefreshes += 1;
+        if (forcedRefreshes === 1) {
+          throw new Error("temporary IDaaS 503");
+        }
+        return "access-refreshed";
+      },
+    } as unknown as IdaasClient;
+    const relayClient = createClient(durableHandlers(), auth);
+    relayClient.start();
+    const socket = await fakeRelay.handshake(relayClient);
+
+    fakeRelay.send(socket, { type: "token_expiring", metadata: {}, payload: {} });
+    const refresh = await fakeRelay.next("token_refresh", 1_000);
+    expect(forcedRefreshes).toBe(2);
+    expect(refresh.envelope.payload?.token).toBe("access-refreshed");
+
+    fakeRelay.send(socket, { type: "token_refreshed", metadata: {}, payload: {} });
+    await Bun.sleep(10);
+    expect(relayClient.status().terminalFailure).toBeNull();
+    expect(relayClient.connected).toBeTrue();
+  });
+
+  test("token refresh ACK 丢失时有限重试后非终止重连", async () => {
+    let forcedRefreshes = 0;
+    const auth = {
+      getAccessToken: async (force = false) => {
+        if (force) forcedRefreshes += 1;
+        return force ? `access-refreshed-${forcedRefreshes}` : "access-initial";
+      },
+    } as unknown as IdaasClient;
+    const relayClient = createClient(durableHandlers(), auth);
+    relayClient.start();
+    const firstSocket = await fakeRelay.handshake(relayClient);
+
+    fakeRelay.send(firstSocket, { type: "token_expiring", metadata: {}, payload: {} });
+    await fakeRelay.next("token_refresh", 1_000);
+    await fakeRelay.next("token_refresh", 1_000);
+    expect(forcedRefreshes).toBe(profile.timing.tokenRefreshMaxFailures);
+
+    const secondSocket = await fakeRelay.handshake(relayClient, 3_000);
+    expect(secondSocket).not.toBe(firstSocket);
+    expect(relayClient.status().terminalFailure).toBeNull();
+    expect(relayClient.connected).toBeTrue();
+  });
+
+  test("旧连接迟到的终止认证错误不影响新连接", async () => {
+    const refreshStarted = deferred<void>();
+    const oldRefresh = deferred<string>();
+    const auth = {
+      getAccessToken: async (force = false) => {
+        if (!force) return "access-initial";
+        refreshStarted.resolve();
+        return oldRefresh.promise;
+      },
+    } as unknown as IdaasClient;
+    const relayClient = createClient(durableHandlers(), auth);
+    relayClient.start();
+    const firstSocket = await fakeRelay.handshake(relayClient);
+
+    fakeRelay.send(firstSocket, { type: "token_expiring", metadata: {}, payload: {} });
+    await refreshStarted.promise;
+    await fakeRelay.disconnect(firstSocket);
+    const secondSocket = await fakeRelay.handshake(relayClient, 3_000);
+
+    oldRefresh.reject(new TerminalAuthError("旧连接的 invalid_grant"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(secondSocket).not.toBe(firstSocket);
+    expect(relayClient.status().terminalFailure).toBeNull();
+    expect(relayClient.connected).toBeTrue();
   });
 
   test("断开后把 Delivering 重置为 Pending，重连重放并完成 ACK", async () => {

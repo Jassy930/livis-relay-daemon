@@ -43,6 +43,7 @@
 - `logout` 现在只在 IDaaS revoke 返回 2xx 后清除本地 refresh token；远端非 2xx 或网络失败会令命令失败并保留本地可恢复凭据，不再虚假报告撤销成功。
 - 重复 `cancel_chat` 现在保持 `Cancelling`，不会误降为 `Cancelled` 并绕过 `CancelUnknown` 与 session 隔离；取消状态转移改为 SQLite 原子条件更新，迟到 cancel 不再回退 `Interrupted` 或其他终态。
 - Relay `connect` 与 `token_refresh` 帧不再携带长期 refresh token，只发送短期 access token；refresh token 仅用于 daemon 向 IDaaS 换取新 token。
+- 在线 `token_refresh` 遇到临时 IDaaS 失败或 ACK 丢失时，按当前连接代际有限退避重试；单连接耗尽后交给外层重连，旧连接迟到的认证错误不会终止新连接，只有当前代际的确定性凭据失效才终止。
 - 结果重试不再覆盖旧的投递 ID；首次投递的延迟 ACK 在重试开始后仍能关联原 job。
 - 驱逐失活 connector 时会先结算旧 generation 的活跃 lease 并隔离相关 session，再接纳新连接；结算仅在持久化成功后标记完成，首次 SQLite/I/O 失败可由 takeover 或迟到 `close` 重试；旧 socket 的入站消息不再影响复用同一 ID 的新 generation。
 - `ack_send_result` 的 `ref_msg_id` 现在会按持久化投递记录回查真实 job，引用投递 `msg_id` 的 ACK 不再丢失。
