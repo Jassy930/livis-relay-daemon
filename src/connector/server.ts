@@ -206,10 +206,11 @@ export class ConnectorServer {
           if (timer) clearTimeout(timer);
           this.helloTimers.delete(socket);
           const connectorId = socket.data.connectorId;
-          if (this.activeSocket === socket) {
+          const wasActive = this.activeSocket === socket;
+          if (wasActive) {
             this.activeSocket = null;
           }
-          if (connectorId) {
+          if (connectorId && wasActive) {
             void handlers.onDisconnected(connectorId).catch((error) => {
               logger.error("connector 断开清理失败", { connectorId, error: errorMessage(error) });
             });
@@ -319,8 +320,9 @@ export class ConnectorServer {
           this.logger.warn("驱逐失活的旧 connector，接受新 hello", {
             staleConnectorId: this.activeSocket.data.connectorId,
           });
-          this.activeSocket.close(1001, "replaced by new connector");
+          const staleSocket = this.activeSocket;
           this.activeSocket = null;
+          staleSocket.close(1001, "replaced by new connector");
         } else {
           this.send(socket, { type: "error", code: "connector_conflict", message: "已有 Hermes connector 在线" });
           socket.close(1008, "connector conflict");

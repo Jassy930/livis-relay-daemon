@@ -377,18 +377,18 @@ describe("RelayClient fake LiViS end-to-end", () => {
     );
   });
 
-  test("ack_send_result 通过 ref_msg_id 引用投递 msg_id 时也能标记 Delivered", async () => {
-    // 避免 40ms 重试在 ACK 处理前刷新 last_message_id 造成竞态。
-    profile.timing.resultAckTimeoutMs = 1_000;
+  test("重试后仍接受 ref_msg_id 引用首次投递的延迟 ACK", async () => {
     createPendingResult(store, "ref-ack-job");
     const relayClient = createClient(durableHandlers());
     relayClient.start();
     const socket = await fakeRelay.handshake(relayClient);
 
-    const delivered = await fakeRelay.next("send_result");
-    const deliveryMessageId = delivered.envelope.metadata?.msg_id;
+    const firstDelivery = await fakeRelay.next("send_result");
+    const deliveryMessageId = firstDelivery.envelope.metadata?.msg_id;
     expect(deliveryMessageId).toBeString();
     expect(deliveryMessageId).not.toBe("ref-ack-job");
+    const retry = await fakeRelay.next("send_result");
+    expect(retry.envelope.metadata?.msg_id).not.toBe(deliveryMessageId);
     fakeRelay.send(socket, {
       type: "ack_send_result",
       metadata: {},
@@ -397,7 +397,7 @@ describe("RelayClient fake LiViS end-to-end", () => {
     await waitFor(
       () => store.require("ref-ack-job").outbox?.status === "Delivered",
       1_000,
-      "ref_msg_id ack delivery",
+      "delayed ref_msg_id ack delivery",
     );
   });
 
