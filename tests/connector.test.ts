@@ -153,6 +153,57 @@ describe("Hermes connector Unix WebSocket", () => {
     client.close();
   });
 
+  test("替换失活连接时旧 close 不误清理新连接", async () => {
+    const oldClient = openWebSocket(server.socketPath, token);
+    const readOld = messageReader(oldClient);
+    await new Promise<void>((resolve, reject) => {
+      oldClient.once("open", resolve);
+      oldClient.once("error", reject);
+    });
+    await readOld();
+    oldClient.send(JSON.stringify({
+      type: "hello",
+      protocolVersion: 1,
+      connectorId: "hermes-reused",
+      backend: "hermes",
+      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.15.1" },
+      capabilities: { cancel: true, finalResult: true },
+    }));
+    expect((await readOld()).type).toBe("hello_ack");
+
+    const activeSocket = (server as unknown as {
+      activeSocket: { data: { lastPongAt: number } };
+    }).activeSocket;
+    activeSocket.data.lastPongAt = 0;
+    const oldClosed = new Promise<void>((resolve) => oldClient.once("close", () => resolve()));
+
+    const newClient = openWebSocket(server.socketPath, token);
+    const readNew = messageReader(newClient);
+    await new Promise<void>((resolve, reject) => {
+      newClient.once("open", resolve);
+      newClient.once("error", reject);
+    });
+    await readNew();
+    newClient.send(JSON.stringify({
+      type: "hello",
+      protocolVersion: 1,
+      connectorId: "hermes-reused",
+      backend: "hermes",
+      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.15.1" },
+      capabilities: { cancel: true, finalResult: true },
+    }));
+    expect((await readNew()).type).toBe("hello_ack");
+    await oldClosed;
+    await Bun.sleep(5);
+
+    expect(server.ready).toBeTrue();
+    expect(events.filter((event) => event.type === "ready")).toHaveLength(2);
+    expect(events.filter((event) => event.type === "disconnected")).toHaveLength(0);
+
+    newClient.close();
+    await new Promise((resolve) => newClient.once("close", resolve));
+  });
+
   test("只接受已审核 Hermes 和 bridge 版本范围", async () => {
     const oldClient = openWebSocket(server.socketPath, token);
     const readOld = messageReader(oldClient);
