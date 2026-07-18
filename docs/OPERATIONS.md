@@ -148,6 +148,8 @@ bun run src/index.ts doctor --online
 
 `status` 中的 `recentJobs[].outboxStatus=AckFailed` 表示结果在本轮 ACK 重试耗尽后进入了持久化退避，`outboxNextAttemptAt` 是下一次尝试的 Unix 毫秒时间。该状态会在到期、重连或重启后自动恢复：
 
+本版本首次启动会在 SQLite 事务中把 schema v2 升级为 v3。部署前先停止 daemon，并完整备份 state directory；旧版 daemon 不认识 v3，若需要回滚程序，也必须同时恢复升级前的数据库备份，不能让旧版直接打开已迁移的 `relay.db`。
+
 - 不要删除 `relay.db`，也不要重跑 Agent job；至少一次投递会允许结果重复，手工重跑会放大副作用。
 - 退避期间到达的延迟 ACK 会直接将结果收敛为 `Delivered`。
 - 若超过 `outboxNextAttemptAt` 且 relay 已连接后仍长时间没有新投递，运行 `status` 和 `doctor --online` 并保留 daemon 日志；不要直接编辑 SQLite。
