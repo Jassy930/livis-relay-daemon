@@ -117,4 +117,60 @@ describe("IDaaS OAuth Device Flow", () => {
     expect((await secrets.get()).refreshToken).toBeUndefined();
     expect(String(requests[0]?.init?.body)).toContain(`client_id=${profile.oauth.clientId}`);
   });
+
+  test("revoke 只有远端确认成功后才清除本地 refresh token", async () => {
+    const profile = await testProfile();
+    await secrets.setRefreshToken("refresh-to-revoke");
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const client = new IdaasClient(profile, secrets, {
+      fetch: queuedFetch([new Response(null, { status: 204 })], requests),
+    });
+
+    await client.revoke();
+
+    expect((await secrets.get()).refreshToken).toBeUndefined();
+    expect(requests[0]?.url).toEndWith("/revoke");
+    const body = String(requests[0]?.init?.body);
+    expect(body).toContain("token=refresh-to-revoke");
+    expect(body).toContain("token_type_hint=refresh_token");
+    expect(body).toContain(`client_id=${profile.oauth.clientId}`);
+  });
+
+  test("revoke 非 2xx 时保留磁盘 refresh token 和缓存 access token", async () => {
+    const profile = await testProfile();
+    await secrets.setRefreshToken("recoverable-refresh");
+    const client = new IdaasClient(profile, secrets, {
+      fetch: queuedFetch([
+        Response.json({
+          [profile.oauth.audience]: {
+            access_token: "cached-access",
+            expires_in: 3600,
+          },
+        }),
+        Response.json({ error: "temporarily_unavailable" }, { status: 503 }),
+      ], []),
+    });
+    expect(await client.getAccessToken(true)).toBe("cached-access");
+
+    await expect(client.revoke()).rejects.toThrow("HTTP 503");
+
+    expect((await secrets.get()).refreshToken).toBe("recoverable-refresh");
+    expect((await new SecretStore(directory.path).load()).refreshToken).toBe("recoverable-refresh");
+    expect(await client.getAccessToken()).toBe("cached-access");
+  });
+
+  test("revoke 网络失败时保留本地 refresh token", async () => {
+    const profile = await testProfile();
+    await secrets.setRefreshToken("recoverable-refresh");
+    const client = new IdaasClient(profile, secrets, {
+      fetch: (async () => {
+        throw new Error("network unavailable");
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(client.revoke()).rejects.toThrow("network unavailable");
+
+    expect((await secrets.get()).refreshToken).toBe("recoverable-refresh");
+    expect((await new SecretStore(directory.path).load()).refreshToken).toBe("recoverable-refresh");
+  });
 });
