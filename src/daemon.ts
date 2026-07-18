@@ -321,6 +321,8 @@ export class RelayDaemon {
 
   private async dispatchPending(): Promise<void> {
     if (this.upstreamBlocked) return;
+    // store 每个 session 只返回最早的待派发 job：该 job 的 backend 离线时，
+    // 同 session 的后续 job 必须继续排队，但其他 session 仍可独立推进。
     for (const candidate of this.store.listDispatchable()) {
       const backend = this.routeBackend(candidate);
       const connectorId = this.connector.connectorId(backend);

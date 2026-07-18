@@ -300,6 +300,28 @@ describe("RelayDaemon 编排：fake LiViS + 真 UDS connector", () => {
     expect(store.listQuarantinedSessions()).toHaveLength(1);
   });
 
+  test("较早 job 的 backend 离线时同 session 后续 job 不越过", async () => {
+    const activeDaemon = createDaemon();
+    // create 已完成生产配置校验；这里仅模拟未来已注册但当前离线的第二后端，
+    // 以确定性验证派发队列，不扩展一期生产注册表。
+    config.security.allowedNodeIds.push("node-offline");
+    config.routing.nodeBackends["node-offline"] = "offline-backend";
+    activeDaemon.start();
+    const relaySocket = await fakeRelay.handshake(
+      () => (daemon!.status().relay as Record<string, unknown>).connected === true,
+    );
+    connector = await connectFakeConnector(config.connector.socketPath, connectorToken, "hermes-order");
+    const store = openReaderStore();
+
+    fakeRelay.send(relaySocket, messageEnvelope("job-offline", "node-offline"));
+    expect((await fakeRelay.next("ack_send_message")).envelope.metadata?.job_id).toBe("job-offline");
+    fakeRelay.send(relaySocket, messageEnvelope("job-online", "node-1"));
+    expect((await fakeRelay.next("ack_send_message")).envelope.metadata?.job_id).toBe("job-online");
+
+    expect(store.require("job-offline").status).toBe("Acked");
+    expect(store.require("job-online").status).toBe("Acked");
+  });
+
   test("未授权 node 的 job 被拒绝并投递拒绝话术", async () => {
     createDaemon().start();
     const relaySocket = await fakeRelay.handshake(

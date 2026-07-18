@@ -232,6 +232,17 @@ export class JobStore {
                     AND active.status IN ('Dispatching','Running','Cancelling')
                 )
                 AND NOT EXISTS (
+                  SELECT 1 FROM jobs earlier
+                  WHERE earlier.scope_key=target.scope_key
+                    AND earlier.session_key=target.session_key
+                    AND earlier.status IN ('Received','Acked')
+                    AND earlier.cancel_requested=0
+                    AND (
+                      earlier.created_at < target.created_at OR
+                      (earlier.created_at=target.created_at AND earlier.rowid < target.rowid)
+                    )
+                )
+                AND NOT EXISTS (
                   SELECT 1 FROM session_quarantine q
                   WHERE q.scope_key=target.scope_key AND q.session_key=target.session_key
                 )`)
@@ -398,10 +409,21 @@ export class JobStore {
               AND active.status IN ('Dispatching','Running','Cancelling')
           )
           AND NOT EXISTS (
+            SELECT 1 FROM jobs earlier
+            WHERE earlier.scope_key=j.scope_key
+              AND earlier.session_key=j.session_key
+              AND earlier.status IN ('Received','Acked')
+              AND earlier.cancel_requested=0
+              AND (
+                earlier.created_at < j.created_at OR
+                (earlier.created_at=j.created_at AND earlier.rowid < j.rowid)
+              )
+          )
+          AND NOT EXISTS (
             SELECT 1 FROM session_quarantine q
             WHERE q.scope_key=j.scope_key AND q.session_key=j.session_key
           )
-        ORDER BY j.created_at ASC LIMIT ?`)
+        ORDER BY j.created_at ASC, j.rowid ASC LIMIT ?`)
       .all(this.scopeKey, limit)
       .map(rowToJob);
   }

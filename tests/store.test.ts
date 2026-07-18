@@ -81,13 +81,17 @@ describe("durable jobs + outbox", () => {
     expect(store.integrityCheck()).toBe("ok");
   });
 
-  test("同 session 单活，不同 session 可并发", () => {
-    for (const id of ["a", "b", "c"]) {
-      store.ingest(incomingJob(id), id === "c" ? "session-2" : "session-1");
-      store.markAcked(id);
-    }
+  test("同 session 跨 backend 只暴露最早 job，不同 session 仍可派发", () => {
+    // daemon 会把 node-offline 路由到离线 backend，把 node-online 路由到
+    // 在线 backend；store 必须先按 session 排队，不能让 b 越过 a。
+    store.ingest(incomingJob("a", "hello", "node-offline"), "session-1");
+    store.ingest(incomingJob("b", "hello", "node-online"), "session-1");
+    store.ingest(incomingJob("c", "hello", "node-online"), "session-2");
+    for (const id of ["a", "b", "c"]) store.markAcked(id);
+
+    expect(store.listDispatchable().map((job) => job.jobId)).toEqual(["a", "c"]);
+    expect(store.claimForDispatch("b", "online-connector", "lease-b")).toBeNull();
     expect(store.claimForDispatch("a", "connector", "lease-a")).not.toBeNull();
-    expect(store.claimForDispatch("b", "connector", "lease-b")).toBeNull();
     expect(store.claimForDispatch("c", "connector", "lease-c")).not.toBeNull();
   });
 

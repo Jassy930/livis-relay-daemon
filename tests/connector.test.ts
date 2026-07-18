@@ -202,10 +202,12 @@ describe("Hermes connector Unix WebSocket", () => {
     }));
     expect((await readOld()).type).toBe("hello_ack");
 
-    const activeSocket = (server as unknown as {
-      activeSocket: { data: { lastPongAt: number } };
-    }).activeSocket;
-    activeSocket.data.lastPongAt = 0;
+    const activeSockets = (server as unknown as {
+      activeSockets: Map<string, { data: { lastPongAt: number } }>;
+    }).activeSockets;
+    const activeSocket = activeSockets.get("hermes");
+    expect(activeSocket).toBeDefined();
+    activeSocket!.data.lastPongAt = 0;
     const oldClosed = new Promise<void>((resolve) => oldClient.once("close", () => resolve()));
 
     const newClient = openWebSocket(server.socketPath, token);
@@ -227,7 +229,8 @@ describe("Hermes connector Unix WebSocket", () => {
     await oldClosed;
     await Bun.sleep(5);
 
-    expect(server.ready).toBeTrue();
+    expect(server.ready("hermes")).toBeTrue();
+    expect(server.connectorId("hermes")).toBe("hermes-reused");
     expect(events.filter((event) => event.type === "ready")).toHaveLength(2);
     expect(events.filter((event) => event.type === "disconnected")).toHaveLength(0);
 
