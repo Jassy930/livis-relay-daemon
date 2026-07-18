@@ -13,7 +13,7 @@
 
 ### 新增
 
-- 新增 Hermes、Codex、Claude 本地后端目标架构、后端中立调用契约与认证所有权边界测试；Codex、Claude 在 adapter 和 canary 完成前保持 `contract-only`。
+- 新增 Hermes、Codex、Claude 本地后端目标架构、后端中立调用契约与认证所有权边界测试；Codex 已实现实验性 app-server backend 但仍使用私有 `CODEX_HOME`，Claude 保持 `contract-only`。
 - 新增严格 JSON Schema 约束的 `capabilities.json`，并提供只读 CLI、证据引用和一致性门禁。
 - 新增 Hermes bridge 原子安装器、私有配置备份、失败自动恢复和哈希绑定回滚收据。
 - 新增源码包与 bridge 包构建、SHA-256 manifest、路径预检和解包后发布产物审计。
@@ -42,6 +42,7 @@
 - schema v1→v2 迁移的 durable 文件、两类 guard 和私有目录现在会在创建句柄或目录上显式固定并读回 `0600` / `0700`，避免极端 `umask` 产生不可读配置、无法释放的 guard 或不可访问目录。
 - `logout` 现在只在 IDaaS revoke 返回 2xx 后清除本地 refresh token；远端非 2xx 或网络失败会令命令失败并保留本地可恢复凭据，不再虚假报告撤销成功。
 - 重复 `cancel_chat` 现在保持 `Cancelling`，不会误降为 `Cancelled` 并绕过 `CancelUnknown` 与 session 隔离；取消状态转移改为 SQLite 原子条件更新，迟到 cancel 不再回退 `Interrupted` 或其他终态。
+- Relay `connect` 与 `token_refresh` 帧不再携带长期 refresh token，只发送短期 access token；refresh token 仅用于 daemon 向 IDaaS 换取新 token。
 - 结果重试不再覆盖旧的投递 ID；首次投递的延迟 ACK 在重试开始后仍能关联原 job。
 - 驱逐失活 connector 时会先结算旧 generation 的活跃 lease 并隔离相关 session，再接纳新连接；结算仅在持久化成功后标记完成，首次 SQLite/I/O 失败可由 takeover 或迟到 `close` 重试；旧 socket 的入站消息不再影响复用同一 ID 的新 generation。
 - `ack_send_result` 的 `ref_msg_id` 现在会按持久化投递记录回查真实 job，引用投递 `msg_id` 的 ACK 不再丢失。

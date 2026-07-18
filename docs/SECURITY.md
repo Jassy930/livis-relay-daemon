@@ -97,7 +97,8 @@ daemon 0.1.1 内建 bridge 0.1.1 安全下限。配置中的 `hermes.bridgeMinim
 - schema v1→v2 迁移和 supported-proof writer 新建的私有目录会在 fsync 前显式固定并精确读回 `0700`；若上次进程在 `mkdir` 与固定权限之间退出，重试会受控修复只缺 owner 权限的已有目录。durable 临时文件与两类 guard 会在各自创建 fd 上显式固定并精确读回 `0600` 后才写入、同步或 rename。不能只依赖 `mkdir` / `open` 的 mode 参数，因为进程 umask 仍可能移除 owner 权限。
 - `config.connector.socketPath` 的父目录必须是 state directory 内的私有非 symlink 目录；profile 迁移会在该路径创建并持久化普通文件 guard。创建 fd 会保持打开到安全 release，以固定原 inode，并与当前路径交叉复核 dev/inode、link count、文件类型、权限和 nonce；父目录的类型、私有权限与 realpath 也会在每次所有权检查和 release 完成前重验。位于 `/tmp` 等共享目录或 state directory 外的 socket 不属于迁移支持边界。
 - connector 使用至少 32 字节随机 Bearer token，并做常量时间比较。
-- refresh token 只在 daemon state directory 持久化，不进入 SQLite、argv、普通日志或 Git。当前 v2.0.0 兼容基线仍会把它复制进 Relay `connect` / `token_refresh` 帧：历史高层 canary 发生在旧代码基线，但没有字段级 receipt，也不证明服务端要求该字段；这是待收口的显式安全例外。目标是 Relay 只接收短期 access token，但在真实 Relay canary 前不得宣称兼容，也不得设置静默泄露回退。证据和门禁见[服务端协议边界](LIVIS-RELAY-PROTOCOL-BOUNDARY.md)。
+- refresh token 只保存在 daemon state directory，并仅由 IDaaS client 用于 `/token`、`/revoke`；不进入 Relay `connect` / `token_refresh` 帧、SQLite、argv、普通日志或 Git。
+- Relay 只接收短期 access token。该最小权限帧与官方 v2.0.0 客户端的已观察字段不同；静态客户端源码没有证明 Relay 要求 refresh token，但本项目尚未用真实 Relay 验证省略字段后的握手与在线刷新兼容性。正式启用前必须完成非生产 canary，失败时保持 fail closed，不能静默恢复长期凭据出站。证据和门禁见[服务端协议边界](LIVIS-RELAY-PROTOCOL-BOUNDARY.md)。
 - LiViS 一期没有附件或文件上传路径。Codex agent 可以读写其专用 workspace；该目录
   必须只放允许远程执行影响的内容，不得包含 daemon secret、其他项目 checkout 或
   用户默认 Codex profile。

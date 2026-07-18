@@ -55,6 +55,12 @@ immutable session hash 还绑定唯一获准 `node_id`，因此同一 state dire
 当前 Codex 已实现并通过 app-server canary，但仍使用 daemon 私有 `CODEX_HOME` 与专用 API
 key；Claude 仍只有中立调用契约。迁移计划与门禁见[本地多后端架构与认证边界](LOCAL-BACKENDS.md)。
 
+## OAuth 凭据边界
+
+refresh token 的流向固定为本地 SecretStore → daemon 的 IDaaS client → IDaaS `/token` 或 `/revoke`，不会进入 Relay WebSocket。Relay `connect` 和 `token_refresh` 只携带 IDaaS 返回的短期 access token；Relay 无法仅凭捕获的业务帧持续换取新 token。
+
+官方 v2.0.0 客户端样本会在这两种帧中附带 refresh token，但静态客户端代码不能证明服务端是否把该字段设为必填。本项目当前只有 fake Relay 契约测试，没有真实 Relay canary；正式启用前必须验证握手、`token_expiring` → `token_refresh` → `token_refreshed` 全链路，不能把单元测试视为线上兼容性证明。
+
 ## 执行与投递是两套状态
 
 ```text
