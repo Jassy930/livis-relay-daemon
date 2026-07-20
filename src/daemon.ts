@@ -66,6 +66,7 @@ export class RelayDaemon {
         socketPath: dependencies.config.connector.socketPath,
         connectorToken: dependencies.secretValues.connectorToken,
         helloTimeoutMs: dependencies.config.connector.helloTimeoutMs,
+        resultStoreTimeoutMs: dependencies.config.connector.resultStoreTimeoutMs,
         maxFrameBytes: dependencies.config.connector.maxFrameBytes,
         daemonVersion: DAEMON_VERSION,
         hermesMinimumVersion: dependencies.config.hermes.minimumVersion,
@@ -241,6 +242,10 @@ export class RelayDaemon {
       this.connector.rejectJobMessage(message.jobId, "stale_lease", "result 使用了失效 lease");
       return;
     }
+    if (before.cancelRequested) {
+      this.connector.rejectJobMessage(message.jobId, "cancel_superseded", "cancel 已获胜，final result 被丢弃");
+      return;
+    }
     const job = this.store.finishSuccess(message.jobId, message.leaseId, resultJson);
     if (job.outbox?.resultJson !== resultJson) {
       this.connector.rejectJobMessage(message.jobId, "result_conflict", "同一 job 收到不同 final result");
@@ -258,6 +263,10 @@ export class RelayDaemon {
     const before = this.store.get(message.jobId);
     if (!before || before.leaseId !== message.leaseId) {
       this.connector.rejectJobMessage(message.jobId, "stale_lease", "failed 使用了失效 lease");
+      return;
+    }
+    if (before.cancelRequested) {
+      this.connector.rejectJobMessage(message.jobId, "cancel_superseded", "cancel 已获胜，failed 上报被丢弃");
       return;
     }
     const userMessage = "Hermes 暂时无法完成该请求，请稍后重试。";
@@ -309,7 +318,7 @@ export class RelayDaemon {
   }
 
   private async recheckUpstream(): Promise<void> {
-    if (this.stopping || this.upstreamBlocked || this.upstreamCheckRunning) return;
+    if (this.stopping || this.upstreamCheckRunning) return;
     this.upstreamCheckRunning = true;
     try {
       const snapshot = await this.upstreamChecker.check(this.profile, [this.profile]);
@@ -324,12 +333,23 @@ export class RelayDaemon {
         snapshot,
       });
       this.upstreamProofExpiresAt = Date.parse(saved.proof.expiresAt);
+      if (this.upstreamBlocked) {
+        // 门禁关闭可能只是 CDN 抖动导致复核失败；恢复 supported 后自动
+        // 解除，避免必须重启进程。
+        const reason = this.upstreamBlocked;
+        this.upstreamBlocked = null;
+        this.logger.info("官方 upstream 门禁恢复，重新连接 LiViS relay", { previousReason: reason });
+        this.relay.start();
+        await this.dispatchPending();
+      }
       this.logger.info("官方 upstream 周期复核通过", {
         profile: this.profile.id,
         expiresAt: saved.proof.expiresAt,
       });
     } catch (error) {
-      if (Date.now() >= this.upstreamProofExpiresAt) {
+      if (this.upstreamBlocked) {
+        this.logger.warn("官方 upstream 门禁保持关闭，复核仍失败", { error: errorMessage(error) });
+      } else if (Date.now() >= this.upstreamProofExpiresAt) {
         await this.blockForUpstream(`在线复核失败且 supported proof 已过期：${errorMessage(error)}`);
       } else {
         this.logger.warn("官方 upstream 周期复核失败，暂用未过期证明", {
