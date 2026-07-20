@@ -29,6 +29,8 @@ Pending → Delivering → Delivered
 - `Dispatching/Running/Cancelling` 属于 ambiguous execution，不自动重跑。
 - 未 ACK 的结果只重发 outbox，每次生成新的 `msg_id`，保留原 `job_id` 和结果内容。
 
+取消意图在 SQLite `IMMEDIATE` 事务内按当前状态原子转移：`Received/Acked` 可直接进入 `Cancelled`，`Dispatching/Running` 只能进入 `Cancelling`。重复 cancel 保持 `Cancelling`，迟到 cancel 不会回退 `Interrupted` 或任何终态；connector 即使确认已发出 `/stop`，仍须由 daemon 记录 `CancelUnknown` 并隔离 session。
+
 ## Hermes connector contract
 
 一期 connector protocol 固定为 v1，关键消息为：
