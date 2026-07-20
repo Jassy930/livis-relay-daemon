@@ -45,6 +45,18 @@ bun run src/index.ts login
 
 完成 Device Flow 后，refresh token 保存在 daemon state directory。不要把 connector token 或 refresh token 粘贴到聊天、日志和 shell history。
 
+### 安全登出与账号边界
+
+`logout` 只负责向 IDaaS 撤销 refresh token 并在远端返回 2xx 后清除本地副本；它不是运行中 daemon 的控制通道。执行前应确认没有活跃 job 或待投递结果，再停止专用 Hermes Gateway 和 `livis-relayd`：
+
+```bash
+bun run src/index.ts logout
+```
+
+只有看到“已撤销并清除本地 refresh token”才表示远端确认成功。网络失败或远端非 2xx 时命令以失败退出，并故意保留本地 token，便于恢复网络后重试；不要为消除错误而手工删除凭据。
+
+一期尚未把 OAuth 账号 subject 与 `identity.json`、SQLite job/outbox 做持久化绑定，因此不支持在同一个 state directory 中直接切换账号。需要使用另一账号时，应使用独立配置和独立 state directory；不得用 `login --force` 覆盖原账号 token 后继续复用旧 outbox。
+
 ## 6. 安装 Hermes plugin
 
 先创建不复制默认凭据、skills、会话或 Gateway 状态的隔离 profile：

@@ -36,6 +36,12 @@
 - supported proof 与 active profile ID、profile SHA、artifact URL/哈希和 marker 绑定，有效期 24 小时。
 - daemon 每 6 小时复核；确认 drift/unknown 后停止新 job 并断开 LiViS。暂时网络失败只允许使用尚未过期的 proof。
 
+## 认证生命周期
+
+- `logout` 不是运行中 daemon 的控制通道；执行前必须停止专用 Hermes Gateway 与 daemon，避免进程继续使用内存中的 access token 或已缓存 refresh token。
+- IDaaS revoke 只有返回 2xx 才允许删除本地 refresh token；网络失败或远端拒绝时保留本地凭据并明确失败，供操作者重试。
+- 一期没有 OAuth 账号 subject 与 identity/outbox 的迁移契约，不支持在同一 state directory 直接切换账号；不同账号必须使用隔离的配置和状态目录。
+
 ## 取消与隔离
 
 Hermes `/stop` 不能证明不合作的工具线程已退出。因此 connector 返回 `cancelled` 后，daemon 仍记录 `CancelUnknown` 并隔离 session。只有在重启专用 Hermes Gateway、确认旧工具进程已结束后，才允许人工执行 `session release`。
