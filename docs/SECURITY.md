@@ -12,12 +12,20 @@
 
 ## 一期强制默认值
 
-- `allowAllNodes=false`，并配置 daemon 与 Hermes 双重 allowlist。
-- `LIVIS_ALLOW_ALL_USERS` 必须为空/false，`LIVIS_ALLOWED_USERS=*` 会被拒绝。
+- `allowAllNodes=false`；进入 `serve` 或实网 canary 前，`security.allowedNodeIds` 必须恰好包含一个获准 `node_id`。
+- `LIVIS_ALLOW_ALL_USERS` 必须为空/false；`LIVIS_ALLOWED_USERS` 必须只包含与 daemon 完全相同的唯一 `node_id`，`*` 和多个值都不属于一期受支持配置。
 - `LIVIS_PHASE1_READ_ONLY_ACK=true` 只在专用 Hermes profile 已关闭写工具后设置。
 - Hermes streaming、tool progress、interim message、附件和远程审批全部关闭。
 - Hermes runtime 审核范围默认是 `[0.15.1, 0.15.2)`；bridge 范围是 `[0.1.0, 0.2.0)`。
 - 未知版本、哈希、wire protocol 或运行契约变化 fail closed。
+
+## 设备来源边界
+
+一期暂将 `from_node_id` 视为设备来源标识，但该值不是账号 subject，也不构成密码学设备认证。配置结构接受数组和逗号列表只是为了兼容现有格式，不表示多设备拓扑已经设计、验证或受到支持。
+
+一套 daemon、config、state directory 与专用 Hermes profile 只能绑定一个来源设备。不得同时放行第二个 `node_id`，不得在同一状态目录中原地替换 `node_id`，也不得假设不同设备可以继承同一个 Hermes session、job、quarantine 或 outbox。设备更换和多设备支持必须先定义上游 ID 稳定性、账号绑定、状态迁移、回滚与真实设备 canary，再作为独立方案评审。
+
+当前版本尚未在 daemon 与 Hermes 两侧把“恰好一个 ID”实现为代码级硬门禁：解析器仍接受多值配置，运行前必须人工读回双侧 allowlist。该残余意味着文档只定义受支持拓扑，不能被表述为已完成逐帧设备认证；尤其 `cancel_chat` 只有 `job_id`、没有来源 `node_id`，其身份边界仍依赖已建立的 Relay 连接和一期单设备部署约束。
 
 ## 本地权限
 

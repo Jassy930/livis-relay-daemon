@@ -20,7 +20,8 @@ flowchart LR
 
 - 只接 Hermes，不接 AionUI/AionCore。
 - 只支持纯文本、单个 final result。
-- 只允许预先配置的 LiViS node ID。
+- 一期暂将 LiViS `node_id` 视为设备来源标识；每套 daemon、config 与 state directory 只允许一个预先配置的 `node_id`。
+- 不支持多设备同时接入、跨设备共享 Hermes 会话或原地换设备。
 - Hermes 必须使用专用 profile、专用工作区和只读工具集。
 - 不支持远程审批、附件、token stream、tool progress、管理命令和远程 `/update`。
 - 取消语义为 `best_effort`；无法证明工具线程退出时进入 `CancelUnknown` 并隔离 session。

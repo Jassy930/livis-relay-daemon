@@ -26,8 +26,10 @@ bun run src/index.ts init \
 随后编辑配置：
 
 - 保持 `security.allowAllNodes=false`。
-- 将获准的稳定 LiViS node ID 填入 `security.allowedNodeIds`。
+- 将唯一获准且稳定的 LiViS `node_id` 作为 `security.allowedNodeIds` 的唯一元素；不要填写多个值。
 - 不扩大 Hermes 审核版本范围，除非已按升级 runbook 验证。
+
+一期暂将 `node_id` 视为设备来源标识，一套 daemon、config、state directory 和专用 Hermes profile 只支持该一个设备。配置解析器仍接受数组是格式兼容，不代表支持多设备；不得通过追加第二个 ID、开启 `allowAllNodes` 或直接替换原 ID 来接入另一设备。设备更换、跨设备会话和旧状态迁移均需另行设计与验收。
 
 ## 4. 生成近期 upstream 证明
 
@@ -98,9 +100,11 @@ HERMES_HOME="$LIVIS_HERMES_HOME" hermes plugins enable livis-bridge
 ```bash
 LIVIS_RELAY_SOCKET=$HOME/.livis-relay/connector.sock
 LIVIS_RELAY_TOKEN=<使用 connector-token 命令读取>
-LIVIS_ALLOWED_USERS=<与 daemon 一致的逗号分隔 node ID>
+LIVIS_ALLOWED_USERS=<与 security.allowedNodeIds 完全相同的唯一 node_id>
 LIVIS_PHASE1_READ_ONLY_ACK=true
 ```
+
+启动前读回 daemon 与 Hermes 两处 allowlist，确认它们完全相同且都只有一个值。`LIVIS_ALLOWED_USERS` 的逗号列表语法不代表一期允许配置多个设备。
 
 读取 connector token：
 
