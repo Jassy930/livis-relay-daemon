@@ -71,6 +71,7 @@ async def run(args: argparse.Namespace) -> None:
             "protocolVersion": 1,
             "connectorId": args.connector_id,
             "daemonVersion": "test",
+            "resultStoreTimeoutMs": 5000,
         }:
             raise AssertionError(f"hello_ack 字段不匹配：{hello_ack!r}")
 

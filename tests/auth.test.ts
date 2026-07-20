@@ -36,7 +36,10 @@ describe("IDaaS OAuth Device Flow", () => {
         expires_in: 60,
         interval: 1,
       }),
+      // Preserve the RFC-style 400 path and the HTTP 428 behavior observed
+      // from LiViS IDaaS; the OAuth error value is authoritative in both cases.
       Response.json({ error: "authorization_pending" }, { status: 400 }),
+      Response.json({ error: "authorization_pending" }, { status: 428 }),
       Response.json({
         [profile.oauth.audience]: {
           access_token: "access",
@@ -58,13 +61,39 @@ describe("IDaaS OAuth Device Flow", () => {
     let pending = 0;
     const token = await client.pollForToken(code, { onPending: () => pending += 1 });
     expect(token.accessToken).toBe("access");
-    expect(pending).toBe(1);
+    expect(pending).toBe(2);
     expect((await secrets.get()).refreshToken).toBe("refresh-1");
     expect(await client.getAccessToken(true)).toBe("access-2");
     expect((await secrets.get()).refreshToken).toBe("refresh-2");
     const auxBody = String(requests[0]?.init?.body);
     expect(auxBody).toContain(`scope=${profile.oauth.scope}+offline_access`);
     expect(auxBody).toContain(`audience=${profile.oauth.audience}`);
+  });
+
+  test("slow_down 不依赖特定 HTTP 状态并增加后续轮询间隔", async () => {
+    const profile = await testProfile();
+    const sleeps: number[] = [];
+    const client = new IdaasClient(profile, secrets, {
+      fetch: queuedFetch([
+        Response.json({ error: "slow_down" }, { status: 429 }),
+        Response.json({
+          [profile.oauth.audience]: {
+            access_token: "access",
+            refresh_token: "refresh",
+            expires_in: 3600,
+          },
+        }),
+      ], []),
+      sleep: async (milliseconds) => { sleeps.push(milliseconds); },
+    });
+    const token = await client.pollForToken({
+      device_code: "device-code",
+      verification_uri_complete: "https://example.test/login",
+      expires_in: 60,
+      interval: 1,
+    });
+    expect(token.accessToken).toBe("access");
+    expect(sleeps).toEqual([1000, 6000]);
   });
 
   test("refresh 401 删除本地 refresh token", async () => {
@@ -75,5 +104,17 @@ describe("IDaaS OAuth Device Flow", () => {
     });
     await expect(client.getAccessToken(true)).rejects.toBeInstanceOf(TerminalAuthError);
     expect((await secrets.get()).refreshToken).toBeUndefined();
+  });
+
+  test("refresh 400 invalid_grant 同样删除本地 refresh token", async () => {
+    const profile = await testProfile();
+    await secrets.setRefreshToken("revoked");
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const client = new IdaasClient(profile, secrets, {
+      fetch: queuedFetch([Response.json({ error: "invalid_grant" }, { status: 400 })], requests),
+    });
+    await expect(client.getAccessToken(true)).rejects.toBeInstanceOf(TerminalAuthError);
+    expect((await secrets.get()).refreshToken).toBeUndefined();
+    expect(String(requests[0]?.init?.body)).toContain(`client_id=${profile.oauth.clientId}`);
   });
 });

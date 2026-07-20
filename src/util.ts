@@ -83,7 +83,8 @@ export function asSha256(value: unknown, label: string): string {
 }
 
 export function parseSemverTriplet(text: string): [number, number, number] | null {
-  const match = text.match(/(?:^|[^0-9])(\d+)\.(\d+)\.(\d+)(?:[^0-9]|$)/);
+  // 预发布版本（1.2.3-beta 等）不视为已审核的 1.2.3，默认拒绝。
+  const match = text.match(/(?:^|[^0-9])(\d+)\.(\d+)\.(\d+)(?![-0-9])/);
   return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
 }
 

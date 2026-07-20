@@ -13,7 +13,7 @@ export type JobStatus =
   | "Failed"
   | "Rejected";
 
-export type OutboxStatus = "Pending" | "Delivering" | "Delivered" | "AckFailed" | "Cancelled";
+export type OutboxStatus = "Pending" | "Delivering" | "Delivered" | "AckFailed";
 
 export interface RelayMetadata {
   msg_id?: string;
@@ -135,6 +135,7 @@ export type ConnectorOutboundMessage =
       protocolVersion: typeof CONNECTOR_PROTOCOL_VERSION;
       connectorId: string;
       daemonVersion: string;
+      resultStoreTimeoutMs: number;
     }
   | ConnectorJobMessage
   | ConnectorCancelMessage
