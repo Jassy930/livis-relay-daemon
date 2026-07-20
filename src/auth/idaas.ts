@@ -121,11 +121,15 @@ export class IdaasClient {
         return tokenSet;
       }
       const oauthError = typeof data.error === "string" ? data.error : `http_${response.status}`;
-      if (response.status === 400 && oauthError === "authorization_pending") {
+      // LiViS IDaaS currently returns HTTP 428 for authorization_pending,
+      // although RFC 8628 examples commonly use HTTP 400. The OAuth error
+      // value is authoritative; coupling polling semantics to one status code
+      // makes a normal pending response terminate the Device Flow.
+      if (oauthError === "authorization_pending") {
         options.onPending?.();
         continue;
       }
-      if (response.status === 400 && oauthError === "slow_down") {
+      if (oauthError === "slow_down") {
         intervalMs += 5000;
         continue;
       }
@@ -135,7 +139,7 @@ export class IdaasClient {
       if (oauthError === "access_denied") {
         throw new TerminalAuthError("用户拒绝了授权");
       }
-      throw new Error(`设备授权失败：${oauthError}`);
+      throw new Error(`设备授权失败：${oauthError}（HTTP ${response.status}）`);
     }
     throw new TerminalAuthError("设备授权等待超时");
   }
@@ -151,15 +155,19 @@ export class IdaasClient {
     const response = await this.postForm("/token", {
       grant_type: "refresh_token",
       refresh_token: currentSecrets.refreshToken,
+      client_id: this.profile.oauth.clientId,
     });
     const data = await responseJson(response, "IDaaS refresh /token");
-    if (response.status === 401) {
+    // refresh token 失效的信号以 OAuth error 值为准（invalid_grant 常见于
+    // HTTP 400），只认 401 会让 daemon 拿着死 token 无限重连而不提示重新登录。
+    const oauthError = typeof data.error === "string" ? data.error : null;
+    if (response.status === 401 || oauthError === "invalid_grant") {
       await this.secrets.clearRefreshToken();
       this.accessToken = null;
       throw new TerminalAuthError("refresh token 已失效，请重新登录");
     }
     if (!response.ok) {
-      throw new Error(`刷新 access token 失败：HTTP ${response.status}`);
+      throw new Error(`刷新 access token 失败：${oauthError ?? `HTTP ${response.status}`}`);
     }
     const tokenSet = tokenSetFromResponse(data, this.profile.oauth.audience);
     await this.acceptTokenSet(tokenSet, currentSecrets.refreshToken);

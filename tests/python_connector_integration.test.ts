@@ -109,6 +109,7 @@ test("Python websockets 与 Bun ConnectorServer 完成真实 UDS job/result 往�
       socketPath: join(directory.path, "connector.sock"),
       connectorToken: token,
       helloTimeoutMs: MESSAGE_TIMEOUT_MS,
+      resultStoreTimeoutMs: 5000,
       maxFrameBytes: 1024 * 1024,
       daemonVersion: "test",
       hermesMinimumVersion: "0.15.1",

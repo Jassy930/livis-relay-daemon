@@ -174,17 +174,16 @@ export function buildTokenRefreshEnvelope(input: {
   });
 }
 
-export function resultAckJobId(envelope: RelayEnvelope): string | null {
-  const reference = envelope.payload?.ref_msg_id;
-  if (typeof reference === "string" && reference !== "") {
-    return reference;
+// ref_msg_id 可能引用 send_result 的 msg_id（每次投递随机），也可能直接是
+// job_id；这里只按官方优先级给出候选，由调用方对照 outbox 解析成真实 job_id。
+export function resultAckCandidates(envelope: RelayEnvelope): string[] {
+  const candidates: string[] = [];
+  for (const value of [envelope.payload?.ref_msg_id, envelope.metadata?.job_id, envelope.metadata?.msg_id]) {
+    if (typeof value === "string" && value !== "" && !candidates.includes(value)) {
+      candidates.push(value);
+    }
   }
-  const jobId = envelope.metadata?.job_id;
-  if (typeof jobId === "string" && jobId !== "") {
-    return jobId;
-  }
-  const messageId = envelope.metadata?.msg_id;
-  return typeof messageId === "string" && messageId !== "" ? messageId : null;
+  return candidates;
 }
 
 export function serializeResult(text: string): string {

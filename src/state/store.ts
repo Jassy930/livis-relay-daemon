@@ -277,15 +277,26 @@ export class JobStore {
   startResultDelivery(jobId: string, messageId: string, retry: boolean): StoredOutbox | null {
     const now = Date.now();
     const expected: OutboxStatus = retry ? "Delivering" : "Pending";
-    const result = this.database
-      .query(`UPDATE outbox SET status='Delivering', last_message_id=?, retry_count=retry_count+?, delivered_at=?, updated_at=?
-              WHERE scope_key=? AND job_id=? AND status=?
-                AND EXISTS (
-                  SELECT 1 FROM jobs
-                  WHERE jobs.scope_key=outbox.scope_key AND jobs.job_id=outbox.job_id AND cancel_requested=0
-                )`)
-      .run(messageId, retry ? 1 : 0, now, now, this.scopeKey, jobId, expected);
-    return result.changes === 1 ? this.require(jobId).outbox : null;
+    let changed = false;
+    const transaction = this.database.transaction(() => {
+      const result = this.database
+        .query(`UPDATE outbox SET status='Delivering', last_message_id=?, retry_count=retry_count+?, delivered_at=?, updated_at=?
+                WHERE scope_key=? AND job_id=? AND status=?
+                  AND EXISTS (
+                    SELECT 1 FROM jobs
+                    WHERE jobs.scope_key=outbox.scope_key AND jobs.job_id=outbox.job_id AND cancel_requested=0
+                  )`)
+        .run(messageId, retry ? 1 : 0, now, now, this.scopeKey, jobId, expected);
+      changed = result.changes === 1;
+      if (changed) {
+        this.database
+          .query(`INSERT INTO outbox_delivery_attempts(scope_key,message_id,job_id,created_at)
+                  VALUES(?,?,?,?)`)
+          .run(this.scopeKey, messageId, jobId, now);
+      }
+    });
+    transaction.immediate();
+    return changed ? this.require(jobId).outbox : null;
   }
 
   resetOutboxPending(jobId: string): StoredOutbox | null {
@@ -300,7 +311,16 @@ export class JobStore {
     this.database
       .query("UPDATE outbox SET status='Delivered', acked_at=?, updated_at=? WHERE scope_key=? AND job_id=? AND status='Delivering'")
       .run(now, now, this.scopeKey, jobId);
-    return this.require(jobId).outbox;
+    return this.get(jobId)?.outbox ?? null;
+  }
+
+  findJobIdByOutboxMessageId(messageId: string): string | null {
+    const row = this.database
+      .query<{ job_id: string }, [string, string]>(
+        "SELECT job_id FROM outbox_delivery_attempts WHERE scope_key=? AND message_id=?",
+      )
+      .get(this.scopeKey, messageId);
+    return row?.job_id ?? null;
   }
 
   markOutboxAckFailed(jobId: string): StoredOutbox | null {
@@ -469,10 +489,27 @@ export class JobStore {
   private migrate(): void {
     const row = this.database.query<{ user_version: number }, []>("PRAGMA user_version").get();
     const version = row?.user_version ?? 0;
-    if (version !== 0 && version !== 1) {
+    if (version !== 0 && version !== 1 && version !== 2) {
       throw new Error(`不支持的数据库 schema 版本：${version}`);
     }
+    if (version === 2) {
+      return;
+    }
     if (version === 1) {
+      this.database.exec(`
+        CREATE TABLE outbox_delivery_attempts (
+          scope_key TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          job_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY(scope_key,message_id),
+          FOREIGN KEY(scope_key,job_id) REFERENCES outbox(scope_key,job_id) ON DELETE CASCADE
+        );
+        INSERT INTO outbox_delivery_attempts(scope_key,message_id,job_id,created_at)
+          SELECT scope_key,last_message_id,job_id,updated_at FROM outbox WHERE last_message_id IS NOT NULL;
+        CREATE INDEX idx_outbox_attempt_job ON outbox_delivery_attempts(scope_key,job_id);
+        PRAGMA user_version=2;
+      `);
       return;
     }
     this.database.exec(`
@@ -516,6 +553,14 @@ export class JobStore {
         PRIMARY KEY(scope_key,job_id),
         FOREIGN KEY(scope_key,job_id) REFERENCES jobs(scope_key,job_id) ON DELETE CASCADE
       );
+      CREATE TABLE outbox_delivery_attempts (
+        scope_key TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        job_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(scope_key,message_id),
+        FOREIGN KEY(scope_key,job_id) REFERENCES outbox(scope_key,job_id) ON DELETE CASCADE
+      );
       CREATE TABLE session_quarantine (
         scope_key TEXT NOT NULL,
         session_key TEXT NOT NULL,
@@ -532,7 +577,8 @@ export class JobStore {
       CREATE INDEX idx_jobs_dispatch ON jobs(scope_key,status,cancel_requested,session_key,created_at);
       CREATE INDEX idx_jobs_connector ON jobs(scope_key,connector_id,status);
       CREATE INDEX idx_outbox_delivery ON outbox(scope_key,status,updated_at);
-      PRAGMA user_version=1;
+      CREATE INDEX idx_outbox_attempt_job ON outbox_delivery_attempts(scope_key,job_id);
+      PRAGMA user_version=2;
     `);
   }
 }
