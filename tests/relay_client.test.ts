@@ -377,6 +377,30 @@ describe("RelayClient fake LiViS end-to-end", () => {
     );
   });
 
+  test("重试后仍接受 ref_msg_id 引用首次投递的延迟 ACK", async () => {
+    createPendingResult(store, "ref-ack-job");
+    const relayClient = createClient(durableHandlers());
+    relayClient.start();
+    const socket = await fakeRelay.handshake(relayClient);
+
+    const firstDelivery = await fakeRelay.next("send_result");
+    const deliveryMessageId = firstDelivery.envelope.metadata?.msg_id;
+    expect(deliveryMessageId).toBeString();
+    expect(deliveryMessageId).not.toBe("ref-ack-job");
+    const retry = await fakeRelay.next("send_result");
+    expect(retry.envelope.metadata?.msg_id).not.toBe(deliveryMessageId);
+    fakeRelay.send(socket, {
+      type: "ack_send_result",
+      metadata: {},
+      payload: { ref_msg_id: deliveryMessageId },
+    });
+    await waitFor(
+      () => store.require("ref-ack-job").outbox?.status === "Delivered",
+      1_000,
+      "delayed ref_msg_id ack delivery",
+    );
+  });
+
   test("cancel-before-message 先持久化意图，后到消息不执行并分别 ACK", async () => {
     let executionCount = 0;
     const relayClient = createClient(durableHandlers((_jobId, inserted) => {

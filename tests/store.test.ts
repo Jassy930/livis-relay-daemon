@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { statSync } from "node:fs";
+import { Database } from "bun:sqlite";
 import { JobConflictError, JobStore } from "../src/state/store.ts";
 import { incomingJob, temporaryDirectory } from "./helpers.ts";
 
@@ -43,7 +44,11 @@ describe("durable jobs + outbox", () => {
     expect(completed.outbox?.status).toBe("Pending");
     expect(store.startResultDelivery("job-1", "result-msg-1", false)?.retryCount).toBe(0);
     expect(store.startResultDelivery("job-1", "result-msg-2", true)?.retryCount).toBe(1);
+    expect(store.findJobIdByOutboxMessageId("result-msg-1")).toBe("job-1");
+    expect(store.findJobIdByOutboxMessageId("result-msg-2")).toBe("job-1");
+    expect(store.findJobIdByOutboxMessageId("unknown-msg")).toBeNull();
     expect(store.markOutboxDelivered("job-1")?.status).toBe("Delivered");
+    expect(store.markOutboxDelivered("no-such-job")).toBeNull();
     expect(store.integrityCheck()).toBe("ok");
   });
 
@@ -55,6 +60,25 @@ describe("durable jobs + outbox", () => {
     const stale = store.finishSuccess("job-1", "lease-stale", '{"text":"stale"}');
     expect(stale.status).toBe("Running");
     expect(stale.outbox).toBeNull();
+  });
+
+  test("v1 数据库迁移后保留最后一次结果投递 ID", () => {
+    const databasePath = join(directory.path, "relay.db");
+    store.ingest(incomingJob("job-migrated"), "session-1");
+    store.markAcked("job-migrated");
+    store.claimForDispatch("job-migrated", "connector", "lease-1");
+    store.markRunning("job-migrated", "connector", "lease-1");
+    store.finishSuccess("job-migrated", "lease-1", '{"text":"done"}');
+    store.startResultDelivery("job-migrated", "legacy-result-msg", false);
+    store.close();
+
+    const legacy = new Database(databasePath);
+    legacy.exec("DROP TABLE outbox_delivery_attempts; PRAGMA user_version=1;");
+    legacy.close();
+
+    store = new JobStore(databasePath, "account:agent");
+    expect(store.findJobIdByOutboxMessageId("legacy-result-msg")).toBe("job-migrated");
+    expect(store.integrityCheck()).toBe("ok");
   });
 
   test("同 session 单活，不同 session 可并发", () => {

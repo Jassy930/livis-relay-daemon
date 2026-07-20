@@ -12,7 +12,7 @@ import {
   buildTokenRefreshEnvelope,
   parseIncomingRelayJob,
   parseRelayEnvelope,
-  resultAckJobId,
+  resultAckCandidates,
 } from "../protocol/livis.ts";
 import type { IdaasClient } from "../auth/idaas.ts";
 import { TerminalAuthError } from "../auth/idaas.ts";
@@ -30,7 +30,7 @@ export interface RelayClientHandlers {
 export class RelayClient {
   private socket: WebSocket | null = null;
   private runPromise: Promise<void> | null = null;
-  private readonly abortController = new AbortController();
+  private abortController = new AbortController();
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private tokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private tokenRefreshFailures = 0;
@@ -69,6 +69,9 @@ export class RelayClient {
   start(): void {
     if (this.runPromise) {
       return;
+    }
+    if (this.abortController.signal.aborted) {
+      this.abortController = new AbortController();
     }
     this.runPromise = this.runLoop();
   }
@@ -169,6 +172,9 @@ export class RelayClient {
       this.messageChain = this.messageChain
         .then(async () => {
           const envelope = parseRelayEnvelope(raw);
+          // 任何能解析的服务端消息都证明链路存活；部分网关不回 WS 协议层
+          // pong，只依赖 pong 会周期性误杀健康连接。
+          this.lastPongAt = Date.now();
           if (envelope.type === "connected" && !this.handshakeComplete) {
             this.handshakeComplete = true;
             this.lastPongAt = Date.now();
@@ -246,9 +252,14 @@ export class RelayClient {
         break;
       }
       case "ack_send_result": {
-        const jobId = resultAckJobId(envelope);
-        if (!jobId) {
+        const candidates = resultAckCandidates(envelope);
+        if (candidates.length === 0) {
           throw new Error("ack_send_result 缺少关联 ID");
+        }
+        const jobId = this.resolveAckJobId(candidates);
+        if (!jobId) {
+          this.logger.warn("ack_send_result 无法关联任何 outbox", { candidates });
+          break;
         }
         const timer = this.resultAckTimers.get(jobId);
         if (timer) {
@@ -332,21 +343,38 @@ export class RelayClient {
     const previousTimer = this.resultAckTimers.get(jobId);
     if (previousTimer) clearTimeout(previousTimer);
     const timer = setTimeout(() => {
-      this.resultAckTimers.delete(jobId);
-      const current = this.store.require(jobId).outbox;
-      if (!current || current.status !== "Delivering") return;
-      if (!this.connected) {
-        this.store.resetOutboxPending(jobId);
-        return;
-      }
-      if (current.retryCount < this.profile.timing.resultMaxRetries) {
-        void this.deliverResult(jobId, true);
-      } else {
-        this.store.markOutboxAckFailed(jobId);
-        this.logger.error("LiViS 结果 ACK 重试耗尽", { jobId, retries: current.retryCount });
+      try {
+        this.resultAckTimers.delete(jobId);
+        const current = this.store.get(jobId)?.outbox;
+        if (!current || current.status !== "Delivering") return;
+        if (!this.connected) {
+          this.store.resetOutboxPending(jobId);
+          return;
+        }
+        if (current.retryCount < this.profile.timing.resultMaxRetries) {
+          void this.deliverResult(jobId, true);
+        } else {
+          this.store.markOutboxAckFailed(jobId);
+          this.logger.error("LiViS 结果 ACK 重试耗尽", { jobId, retries: current.retryCount });
+        }
+      } catch (error) {
+        this.logger.error("结果重试定时器处理失败", { jobId, error: errorMessage(error) });
       }
     }, this.profile.timing.resultAckTimeoutMs);
     this.resultAckTimers.set(jobId, timer);
+  }
+
+  private resolveAckJobId(candidates: string[]): string | null {
+    for (const candidate of candidates) {
+      if (this.store.get(candidate)) {
+        return candidate;
+      }
+      const mapped = this.store.findJobIdByOutboxMessageId(candidate);
+      if (mapped) {
+        return mapped;
+      }
+    }
+    return null;
   }
 
   private startHeartbeat(): void {
