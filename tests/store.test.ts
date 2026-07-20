@@ -113,6 +113,54 @@ describe("durable jobs + outbox", () => {
     expect(store.migrateSessionKeys((nodeId) => `isolated-${nodeId}`)).toEqual({ jobs: 0, quarantines: 0 });
   });
 
+  test("session 迁移在 IMMEDIATE 快照内覆盖事务开始前到达的旧 job", () => {
+    const databasePath = join(directory.path, "relay.db");
+    store.ingest(incomingJob("job-node-a", "hello", "node-a"), "legacy-shared-session");
+    store.markAcked("job-node-a");
+    store.claimForDispatch("job-node-a", "connector", "lease-a");
+    store.markRunning("job-node-a", "connector", "lease-a");
+    store.recoverAfterRestart();
+
+    const concurrentStore = new JobStore(databasePath, "account:agent");
+    const database = (store as unknown as { database: Database }).database;
+    const originalTransaction = database.transaction.bind(database);
+    let injected = false;
+
+    Object.defineProperty(database, "transaction", {
+      configurable: true,
+      value: ((callback: () => unknown) => {
+        const transaction = originalTransaction(callback) as { immediate: () => unknown };
+        const immediate = transaction.immediate.bind(transaction);
+        return {
+          immediate: () => {
+            injected = true;
+            concurrentStore.ingest(
+              incomingJob("job-node-late", "hello", "node-late"),
+              "legacy-shared-session",
+            );
+            return immediate();
+          },
+        };
+      }) as typeof database.transaction,
+    });
+
+    try {
+      expect(store.migrateSessionKeys((nodeId) => `isolated-${nodeId}`)).toEqual({
+        jobs: 2,
+        quarantines: 2,
+      });
+      expect(injected).toBeTrue();
+      expect(store.require("job-node-late").sessionKey).toBe("isolated-node-late");
+      expect(store.listQuarantinedSessions().map((entry) => entry.sessionKey)).toEqual([
+        "isolated-node-a",
+        "isolated-node-late",
+      ]);
+    } finally {
+      delete (database as unknown as { transaction?: unknown }).transaction;
+      concurrentStore.close();
+    }
+  });
+
   test("cancel intent 可先于消息到达", () => {
     expect(store.requestCancel("future-job")).toBeNull();
     const ingested = store.ingest(incomingJob("future-job"), "session-1").job;

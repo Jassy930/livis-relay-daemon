@@ -124,18 +124,21 @@ export class JobStore {
   }
 
   migrateSessionKeys(resolveSessionKey: (fromNodeId: string) => string): { jobs: number; quarantines: number } {
-    const jobs = this.database
-      .query<{ job_id: string; from_node_id: string; session_key: string }, [string]>(
-        "SELECT job_id,from_node_id,session_key FROM jobs WHERE scope_key=?",
-      )
-      .all(this.scopeKey);
-    const quarantines = this.database
-      .query<{ session_key: string; reason: string; created_at: number }, [string]>(
-        "SELECT session_key,reason,created_at FROM session_quarantine WHERE scope_key=? ORDER BY created_at",
-      )
-      .all(this.scopeKey);
-
     const transaction = this.database.transaction(() => {
+      // 快照读取必须与后续展开、rekey 和旧隔离删除处于同一个 IMMEDIATE
+      // 事务。否则旧 daemon 可在读取后、事务开始前写入 legacy session，
+      // 导致新 job 未 rekey 且旧 quarantine 已被删除。
+      const jobs = this.database
+        .query<{ job_id: string; from_node_id: string; session_key: string }, [string]>(
+          "SELECT job_id,from_node_id,session_key FROM jobs WHERE scope_key=?",
+        )
+        .all(this.scopeKey);
+      const quarantines = this.database
+        .query<{ session_key: string; reason: string; created_at: number }, [string]>(
+          "SELECT session_key,reason,created_at FROM session_quarantine WHERE scope_key=? ORDER BY created_at",
+        )
+        .all(this.scopeKey);
+
       let migratedJobs = 0;
       let migratedQuarantines = 0;
 
