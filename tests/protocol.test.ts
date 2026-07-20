@@ -5,7 +5,7 @@ import {
   buildResultEnvelope,
   parseIncomingRelayJob,
   parseRelayEnvelope,
-  resultAckJobId,
+  resultAckCandidates,
   serializeResult,
 } from "../src/protocol/livis.ts";
 import { testProfile } from "./helpers.ts";
@@ -61,13 +61,20 @@ describe("LiViS wire protocol", () => {
     expect(typeof result.payload?.data).toBe("string");
   });
 
-  test("按官方优先级解析结果 ACK", () => {
-    expect(resultAckJobId({
+  test("按官方优先级给出结果 ACK 候选 ID", () => {
+    expect(resultAckCandidates({
       type: "ack_send_result",
       metadata: { job_id: "metadata-job" },
-      payload: { ref_msg_id: "payload-job" },
-    })).toBe("payload-job");
-    expect(resultAckJobId({ type: "ack_send_result", metadata: { msg_id: "message-id" } })).toBe("message-id");
+      payload: { ref_msg_id: "payload-ref" },
+    })).toEqual(["payload-ref", "metadata-job"]);
+    expect(resultAckCandidates({ type: "ack_send_result", metadata: { msg_id: "message-id" } }))
+      .toEqual(["message-id"]);
+    expect(resultAckCandidates({
+      type: "ack_send_result",
+      metadata: { job_id: "same" },
+      payload: { ref_msg_id: "same" },
+    })).toEqual(["same"]);
+    expect(resultAckCandidates({ type: "ack_send_result" })).toEqual([]);
   });
 
   test("拒绝非对象 envelope", () => {

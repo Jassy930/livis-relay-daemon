@@ -268,6 +268,79 @@ async def test_same_final_is_idempotent_but_distinct_final_is_rejected(
 
 
 @pytest.mark.asyncio
+async def test_hello_ack_applies_daemon_result_store_timeout(
+    adapter_module,
+    secure_environment,
+    config,
+    fake_ws,
+):
+    adapter = make_adapter(adapter_module, config, fake_ws)
+    assert adapter._result_store_timeout == adapter_module.DEFAULT_RESULT_STORE_TIMEOUT_SECONDS
+
+    await adapter._handle_daemon_message({
+        "type": "hello_ack",
+        "protocolVersion": 1,
+        "connectorId": adapter.connector_id,
+        "daemonVersion": "test",
+        "resultStoreTimeoutMs": 2500,
+    })
+
+    assert adapter._ready_event.is_set()
+    assert adapter._result_store_timeout == 2.5
+
+
+@pytest.mark.asyncio
+async def test_hello_ack_without_timeout_keeps_default(
+    adapter_module,
+    secure_environment,
+    config,
+    fake_ws,
+):
+    adapter = make_adapter(adapter_module, config, fake_ws)
+
+    await adapter._handle_daemon_message({
+        "type": "hello_ack",
+        "protocolVersion": 1,
+        "connectorId": adapter.connector_id,
+        "daemonVersion": "test",
+    })
+
+    assert adapter._result_store_timeout == adapter_module.DEFAULT_RESULT_STORE_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_cancel_superseded_resolves_send_as_cancelled(
+    adapter_module,
+    secure_environment,
+    config,
+    fake_ws,
+):
+    adapter = make_adapter(adapter_module, config, fake_ws)
+    adapter._ready_event.set()
+    adapter._job_by_message_id["message-1"] = "job-1"
+    adapter._lease_by_job["job-1"] = "lease-1"
+    adapter._active_job_by_chat["chat-1"] = "job-1"
+    adapter._source_by_job["job-1"] = SimpleNamespace(chat_id="chat-1")
+
+    send_task = asyncio.create_task(adapter.send("chat-1", "final", reply_to="message-1"))
+    await asyncio.sleep(0)
+    await adapter._handle_daemon_message({
+        "type": "error",
+        "code": "cancel_superseded",
+        "jobId": "job-1",
+        "message": "cancel won the race",
+    })
+    result = await send_task
+
+    assert result.success is True
+    assert result.message_id == "cancelled:job-1"
+    assert "job-1" in adapter._cancelled_jobs
+    assert fake_ws.sent == [
+        {"type": "result", "jobId": "job-1", "leaseId": "lease-1", "text": "final"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_cancel_dispatches_stop_and_emits_cancelunknown_connector_signal(
     adapter_module,
     secure_environment,

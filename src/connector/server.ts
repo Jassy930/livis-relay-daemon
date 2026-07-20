@@ -19,6 +19,9 @@ import {
 import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const HEARTBEAT_TIMEOUT_MS = 45_000;
+
 interface ConnectorSocketData {
   authenticated: true;
   connectorId: string | null;
@@ -41,6 +44,7 @@ export interface ConnectorServerOptions {
   socketPath: string;
   connectorToken: string;
   helloTimeoutMs: number;
+  resultStoreTimeoutMs: number;
   maxFrameBytes: number;
   daemonVersion: string;
   hermesMinimumVersion: string;
@@ -202,10 +206,11 @@ export class ConnectorServer {
           if (timer) clearTimeout(timer);
           this.helloTimers.delete(socket);
           const connectorId = socket.data.connectorId;
-          if (this.activeSocket === socket) {
+          const wasActive = this.activeSocket === socket;
+          if (wasActive) {
             this.activeSocket = null;
           }
-          if (connectorId) {
+          if (connectorId && wasActive) {
             void handlers.onDisconnected(connectorId).catch((error) => {
               logger.error("connector 断开清理失败", { connectorId, error: errorMessage(error) });
             });
@@ -217,12 +222,12 @@ export class ConnectorServer {
     this.heartbeatTimer = setInterval(() => {
       const socket = this.activeSocket;
       if (!socket?.data.ready) return;
-      if (Date.now() - socket.data.lastPongAt > 45_000) {
+      if (Date.now() - socket.data.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
         socket.close(1001, "connector heartbeat timeout");
         return;
       }
       this.send(socket, { type: "ping", timestamp: Date.now() });
-    }, 15_000);
+    }, HEARTBEAT_INTERVAL_MS);
     this.logger.info("connector server 已启动", { socketPath: options.socketPath });
   }
 
@@ -309,9 +314,20 @@ export class ConnectorServer {
         throw new Error("重复 hello");
       }
       if (this.activeSocket && this.activeSocket !== socket) {
-        this.send(socket, { type: "error", code: "connector_conflict", message: "已有 Hermes connector 在线" });
-        socket.close(1008, "connector conflict");
-        return;
+        // Hermes 重启后旧 socket 可能还没被心跳超时（最长 45 秒）回收。
+        // 旧连接已错过一个完整心跳周期时按失活处理，把位置让给新连接。
+        if (Date.now() - this.activeSocket.data.lastPongAt > HEARTBEAT_INTERVAL_MS * 2) {
+          this.logger.warn("驱逐失活的旧 connector，接受新 hello", {
+            staleConnectorId: this.activeSocket.data.connectorId,
+          });
+          const staleSocket = this.activeSocket;
+          this.activeSocket = null;
+          staleSocket.close(1001, "replaced by new connector");
+        } else {
+          this.send(socket, { type: "error", code: "connector_conflict", message: "已有 Hermes connector 在线" });
+          socket.close(1008, "connector conflict");
+          return;
+        }
       }
       if (message.implementation.name !== this.options.bridgeImplementation) {
         this.send(socket, {
@@ -366,6 +382,7 @@ export class ConnectorServer {
         protocolVersion: CONNECTOR_PROTOCOL_VERSION,
         connectorId: message.connectorId,
         daemonVersion: this.options.daemonVersion,
+        resultStoreTimeoutMs: this.options.resultStoreTimeoutMs,
       });
       await this.handlers.onReady(message);
       this.logger.info("Hermes connector 已就绪", {
@@ -400,7 +417,10 @@ export class ConnectorServer {
 
   private send(socket: Bun.ServerWebSocket<ConnectorSocketData>, message: ConnectorOutboundMessage): boolean {
     try {
-      return socket.send(JSON.stringify(message)) > 0;
+      // Bun：-1 表示背压但消息已入队仍会送达，0 表示连接已关闭被丢弃。
+      // 把 -1 判为失败会触发 resetUnsentDispatch 后重新派发一条实际已送达
+      // 的 job，破坏至多执行一次。
+      return socket.send(JSON.stringify(message)) !== 0;
     } catch (error) {
       this.logger.warn("发送 connector 消息失败", { type: message.type, error: errorMessage(error) });
       return false;
