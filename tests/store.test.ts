@@ -98,6 +98,22 @@ describe("durable jobs + outbox", () => {
     expect(ingested.cancelRequested).toBeTrue();
   });
 
+  test("未派发 job 可取消，终态和 Interrupted 不回退", () => {
+    store.ingest(incomingJob("received-job"), "session-received");
+    expect(store.requestCancel("received-job")?.status).toBe("Cancelled");
+
+    store.ingest(incomingJob("acked-job"), "session-acked");
+    store.markAcked("acked-job");
+    expect(store.requestCancel("acked-job")?.status).toBe("Cancelled");
+
+    store.ingest(incomingJob("interrupted-job"), "session-interrupted");
+    store.markAcked("interrupted-job");
+    store.claimForDispatch("interrupted-job", "connector", "lease-interrupted");
+    store.markRunning("interrupted-job", "connector", "lease-interrupted");
+    store.recoverAfterRestart();
+    expect(store.requestCancel("interrupted-job")?.status).toBe("Interrupted");
+  });
+
   test("cancel 和 final 由 CAS 决定先后", () => {
     store.ingest(incomingJob("cancel-first"), "session-1");
     store.markAcked("cancel-first");
@@ -116,6 +132,23 @@ describe("durable jobs + outbox", () => {
     const tooLate = store.requestCancel("final-first")!;
     expect(tooLate.status).toBe("Succeeded");
     expect(tooLate.outbox?.status).toBe("Pending");
+  });
+
+  test("重复 cancel 保持 Cancelling 并继续隔离同 session", () => {
+    for (const jobId of ["active-job", "next-job"]) {
+      store.ingest(incomingJob(jobId), "session-risk");
+      store.markAcked(jobId);
+    }
+    store.claimForDispatch("active-job", "connector", "lease-active");
+    store.markRunning("active-job", "connector", "lease-active");
+
+    expect(store.requestCancel("active-job")?.status).toBe("Cancelling");
+    expect(store.requestCancel("active-job")?.status).toBe("Cancelling");
+    expect(store.claimForDispatch("next-job", "connector", "lease-next")).toBeNull();
+
+    const cancelled = store.markCancelUnknown("active-job", "lease-active", "best-effort cancel");
+    expect(cancelled.status).toBe("CancelUnknown");
+    expect(store.listQuarantinedSessions().map((item) => item.sessionKey)).toContain("session-risk");
   });
 
   test("重启把 ambiguous execution 隔离，不自动重跑", () => {
