@@ -16,6 +16,7 @@
 - `parseSemverTriplet` 拒绝预发布版本（如 `0.15.1-beta`），预发布 Hermes/bridge 不再落入已审核区间。
 - Relay WebSocket 新增兼容旧配置的整体帧上限，并在落盘前限制外部 type、job/message/node 等标识；超长错误不再原样进入日志。
 - 提前到达的 cancel intent 会在匹配 job 首次、重复入库或启动恢复时先按状态应用、再同事务消费；未知 intent 采用 24 小时 TTL 和全库 4096 条硬上限，旧 schema v2 数据库会幂等补充 GC 索引并修复历史残留。
+- 历史 cancel intent 只在 daemon 重启恢复事务中消费；`doctor`、`session release` 等维护命令打开数据库时不再静默改变 active job。
 
 ### 变更
 

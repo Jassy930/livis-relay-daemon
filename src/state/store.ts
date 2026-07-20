@@ -119,13 +119,6 @@ export class JobStore {
     this.database = new Database(path, { create: true, strict: true });
     this.database.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;");
     this.migrate();
-    const prune = this.database.transaction(() => {
-      const now = Date.now();
-      this.pruneExpiredPendingCancelsLocked(now);
-      this.consumeAllMatchedPendingCancelsLocked(now);
-      this.trimLegacyPendingCancelOverflowLocked();
-    });
-    prune.immediate();
     this.enforcePrivatePermissions();
   }
 
@@ -149,6 +142,11 @@ export class JobStore {
   recoverAfterRestart(): { interrupted: number; cancelUnknown: number; outboxPending: number } {
     const now = Date.now();
     const transaction = this.database.transaction(() => {
+      // 只有 daemon 启动恢复路径可以消费历史 intent 并改变 active job。
+      // doctor/session release 等维护命令只构造 JobStore，不得产生运行时状态迁移。
+      this.pruneExpiredPendingCancelsLocked(now);
+      this.consumeAllMatchedPendingCancelsLocked(now);
+      this.trimLegacyPendingCancelOverflowLocked();
       this.database.query(`
         INSERT OR IGNORE INTO session_quarantine(scope_key,session_key,reason,created_at)
         SELECT scope_key,session_key,'daemon restarted during active execution',?

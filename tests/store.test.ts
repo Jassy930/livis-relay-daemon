@@ -117,7 +117,7 @@ describe("durable jobs + outbox", () => {
     expect(pendingCancelCount(databasePath)).toBe(0);
   });
 
-  test("重复 job 入库和启动 GC 都会先应用再消费历史匹配的 cancel intent", () => {
+  test("重复 job 入库和 daemon 启动恢复都会先应用再消费历史匹配的 cancel intent", () => {
     const databasePath = join(directory.path, "relay.db");
     store.ingest(incomingJob("duplicate-job"), "session-duplicate");
     store.markAcked("duplicate-job");
@@ -137,11 +137,14 @@ describe("durable jobs + outbox", () => {
     legacy.close();
     store.close();
     store = new JobStore(databasePath, "account:agent");
+    expect(pendingCancelCount(databasePath)).toBe(1);
+    expect(store.require("startup-job").status).toBe("Acked");
+    store.recoverAfterRestart();
     expect(pendingCancelCount(databasePath)).toBe(0);
     expect(store.require("startup-job").status).toBe("Cancelled");
   });
 
-  test("启动 GC 将 active job 的历史 intent 应用为 Cancelling，恢复时隔离为 CancelUnknown", () => {
+  test("daemon 启动恢复将 active job 的历史 intent 隔离为 CancelUnknown", () => {
     const databasePath = join(directory.path, "relay.db");
     store.ingest(incomingJob("active-job"), "session-active");
     store.markAcked("active-job");
@@ -155,8 +158,8 @@ describe("durable jobs + outbox", () => {
     legacy.close();
 
     store = new JobStore(databasePath, "account:agent");
-    expect(store.require("active-job").status).toBe("Cancelling");
-    expect(pendingCancelCount(databasePath)).toBe(0);
+    expect(store.require("active-job").status).toBe("Running");
+    expect(pendingCancelCount(databasePath)).toBe(1);
     const recovery = store.recoverAfterRestart();
     expect(recovery.cancelUnknown).toBe(1);
     expect(store.require("active-job").status).toBe("CancelUnknown");
@@ -213,7 +216,7 @@ describe("durable jobs + outbox", () => {
     expect(pendingCancelCount(databasePath)).toBe(PENDING_CANCEL_MAX_ROWS);
   });
 
-  test("schema v2 幂等补 GC 索引，并在启动时清除过期、匹配和旧库溢出 intent", () => {
+  test("schema v2 幂等补 GC 索引，并在 daemon 恢复时清除历史 intent", () => {
     const databasePath = join(directory.path, "relay.db");
     store.ingest(incomingJob("matched-job"), "session-1");
     store.close();
@@ -234,6 +237,9 @@ describe("durable jobs + outbox", () => {
     legacy.close();
 
     store = new JobStore(databasePath, "account:agent");
+    expect(store.require("matched-job").status).toBe("Received");
+    expect(pendingCancelCount(databasePath)).toBe(PENDING_CANCEL_MAX_ROWS + 3);
+    store.recoverAfterRestart();
     expect(pendingCancelCount(databasePath)).toBe(PENDING_CANCEL_MAX_ROWS);
     expect(store.require("matched-job").status).toBe("Cancelled");
     const migrated = new Database(databasePath, { readonly: true });
