@@ -81,7 +81,9 @@ bun run src/index.ts upstream rollback \
 
 ## Hermes 官方更新流程
 
-默认审核范围是 Hermes `[0.15.1, 0.15.2)`，只放行已做真实 smoke 的 0.15.1。0.15.2 及未知未来版本会被 connector hello 和 doctor 拒绝，验证后再显式扩大范围。
+默认审核范围是 Hermes `[0.18.2, 0.18.3)`，只放行已完成公共接口对照和自动回归的 0.18.2。0.18.3 及其他未知版本会被 connector hello 和 doctor 拒绝；0.18.2 恢复生产常驻前仍须先完成隔离真实 profile canary。
+
+已有 state directory 中的 `config.json` 不会被升级过程自动改写。旧配置会继续按原范围失败关闭；必须先复制到隔离 state directory 验证，再由操作者显式把 `minimumVersion/maximumExclusiveVersion` 更新为 `0.18.2/0.18.3`。
 
 更新步骤：
 
@@ -89,6 +91,6 @@ bun run src/index.ts upstream rollback \
 2. 按 Hermes 官方本地升级方式更新隔离环境，不改本项目 plugin。
 3. 在候选官方版本环境中执行 plugin import/register/job/final/cancel smoke。
 4. 执行 `uv run pytest -q` 和项目根目录 `bun run check`。
-5. 只有验证通过后，才在配置中扩大 `minimumVersion/maximumExclusiveVersion`；先做 canary，再恢复常驻服务。
+5. 只有自动测试通过后，才在隔离配置中更新 `minimumVersion/maximumExclusiveVersion`；真实 canary 通过后再更新生产配置并恢复常驻服务。
 
 外置 `~/.hermes/plugins/livis-bridge` 不修改 Hermes core，正常官方更新不会被覆盖。若官方 public platform API 变化，测试或 plugin 加载会先失败，daemon 不会接受 connector。

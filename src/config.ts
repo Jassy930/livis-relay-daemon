@@ -204,8 +204,8 @@ export async function initializeConfig(options: {
     },
     hermes: {
       command: "hermes",
-      minimumVersion: "0.15.1",
-      maximumExclusiveVersion: "0.15.2",
+      minimumVersion: "0.18.2",
+      maximumExclusiveVersion: "0.18.3",
       bridgeImplementation: "livis-hermes-bridge",
       bridgeMinimumVersion: "0.1.0",
       bridgeMaximumExclusiveVersion: "0.2.0",

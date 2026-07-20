@@ -27,6 +27,7 @@ interface ConnectorSocketData {
   connectorId: string | null;
   backend: "hermes" | null;
   ready: boolean;
+  draining: boolean;
   lastPongAt: number;
 }
 
@@ -79,7 +80,9 @@ function parseConnectorMessage(raw: string): ConnectorInboundMessage {
       typeof implementation.version !== "string" ||
       typeof implementation.runtimeVersion !== "string" ||
       capabilities.cancel !== true ||
-      capabilities.finalResult !== true
+      capabilities.finalResult !== true ||
+      capabilities.prestartFailure !== true ||
+      capabilities.draining !== true
     ) {
       throw new Error("connector hello capability 不满足一期要求");
     }
@@ -95,6 +98,16 @@ function parseConnectorMessage(raw: string): ConnectorInboundMessage {
     if (data.type === "failed" && typeof data.error !== "string") {
       throw new Error("failed.error 必须是字符串");
     }
+    if (
+      data.type === "failed" &&
+      data.notStarted !== undefined &&
+      typeof data.notStarted !== "boolean"
+    ) {
+      throw new Error("failed.notStarted 必须是布尔值");
+    }
+    return data as unknown as ConnectorInboundMessage;
+  }
+  if (data.type === "draining") {
     return data as unknown as ConnectorInboundMessage;
   }
   if (data.type === "pong") {
@@ -171,6 +184,7 @@ export class ConnectorServer {
             connectorId: null,
             backend: null,
             ready: false,
+            draining: false,
             lastPongAt: Date.now(),
           },
         });
@@ -290,13 +304,13 @@ export class ConnectorServer {
   }
 
   acknowledgeResult(jobId: string, leaseId: string): void {
-    if (this.activeSocket?.data.ready) {
+    if (this.activeSocket && (this.activeSocket.data.ready || this.activeSocket.data.draining)) {
       this.send(this.activeSocket, { type: "result_stored", jobId, leaseId });
     }
   }
 
   rejectJobMessage(jobId: string, code: string, message: string): void {
-    if (this.activeSocket?.data.ready) {
+    if (this.activeSocket && (this.activeSocket.data.ready || this.activeSocket.data.draining)) {
       this.send(this.activeSocket, { type: "error", code, message, jobId });
     }
   }
@@ -373,6 +387,7 @@ export class ConnectorServer {
       socket.data.connectorId = message.connectorId;
       socket.data.backend = message.backend;
       socket.data.ready = true;
+      socket.data.draining = false;
       this.activeSocket = socket;
       const timer = this.helloTimers.get(socket);
       if (timer) clearTimeout(timer);
@@ -383,6 +398,7 @@ export class ConnectorServer {
         connectorId: message.connectorId,
         daemonVersion: this.options.daemonVersion,
         resultStoreTimeoutMs: this.options.resultStoreTimeoutMs,
+        capabilities: { prestartFailure: true, draining: true },
       });
       await this.handlers.onReady(message);
       this.logger.info("Hermes connector 已就绪", {
@@ -391,7 +407,19 @@ export class ConnectorServer {
       });
       return;
     }
-    if (!socket.data.ready || !socket.data.connectorId) {
+    if (message.type === "draining") {
+      if (!socket.data.ready || !socket.data.connectorId) {
+        throw new Error("connector 尚未完成 hello 或已停止派发");
+      }
+      // Flip readiness synchronously before acknowledging. Subsequent proof
+      // frames remain accepted through the draining flag, while every daemon
+      // dispatch path observes ready=false and cannot offer another job.
+      socket.data.ready = false;
+      socket.data.draining = true;
+      this.send(socket, { type: "draining_ack" });
+      return;
+    }
+    if ((!socket.data.ready && !socket.data.draining) || !socket.data.connectorId) {
       throw new Error("connector 尚未完成 hello");
     }
     switch (message.type) {

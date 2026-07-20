@@ -96,9 +96,9 @@ LIVIS_PHASE1_READ_ONLY_ACK=true
 bun run src/index.ts connector-token
 ```
 
-Hermes 显示配置必须关闭 streaming、tool progress 和 interim assistant messages；工具配置必须为只读，并使用独立工作区。不要在这条远程渠道中启用 manual approval，因为一期没有 approval control lane。
+Hermes 显示配置必须关闭 streaming、tool progress 和 interim assistant messages；工具配置必须为只读，并使用独立工作区。不要在这条远程渠道中启用 manual approval，因为一期没有 approval control lane。bridge 在检测到 blocking approval 时会拒绝该 session 的全部 LiViS 回复并等待 Hermes 自行超时拒绝；这只用于失败关闭，不能把误配的审批流程变成可用功能。
 
-Hermes 0.15.1 建议为 LiViS 使用独立 profile，并在该 profile 的 `config.yaml` 中显式固定：
+Hermes 0.18.2 建议为 LiViS 使用独立 profile，并在该 profile 的 `config.yaml` 中显式固定：
 
 ```yaml
 platform_toolsets:
@@ -126,6 +126,8 @@ gateway:
 该目录不是 wheel，也不能直接通过 monorepo 根执行 `hermes plugins install owner/repo`；开发、升级和卸载边界见 [`hermes-plugin/README.md`](../hermes-plugin/README.md)。
 
 ## 7. 启动顺序
+
+bridge 与 daemon 必须成对升级：新版使用 connector protocol v2，并双向校验 `prestartFailure` 与 `draining` 能力，任一侧仍为旧版都会在 connector 就绪前失败关闭。停止专用 Hermes Gateway 和 `livis-relayd`，在两侧均完成替换后再按下列顺序启动；不要以一方的兼容失败连接承载业务。优雅停止时，bridge 会先发送 `draining`；daemon 在回 `draining_ack` 之前已同步关闭派发门。bridge 随后重放未执行 `failed` proof，并等待对应 `result_stored` 后才关闭 UDS，因此不得用强制杀进程代替正常停止流程。
 
 1. 启动 `livis-relayd`。
 2. 启动专用 Hermes Gateway。
@@ -158,3 +160,7 @@ bun run src/index.ts session release '<sessionKey>'
 ```
 
 不得只为清除状态而跳过前两步。
+
+`session release` 会在同一个 SQLite 事务中删除当前 quarantine，并为相关历史 job 写入 durable release marker。该标记用来防止迟到 cancel 重建已经人工解除的隔离，不代表无需重启 Gateway 或确认旧工具进程退出。
+
+schema v2 升级到 v3 时会保留旧版“删除 session quarantine 行即完成人工释放”的状态：legacy quarantine 只绑定到其 `created_at` 所对应的 `Interrupted/CancelUnknown` 故障 epoch；同 session 更早的歧义 job 会回填 release marker。同一毫秒出现多个精确匹配时会全部保留，找不到同事务时间戳的终态 job 时则迁移为 sentinel 并附带现有歧义 job。旧版迟到 cancel 若把隔离来源改成带 lease 的 `Cancelled` 并覆盖原完成时间，也会强制保留 sentinel 和该来源行。以上不确定情况都确保 proof 不能自动解除而人工 release 仍能持久写入 marker，继续 fail-closed 等待人工核验，不能借升级自动解除。
