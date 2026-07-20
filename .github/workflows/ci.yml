@@ -25,7 +25,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - name: 检出代码
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
       - name: 安装 Bun
@@ -38,7 +38,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: 安装 uv
-        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           version: "0.11.19"
           enable-cache: true
@@ -60,7 +60,7 @@ jobs:
         working-directory: hermes-plugin
     steps:
       - name: 检出代码
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
       - name: 安装 Python
@@ -69,7 +69,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: 安装 uv
-        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
         with:
           version: "0.11.19"
           enable-cache: true
