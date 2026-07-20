@@ -33,7 +33,8 @@ export class RelayClient {
   private abortController = new AbortController();
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private tokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-  private tokenRefreshFailures = 0;
+  private connectionGeneration = 0;
+  private tokenRefreshGeneration = 0;
   private lastPongAt = 0;
   private handshakeComplete = false;
   private terminalFailure: string | null = null;
@@ -79,7 +80,7 @@ export class RelayClient {
   async stop(): Promise<void> {
     this.abortController.abort(new Error("relay client stopping"));
     this.stopHeartbeat();
-    this.stopTokenRefreshTimer();
+    this.invalidateTokenRefresh();
     this.clearResultTimers(true);
     this.socket?.close(1000, "daemon stopping");
     await this.runPromise?.catch(() => undefined);
@@ -125,9 +126,13 @@ export class RelayClient {
     const url = new URL(this.profile.endpoints.relayWebSocketUrl);
     url.searchParams.set("protocol_version", String(this.profile.wireProtocolVersion));
     const socket = new WebSocket(url);
+    const connectionGeneration = this.connectionGeneration + 1;
+    this.connectionGeneration = connectionGeneration;
+    this.invalidateTokenRefresh();
     this.socket = socket;
     this.handshakeComplete = false;
     this.messageChain = Promise.resolve();
+    let connectionHandshakeComplete = false;
 
     let resolveHandshake!: () => void;
     let rejectHandshake!: (error: Error) => void;
@@ -142,7 +147,7 @@ export class RelayClient {
     const socketClosed = new Promise<{ code: number; reason: string }>((resolvePromise) => {
       socket.once("close", (code, reason) => {
         const text = reason.toString();
-        if (!this.handshakeComplete) {
+        if (!connectionHandshakeComplete) {
           rejectHandshake(new Error(`LiViS WebSocket 握手前断开：${code} ${text}`));
         }
         resolvePromise({ code, reason: text });
@@ -172,23 +177,27 @@ export class RelayClient {
       this.messageChain = this.messageChain
         .then(async () => {
           const envelope = parseRelayEnvelope(raw);
+          if (!this.isCurrentConnection(socket, connectionGeneration)) {
+            return;
+          }
           // 任何能解析的服务端消息都证明链路存活；部分网关不回 WS 协议层
           // pong，只依赖 pong 会周期性误杀健康连接。
           this.lastPongAt = Date.now();
-          if (envelope.type === "connected" && !this.handshakeComplete) {
+          if (envelope.type === "connected" && !connectionHandshakeComplete) {
+            connectionHandshakeComplete = true;
             this.handshakeComplete = true;
             this.lastPongAt = Date.now();
             resolveHandshake();
             return;
           }
-          await this.handleEnvelope(envelope);
+          await this.handleEnvelope(envelope, socket, connectionGeneration);
         })
         .catch((error) => {
           this.logger.warn("LiViS 消息被拒绝", { error: errorMessage(error) });
         });
     });
     socket.on("error", (error) => {
-      if (!this.handshakeComplete) {
+      if (!connectionHandshakeComplete) {
         rejectHandshake(new Error(`LiViS WebSocket 错误：${error.message}`));
       }
     });
@@ -207,10 +216,12 @@ export class RelayClient {
     } finally {
       clearTimeout(handshakeTimer);
       this.stopHeartbeat();
-      this.stopTokenRefreshTimer();
+      if (this.isCurrentConnection(socket, connectionGeneration)) {
+        this.invalidateTokenRefresh();
+      }
       this.clearResultTimers(true);
-      this.handshakeComplete = false;
       if (this.socket === socket) {
+        this.handshakeComplete = false;
         this.socket = null;
       }
       if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
@@ -219,15 +230,19 @@ export class RelayClient {
     }
   }
 
-  private async handleEnvelope(envelope: RelayEnvelope): Promise<void> {
-    if (!this.handshakeComplete) {
+  private async handleEnvelope(
+    envelope: RelayEnvelope,
+    socket: WebSocket,
+    connectionGeneration: number,
+  ): Promise<void> {
+    if (!this.handshakeComplete || !this.isCurrentConnection(socket, connectionGeneration)) {
       throw new Error(`握手前收到业务消息：${envelope.type}`);
     }
     switch (envelope.type) {
       case "send_message": {
         const job = parseIncomingRelayJob(envelope, this.config.security.maxInputChars);
         await this.handlers.onIncoming(envelope);
-        this.send(buildAckEnvelope(
+        this.sendOnConnection(socket, connectionGeneration, buildAckEnvelope(
           this.profile,
           "ack_send_message",
           job.jobId,
@@ -242,7 +257,7 @@ export class RelayClient {
           throw new Error("cancel_chat 缺少 job_id");
         }
         await this.handlers.onCancel(jobId);
-        this.send(buildAckEnvelope(
+        this.sendOnConnection(socket, connectionGeneration, buildAckEnvelope(
           this.profile,
           "ack_cancel_chat",
           jobId,
@@ -271,11 +286,10 @@ export class RelayClient {
         break;
       }
       case "token_expiring":
-        await this.refreshRelayToken();
+        await this.beginRelayTokenRefresh(socket, connectionGeneration);
         break;
       case "token_refreshed":
-        this.stopTokenRefreshTimer();
-        this.tokenRefreshFailures = 0;
+        this.invalidateTokenRefresh();
         break;
       case "connected":
         break;
@@ -284,14 +298,31 @@ export class RelayClient {
     }
   }
 
-  private async refreshRelayToken(): Promise<void> {
+  private async beginRelayTokenRefresh(socket: WebSocket, connectionGeneration: number): Promise<void> {
+    this.invalidateTokenRefresh();
+    const refreshGeneration = this.tokenRefreshGeneration;
+    await this.refreshRelayToken(socket, connectionGeneration, refreshGeneration, 1);
+  }
+
+  private async refreshRelayToken(
+    socket: WebSocket,
+    connectionGeneration: number,
+    refreshGeneration: number,
+    attempt: number,
+  ): Promise<void> {
+    if (!this.isCurrentTokenRefresh(socket, connectionGeneration, refreshGeneration)) {
+      return;
+    }
     try {
       const accessToken = await this.auth.getAccessToken(true);
       const currentSecrets = await this.secrets.get();
       if (!currentSecrets.refreshToken) {
         throw new TerminalAuthError("刷新后缺少 refresh token");
       }
-      this.send(buildTokenRefreshEnvelope({
+      if (!this.isCurrentTokenRefresh(socket, connectionGeneration, refreshGeneration)) {
+        return;
+      }
+      this.sendOnConnection(socket, connectionGeneration, buildTokenRefreshEnvelope({
         profile: this.profile,
         agentId: this.identity.agentId,
         deviceId: this.identity.deviceId,
@@ -300,20 +331,89 @@ export class RelayClient {
       }));
       this.stopTokenRefreshTimer();
       this.tokenRefreshTimer = setTimeout(() => {
-        this.tokenRefreshFailures += 1;
-        if (this.tokenRefreshFailures >= this.profile.timing.tokenRefreshMaxFailures) {
-          this.terminalFailure = "token_refresh ACK 连续失败";
-          this.socket?.close(1008, "token refresh failure");
-        }
+        this.tokenRefreshTimer = null;
+        this.scheduleTokenRefreshRetry(
+          socket,
+          connectionGeneration,
+          refreshGeneration,
+          attempt,
+          "token_refresh ACK 超时",
+        );
       }, this.profile.timing.tokenRefreshAckTimeoutMs);
     } catch (error) {
-      this.tokenRefreshFailures += 1;
-      if (error instanceof TerminalAuthError || this.tokenRefreshFailures >= this.profile.timing.tokenRefreshMaxFailures) {
-        this.terminalFailure = errorMessage(error);
-        this.socket?.close(1008, "token refresh failure");
+      if (!this.isCurrentTokenRefresh(socket, connectionGeneration, refreshGeneration)) {
+        return;
       }
-      throw error;
+      if (error instanceof TerminalAuthError) {
+        this.terminalFailure = errorMessage(error);
+        this.invalidateTokenRefresh();
+        this.socket?.close(1008, "terminal token refresh failure");
+        this.logger.error("LiViS token refresh 进入终止状态", { error: errorMessage(error) });
+        return;
+      }
+      this.scheduleTokenRefreshRetry(
+        socket,
+        connectionGeneration,
+        refreshGeneration,
+        attempt,
+        errorMessage(error),
+      );
     }
+  }
+
+  private scheduleTokenRefreshRetry(
+    socket: WebSocket,
+    connectionGeneration: number,
+    refreshGeneration: number,
+    attempt: number,
+    reason: string,
+  ): void {
+    if (!this.isCurrentTokenRefresh(socket, connectionGeneration, refreshGeneration)) {
+      return;
+    }
+    if (attempt >= this.profile.timing.tokenRefreshMaxFailures) {
+      this.logger.warn("LiViS token refresh 单连接重试耗尽，将重连", { attempt, reason });
+      this.invalidateTokenRefresh();
+      socket.close(1012, "token refresh retry exhausted");
+      return;
+    }
+    const base = Math.min(
+      Math.min(this.profile.timing.tokenRefreshAckTimeoutMs, 1_000) * 2 ** Math.max(0, attempt - 1),
+      this.config.relay.reconnectMaxMs,
+    );
+    const waitMs = Math.max(
+      1,
+      Math.min(this.config.relay.reconnectMaxMs, withJitter(Math.max(1, base))),
+    );
+    this.logger.warn("LiViS token refresh 临时失败，将重试", {
+      attempt,
+      nextAttempt: attempt + 1,
+      waitMs,
+      reason,
+    });
+    this.stopTokenRefreshTimer();
+    this.tokenRefreshTimer = setTimeout(() => {
+      this.tokenRefreshTimer = null;
+      void this.refreshRelayToken(
+        socket,
+        connectionGeneration,
+        refreshGeneration,
+        attempt + 1,
+      );
+    }, waitMs);
+  }
+
+  private isCurrentConnection(socket: WebSocket, connectionGeneration: number): boolean {
+    return this.socket === socket && this.connectionGeneration === connectionGeneration;
+  }
+
+  private isCurrentTokenRefresh(
+    socket: WebSocket,
+    connectionGeneration: number,
+    refreshGeneration: number,
+  ): boolean {
+    return this.isCurrentConnection(socket, connectionGeneration) &&
+      this.tokenRefreshGeneration === refreshGeneration;
   }
 
   private async replayOutbox(): Promise<void> {
@@ -405,6 +505,11 @@ export class RelayClient {
     }
   }
 
+  private invalidateTokenRefresh(): void {
+    this.stopTokenRefreshTimer();
+    this.tokenRefreshGeneration += 1;
+  }
+
   private clearResultTimers(resetPending: boolean): void {
     for (const [jobId, timer] of this.resultAckTimers) {
       clearTimeout(timer);
@@ -420,5 +525,16 @@ export class RelayClient {
       throw new Error(`LiViS WebSocket 未连接，无法发送 ${envelope.type}`);
     }
     this.socket.send(JSON.stringify(envelope));
+  }
+
+  private sendOnConnection(
+    socket: WebSocket,
+    connectionGeneration: number,
+    envelope: RelayEnvelope,
+  ): void {
+    if (!this.isCurrentConnection(socket, connectionGeneration) || socket.readyState !== WebSocket.OPEN) {
+      throw new Error(`LiViS WebSocket 连接已过期，无法发送 ${envelope.type}`);
+    }
+    socket.send(JSON.stringify(envelope));
   }
 }
