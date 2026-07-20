@@ -6,6 +6,7 @@
 
 ### 修复
 
+- Relay `connect` 与 `token_refresh` 帧不再携带长期 refresh token，只发送短期 access token；refresh token 仅用于 daemon 向 IDaaS 换取新 token。
 - 结果重试不再覆盖旧的投递 ID；首次投递的延迟 ACK 在重试开始后仍能关联原 job。
 - 驱逐失活 connector 后，旧 socket 的延迟 `close` 回调不再误清理复用同一 ID 的新连接。
 - `ack_send_result` 的 `ref_msg_id` 现在会按持久化投递记录回查真实 job，引用投递 `msg_id` 的 ACK 不再丢失。

@@ -11,6 +11,12 @@
 
 这种边界允许将来增加 AionCore connector，而不复制 LiViS 登录、协议和 durable outbox。
 
+## OAuth 凭据边界
+
+refresh token 的流向固定为本地 SecretStore → daemon 的 IDaaS client → IDaaS `/token` 或 `/revoke`，不会进入 Relay WebSocket。Relay `connect` 和 `token_refresh` 只携带 IDaaS 返回的短期 access token；Relay 无法仅凭捕获的业务帧持续换取新 token。
+
+官方 v2.0.0 客户端样本会在这两种帧中附带 refresh token，但静态客户端代码不能证明服务端是否把该字段设为必填。本项目当前只有 fake Relay 契约测试，没有真实 Relay canary；正式启用前必须验证握手、`token_expiring` → `token_refresh` → `token_refreshed` 全链路，不能把单元测试视为线上兼容性证明。
+
 ## 执行与投递是两套状态
 
 ```text

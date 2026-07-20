@@ -277,7 +277,6 @@ describe("RelayClient fake LiViS end-to-end", () => {
       config,
       profile,
       identity,
-      secrets,
       auth,
       store,
       handlers,
@@ -326,6 +325,24 @@ describe("RelayClient fake LiViS end-to-end", () => {
     const ack = await fakeRelay.next("ack_send_message");
     expect(ack.envelope.metadata?.job_id).toBe("durable-job");
     expect(store.require("durable-job").status).toBe("Acked");
+  });
+
+  test("connect 与 token_refresh 只向 Relay 发送 access token", async () => {
+    const relayClient = createClient(durableHandlers());
+    relayClient.start();
+    const socket = await fakeRelay.handshake(relayClient);
+
+    const connect = fakeRelay.history.find((captured) => captured.envelope.type === "connect")!;
+    expect(connect.envelope.payload?.token).toBe("access-test");
+    expect(connect.envelope.payload).not.toHaveProperty("refresh_token");
+
+    fakeRelay.send(socket, { type: "token_expiring", metadata: {}, payload: {} });
+    const refresh = await fakeRelay.next("token_refresh");
+    expect(refresh.envelope.payload?.token).toBe("access-test");
+    expect(refresh.envelope.payload).not.toHaveProperty("refresh_token");
+    expect((await secrets.get()).refreshToken).toBe("refresh-test");
+
+    fakeRelay.send(socket, { type: "token_refreshed", metadata: {}, payload: {} });
   });
 
   test("重复 job 不重复执行，但每次投递都重新 ACK", async () => {

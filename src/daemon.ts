@@ -88,7 +88,6 @@ export class RelayDaemon {
       dependencies.config,
       dependencies.profile,
       dependencies.identity,
-      dependencies.secrets,
       auth,
       store,
       relayHandlers,
