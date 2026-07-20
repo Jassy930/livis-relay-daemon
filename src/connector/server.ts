@@ -213,8 +213,13 @@ export class ConnectorServer {
           if (timer) clearTimeout(timer);
           this.helloTimers.delete(socket);
           void this.enqueueTransition(async () => {
-            if (!this.isActiveSocket(socket)) return;
-            this.fenceSocket(socket);
+            if (this.isActiveSocket(socket)) {
+              this.fenceSocket(socket);
+            } else if (socket.data.generation === 0) {
+              return;
+            }
+            // takeover 可能已 fence generation，但首次 durable settlement
+            // 失败；迟到 close 仍应重试，而不是因“不再 active”直接跳过。
             await this.settleDisconnected(socket);
           }).catch((error) => {
             logger.error("connector 断开清理失败", {
@@ -467,10 +472,12 @@ export class ConnectorServer {
 
   private async settleDisconnected(socket: Bun.ServerWebSocket<ConnectorSocketData>): Promise<void> {
     if (socket.data.disconnectHandled) return;
-    socket.data.disconnectHandled = true;
     if (socket.data.connectorId) {
       await this.handlers.onDisconnected(socket.data.connectorId);
     }
+    // 只有 durable handler 成功后才能记为已结算；否则 takeover/close 的
+    // 后续路径必须仍可重试同一 generation。
+    socket.data.disconnectHandled = true;
   }
 
   private enqueueTransition(operation: () => Promise<void>): Promise<void> {

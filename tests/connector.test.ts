@@ -346,3 +346,40 @@ describe("Hermes connector Unix WebSocket", () => {
     );
   });
 });
+
+describe("Connector 断连 durable 结算", () => {
+  test("断连结算首次失败后不会永久标记为已处理", async () => {
+    let settlementAttempts = 0;
+    const socket = {
+      data: {
+        connectorId: "retry-connector",
+        disconnectHandled: false,
+      },
+    };
+    const server = Object.create(ConnectorServer.prototype) as ConnectorServer;
+    const internals = server as unknown as {
+      handlers: Pick<ConnectorServerHandlers, "onDisconnected">;
+      settleDisconnected(candidate: typeof socket): Promise<void>;
+    };
+    internals.handlers = {
+      onDisconnected: async (connectorId) => {
+        settlementAttempts += 1;
+        expect(connectorId).toBe("retry-connector");
+        if (settlementAttempts === 1) {
+          throw new Error("synthetic settlement failure");
+        }
+      },
+    };
+
+    await expect(internals.settleDisconnected(socket)).rejects.toThrow("synthetic settlement failure");
+    expect(settlementAttempts).toBe(1);
+    expect(socket.data.disconnectHandled).toBeFalse();
+
+    await internals.settleDisconnected(socket);
+    expect(settlementAttempts).toBe(2);
+    expect(socket.data.disconnectHandled).toBeTrue();
+
+    await internals.settleDisconnected(socket);
+    expect(settlementAttempts).toBe(2);
+  });
+});
