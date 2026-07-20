@@ -148,14 +148,16 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
 
 export async function loadRelayConfig(path = process.env.LIVIS_RELAY_CONFIG ?? DEFAULT_CONFIG_PATH): Promise<{
   path: string;
+  text: string;
   config: RelayConfig;
 }> {
   const resolvedPath = expandHome(path);
-  const config = parseRelayConfig(await Bun.file(resolvedPath).text(), resolvedPath);
+  const text = await Bun.file(resolvedPath).text();
+  const config = parseRelayConfig(text, resolvedPath);
   if (process.env.LIVIS_RELAY_STATE_DIR) {
     config.stateDir = expandHome(process.env.LIVIS_RELAY_STATE_DIR);
   }
-  return { path: resolvedPath, config };
+  return { path: resolvedPath, text, config };
 }
 
 export async function initializeConfig(options: {

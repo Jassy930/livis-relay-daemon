@@ -151,6 +151,7 @@ export function validateProfileActivation(options: {
 
 interface ReviewedProfileActivationOptions {
   configPath: string;
+  expectedConfigText: string;
   config: RelayConfig;
   activeProfile: ProtocolProfile;
   candidateProfile: ProtocolProfile;
@@ -175,6 +176,9 @@ async function activateReviewedProfileLocked(
   const profileText = `${JSON.stringify(options.candidateProfile, null, 2)}\n`;
   const profileHash = sha256(profileText);
   const originalConfigText = await Bun.file(options.configPath).text();
+  if (originalConfigText !== options.expectedConfigText) {
+    throw new Error("配置在激活期间发生变化，拒绝覆盖");
+  }
   const configRoot = parseJsonObject(originalConfigText, options.configPath);
   if (
     configRoot.profile !== options.config.profile ||

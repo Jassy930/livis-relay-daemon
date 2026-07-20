@@ -253,6 +253,7 @@ async function commandUpstreamActivate(args: string[]): Promise<void> {
   const liveSnapshot = await new UpstreamChecker().check(candidateProfile, [candidateProfile]);
   const activated = await activateReviewedProfile({
     configPath: context.path,
+    expectedConfigText: context.text,
     config: context.config,
     activeProfile: context.profile,
     candidateProfile,

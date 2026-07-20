@@ -14,7 +14,7 @@
 - Device Flow 依据 OAuth error 处理 `authorization_pending` / `slow_down`，兼容 LiViS IDaaS 对 pending 返回 HTTP 428 的实际行为。
 - relay 心跳判活改为任何可解析的服务端消息都刷新，不再仅依赖 WS 协议层 pong。
 - `parseSemverTriplet` 拒绝预发布版本（如 `0.15.1-beta`），预发布 Hermes/bridge 不再落入已审核区间。
-- profile 激活现在先持久化 supported proof 与审批回执，再以 live config 为最后提交点；跨进程锁与配置内容 CAS 防止并发激活或补偿回滚相互覆盖。
+- profile 激活现在先持久化 supported proof 与审批回执，再以 live config 为最后提交点；跨进程锁与完整配置文本 CAS 防止 `stateDir` 等并发修改或补偿回滚相互覆盖。
 
 ### 变更
 

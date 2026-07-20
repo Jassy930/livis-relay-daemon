@@ -49,7 +49,8 @@ async function prepareActivation(directoryPath: string) {
     profileSha256: sha256(activeText),
   };
   const configPath = join(directoryPath, "config.json");
-  await atomicWritePrivate(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  const configText = `${JSON.stringify(config, null, 2)}\n`;
+  await atomicWritePrivate(configPath, configText);
   const candidatePath = join(directoryPath, "candidate.json");
   await atomicWritePrivate(candidatePath, `${JSON.stringify(candidate, null, 2)}\n`);
   const identity: RelayIdentity = {
@@ -66,6 +67,7 @@ async function prepareActivation(directoryPath: string) {
     configPath,
     options: {
       configPath,
+      expectedConfigText: configText,
       config,
       activeProfile: active,
       candidateProfile: candidate,
@@ -191,6 +193,32 @@ describe("官方 profile 原子激活", () => {
       expect(await Bun.file(
         supportedProofPath(directory.path, loaded.config.profileSha256),
       ).exists()).toBeTrue();
+    } finally {
+      await directory.cleanup();
+    }
+  });
+
+  test("完整配置 CAS 拒绝只修改 stateDir 的并发更新", async () => {
+    const directory = await temporaryDirectory();
+    try {
+      const fixture = await prepareActivation(directory.path);
+      const concurrentStateDir = join(directory.path, "moved-state");
+      const concurrentConfigText = `${JSON.stringify({
+        ...fixture.config,
+        stateDir: concurrentStateDir,
+      }, null, 2)}\n`;
+      await atomicWritePrivate(fixture.configPath, concurrentConfigText);
+
+      await expect(activateReviewedProfile(fixture.options)).rejects.toThrow(
+        "配置在激活期间发生变化",
+      );
+      expect(await Bun.file(fixture.configPath).text()).toBe(concurrentConfigText);
+      expect(await Bun.file(
+        join(directory.path, "protocol-profiles", "livis-community-v2.1.0.json"),
+      ).exists()).toBeFalse();
+      expect(await Bun.file(
+        join(concurrentStateDir, "protocol-profiles", "livis-community-v2.1.0.json"),
+      ).exists()).toBeFalse();
     } finally {
       await directory.cleanup();
     }
