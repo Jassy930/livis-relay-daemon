@@ -401,6 +401,30 @@ describe("RelayClient fake LiViS end-to-end", () => {
     );
   });
 
+  test("send 同步失败后不接受尚未发出的 result ACK", async () => {
+    createPendingResult(store, "sync-send-failure");
+    const relayClient = createClient(durableHandlers());
+    const internals = relayClient as unknown as {
+      handshakeComplete: boolean;
+      socket: { readyState: number; close: () => void };
+      send: (envelope: RelayEnvelope) => void;
+      deliverResult: (jobId: string, retry: boolean) => Promise<void>;
+    };
+    internals.handshakeComplete = true;
+    internals.socket = { readyState: 1, close: () => undefined };
+    internals.send = () => {
+      throw new Error("synthetic send failure");
+    };
+
+    await expect(internals.deliverResult("sync-send-failure", false)).rejects.toThrow(
+      "synthetic send failure",
+    );
+    const outbox = store.require("sync-send-failure").outbox!;
+    expect(outbox.status).toBe("Pending");
+    expect(outbox.lastMessageId).toBeNull();
+    expect(store.markOutboxDelivered("sync-send-failure")?.status).toBe("Pending");
+  });
+
   test("重试耗尽后迟到 ACK 可从持久化退避态完成投递", async () => {
     profile = {
       ...profile,

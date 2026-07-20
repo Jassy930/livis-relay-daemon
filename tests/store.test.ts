@@ -135,6 +135,35 @@ describe("durable jobs + outbox", () => {
     expect(store.nextOutboxAttemptAt()).toBeNull();
   });
 
+  test("同步发送失败会撤销未出进程的投递 ID", () => {
+    store.ingest(incomingJob("send-failed"), "session-1");
+    store.markAcked("send-failed");
+    store.claimForDispatch("send-failed", "connector", "lease-1");
+    store.markRunning("send-failed", "connector", "lease-1");
+    store.finishSuccess("send-failed", "lease-1", '{"text":"done"}');
+
+    store.startResultDelivery("send-failed", "never-sent", false);
+    const reset = store.resetOutboxPendingAfterSendFailure("send-failed", "never-sent", false)!;
+    expect(reset.status).toBe("Pending");
+    expect(reset.lastMessageId).toBeNull();
+    expect(reset.retryCount).toBe(0);
+    expect(store.findJobIdByOutboxMessageId("never-sent")).toBeNull();
+    expect(store.markOutboxDelivered("send-failed")?.status).toBe("Pending");
+
+    store.startResultDelivery("send-failed", "sent-once", false);
+    store.startResultDelivery("send-failed", "retry-never-sent", true);
+    const retryReset = store.resetOutboxPendingAfterSendFailure(
+      "send-failed",
+      "retry-never-sent",
+      true,
+    )!;
+    expect(retryReset.status).toBe("Pending");
+    expect(retryReset.lastMessageId).toBe("sent-once");
+    expect(retryReset.retryCount).toBe(0);
+    expect(store.findJobIdByOutboxMessageId("retry-never-sent")).toBeNull();
+    expect(store.findJobIdByOutboxMessageId("sent-once")).toBe("send-failed");
+  });
+
   test("重启后到期 AckFailed 从新的重试周期继续", () => {
     const databasePath = join(directory.path, "relay.db");
     store.ingest(incomingJob("restart-recovery"), "session-1");

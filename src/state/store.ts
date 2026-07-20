@@ -332,6 +332,37 @@ export class JobStore {
     return this.require(jobId).outbox;
   }
 
+  resetOutboxPendingAfterSendFailure(jobId: string, messageId: string, retry: boolean): StoredOutbox | null {
+    const now = Date.now();
+    const transaction = this.database.transaction(() => {
+      const reset = this.database
+        .query(`UPDATE outbox
+                SET status='Pending',
+                    retry_count=CASE WHEN ?=1 AND retry_count>0 THEN retry_count-1 ELSE retry_count END,
+                    last_message_id=(
+                      SELECT previous.message_id
+                      FROM outbox_delivery_attempts previous
+                      WHERE previous.scope_key=outbox.scope_key
+                        AND previous.job_id=outbox.job_id
+                        AND previous.message_id<>?
+                      ORDER BY previous.created_at DESC, previous.rowid DESC
+                      LIMIT 1
+                    ),
+                    next_attempt_at=NULL,
+                    updated_at=?
+                WHERE scope_key=? AND job_id=?
+                  AND status='Delivering' AND last_message_id=?`)
+        .run(retry ? 1 : 0, messageId, now, this.scopeKey, jobId, messageId);
+      if (reset.changes === 1) {
+        this.database
+          .query("DELETE FROM outbox_delivery_attempts WHERE scope_key=? AND job_id=? AND message_id=?")
+          .run(this.scopeKey, jobId, messageId);
+      }
+    });
+    transaction.immediate();
+    return this.require(jobId).outbox;
+  }
+
   markOutboxDelivered(jobId: string): StoredOutbox | null {
     const now = Date.now();
     this.database

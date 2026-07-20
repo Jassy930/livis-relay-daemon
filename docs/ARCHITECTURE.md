@@ -32,7 +32,7 @@ Pending → Delivering → Delivered
 
 `resultMaxRetries` 只限制一个投递周期内的快速重试。耗尽后 outbox 进入 `AckFailed`，并在 SQLite 中保存 `next_attempt_at`；退避时间按 `resultAckTimeoutMs` 和本周期重试次数指数增长，最长 5 分钟。到期后，当前在线连接、重连或 daemon 重启都会开启新周期；这是持久化退避态，不是死信。
 
-每次投递的 `msg_id` 都持久化在 `outbox_delivery_attempts`。只要结果确实曾投递，引用任一历史 `msg_id` 或原 `job_id` 的迟到 ACK 在 `Pending` / `Delivering` / `AckFailed` 期间都能将它收敛为 `Delivered`；尚未投递过的 `Pending` 结果不接受 ACK。
+每次投递的 `msg_id` 都先持久化在 `outbox_delivery_attempts`，再交给 WebSocket；若 `send` 同步失败，daemon 会在同一个 SQLite 事务内撤销该未出进程的 ID、恢复此前的最后一次真实 attempt 并回到 `Pending`。只要结果确实曾投递，引用任一历史 `msg_id` 或原 `job_id` 的迟到 ACK 在 `Pending` / `Delivering` / `AckFailed` 期间都能将它收敛为 `Delivered`；尚未投递过的 `Pending` 结果不接受 ACK。
 
 ## Hermes connector contract
 

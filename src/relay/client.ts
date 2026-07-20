@@ -347,7 +347,10 @@ export class RelayClient {
         messageId,
       }));
     } catch (error) {
-      this.store.resetOutboxPending(jobId);
+      // startResultDelivery 会在网络发送前持久化 messageId，保证帧不会先于
+      // durable mapping 离开进程。若 send 同步失败，必须同时撤销这次尚未
+      // 发出的 attempt；否则伪造或串线的 ACK 可把 Pending 结果误结算。
+      this.store.resetOutboxPendingAfterSendFailure(jobId, messageId, retry);
       throw error;
     }
     const previousTimer = this.resultAckTimers.get(jobId);
