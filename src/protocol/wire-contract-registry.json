@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "currentRevision": "livis-relay-v1-access-refresh-r1",
+  "contracts": [
+    {
+      "revision": "livis-relay-v1-access-refresh-r1",
+      "credentialMode": "access-and-refresh-token",
+      "wireProtocolVersion": 1,
+      "localProbeArtifactPath": "protocol-probes/local/livis-relay-v1-access-refresh-r1.json",
+      "localProbeArtifactSha256": "6e968e7b89828f0dcf077fb9aa9c139fd9a0bf9417ef6720db5cb79ed276cb34"
+    }
+  ]
+}

@@ -9,9 +9,9 @@
 协议相关事实按以下顺序组合使用：
 
 1. 本文记录“知道什么、凭什么知道、还不知道什么”；
-2. 私有 protocol profile 固定获授权端点、OAuth 参数、wire identity、timing 与官方 artifact 哈希；
+2. 私有 protocol profile 固定获授权端点、OAuth 参数、wire identity、timing、`wireContractRevision`、`credentialMode` 与官方 artifact 哈希；
 3. `src/protocol/livis.ts` 和 `src/relay/client.ts` 是当前 daemon 的实际序列化与状态机实现；
-4. fake Relay、golden fixture 与单元测试只证明本项目内部契约；
+4. [本地协议探针](PROTOCOL-PROBES.md)、fake Relay、golden fixture 与单元测试只证明本项目内部契约；
 5. 脱敏的真实 canary 记录只证明精确版本组合在特定时间和环境中被服务端接受。
 
 出现冲突时，不按“更像官方”猜测：降低证据等级、标为未知并失败关闭。以下表述是强制约束：
@@ -36,6 +36,8 @@
 IDaaS 的标准语义可同时引用公开 RFC：Device Authorization Grant 参考 [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)，refresh-token grant 参考 [RFC 6749](https://www.rfc-editor.org/rfc/rfc6749)，token revocation 参考 [RFC 7009](https://www.rfc-editor.org/rfc/rfc7009)。RFC 只能约束标准 OAuth 语义，不能替代 LiViS 私有端点和 Relay wire 的服务端证据。
 
 截至核对日期，本项目未持有 S5 级 LiViS Relay 服务端 schema、公开 SDK 或稳定协议承诺。
+
+本地 probe 的脱敏 artifact 固定当前 daemon 观察，但证据等级仍是 S2。它可以阻止实现静默漂移，不能回答服务端必填性或把未知项升级为兼容结论。
 
 ### 公开检索记录
 
@@ -127,7 +129,7 @@ sequenceDiagram
 
 | 操作 | daemon 发送 / 接收 | 当前证据 | 服务端边界 |
 |---|---|---|---|
-| Device code | `POST /aux`：`client_id`、`scope + offline_access`、`audience`、`offline_access=true`；接收 `device_code`、`verification_uri_complete`、`expires_in`、`interval` | S4 完成真实 Device Flow；S2 只覆盖已登记成功形状和部分必需字段存在性 | 字段类型、取值范围、URI scheme、私有路径和服务端必填性尚无完整负向验证或 S5 schema |
+| Device code | `POST /aux`：`client_id`、`scope + offline_access`、`audience`、`offline_access=true`；接收 `device_code`、`verification_uri_complete`、`expires_in`、`interval` | S4 完成真实 Device Flow；S2 probe 固定精确请求字段，并记录当前响应类型/范围/URI 校验缺口 | 当前缺口是 daemon 风险，不表示服务端允许这些形状；私有路径和必填性没有 S5 schema |
 | Device token polling | `POST /token`：device-code grant、`device_code`、`client_id` | S4 观察到 `authorization_pending` + HTTP 428 并最终成功；S2 覆盖标准 HTTP 400 和 `slow_down` | HTTP 400/429 分支不是实网证据；以 OAuth `error` 而非状态码裁决 |
 | Access-token refresh | `POST /token`：refresh-token grant、`refresh_token`、`client_id`；接收 access token，可选轮换 refresh token | S2 覆盖成功、轮换、`invalid_grant` 等分支；当前代码路径暗示历史握手前可能经过该步骤，只能记为 S1 推断 | 没有独立真实 HTTP receipt；响应字段、轮换细节、所有错误状态和在线长期行为未知 |
 | Revoke | `POST /revoke`：token、`token_type_hint=refresh_token`、`client_id` | S2 代码与测试 | 当前没有真实 2xx、网络失败或拒绝 canary |
@@ -204,7 +206,7 @@ wire 变化转 Ready 前必须同时满足：
 7. 重基、冲突解决、组合其他 wire PR 或 profile/runtime 变化后重新验证；
 8. 找不到服务端证据时保持 Draft，不以推断投票决定兼容性。
 
-当前 `runtimeContractSha256()` 固定 profile 参数，但没有覆盖 daemon 生成帧的代码语义。必须建立独立的 `wireContractRevision`（凭据模式也必须进入该 revision），并将它绑定到 protocol profile、runtime digest、supported proof、status 与 canary receipt。在该代码门禁合入前，任何 wire 代码变化都不得转 Ready；仅在文字上声明“人工失效旧 proof”不构成可执行门禁。
+代码内置只读 registry 维护 `wireContractRevision + credentialMode` 并固定对应脱敏 artifact SHA-256；protocol profile schema v2、`runtimeContractSha256()`、supported proof 和 status 同时绑定该契约。本地 artifact 固定 daemon 生成帧、入站解析和 IDaaS 表单的 S2 行为。任何 wire 变化必须建立新 revision 并更新 artifact；复用旧 revision、只改文字或只让 fake Relay 返回成功都不能构成门禁。S2 门禁仍不能替代最终 head 的获授权 S4 canary；真实 canary receipt 的 schema/私有保管和 revision 绑定仍须在执行 S4 前独立实现，未完成时 wire PR 继续保持 Draft。
 
 ## 10. 当前 PR 裁决
 
@@ -213,7 +215,7 @@ wire 变化转 Ready 前必须同时满足：
 #23 保持 Draft。转 Ready 前必须同时满足：
 
 1. 基于最新 `main` 形成最终组合 head，并保留 #20 的 revoke 语义；
-2. 先合入并使用上述 `wireContractRevision + credentialMode` 代码门禁；
+2. 基于上述代码门禁建立新的 access-token-only revision / credential mode，不得覆写当前 access-and-refresh-token 基线；
 3. strict fake Relay 对 `connect` 与 `token_refresh` 同时断言只有 access token，并拒绝 refresh token；
 4. 在同一最终 head 完成 `connect(access-only) → connected`；
 5. 完成 `token_expiring → 本地 IDaaS refresh → token_refresh(access-only) → token_refreshed`；

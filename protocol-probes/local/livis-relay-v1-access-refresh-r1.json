@@ -1,0 +1,263 @@
+{
+  "schemaVersion": 1,
+  "evidenceLevel": "S2",
+  "disclaimer": "只证明当前 daemon 在固定假数据和本地 fake 服务下的行为，不证明真实 LiViS 服务端要求或兼容性。",
+  "contract": {
+    "wireProtocolVersion": 1,
+    "wireContractRevision": "livis-relay-v1-access-refresh-r1",
+    "credentialMode": "access-and-refresh-token"
+  },
+  "safety": {
+    "network": "injected-fetch-and-loopback-only",
+    "credentials": "fixed-sentinel-only",
+    "liveProfileRead": false,
+    "rawFramePersistence": false
+  },
+  "relay": {
+    "outboundFrames": {
+      "connect": {
+        "type": "connect",
+        "metadata": {
+          "msg_id": "<generated-message-id>",
+          "job_id": "<generated-job-id>",
+          "agent_id": "<agent-id>",
+          "timestamp": "<timestamp:number>"
+        },
+        "payload": {
+          "device_id": "<device-id>",
+          "node_name": "<node-name>",
+          "node_desc": "<node-description>",
+          "client": "<wire-client>",
+          "token": "<access-token>",
+          "refresh_token": "<refresh-token>"
+        }
+      },
+      "heartbeat": {
+        "type": "heartbeat",
+        "metadata": {
+          "msg_id": "<generated-message-id>",
+          "job_id": "<generated-job-id>",
+          "agent_id": "<agent-id>",
+          "device_id": "<device-id>",
+          "timestamp": "<timestamp:number>",
+          "client": "<wire-client>"
+        },
+        "payload": {
+          "nodeType": "<node-type>"
+        }
+      },
+      "ack_send_message": {
+        "type": "ack_send_message",
+        "metadata": {
+          "msg_id": "<generated-message-id>",
+          "job_id": "<job-id>",
+          "agent_id": "<agent-id>",
+          "device_id": "<device-id>",
+          "timestamp": "<timestamp:number>",
+          "client": "<wire-client>"
+        },
+        "payload": {
+          "nodeType": "<node-type>"
+        }
+      },
+      "ack_cancel_chat": {
+        "type": "ack_cancel_chat",
+        "metadata": {
+          "msg_id": "<generated-message-id>",
+          "job_id": "<job-id>",
+          "agent_id": "<agent-id>",
+          "device_id": "<device-id>",
+          "timestamp": "<timestamp:number>",
+          "client": "<wire-client>"
+        },
+        "payload": {
+          "nodeType": "<node-type>"
+        }
+      },
+      "send_result": {
+        "type": "send_result",
+        "metadata": {
+          "msg_id": "<provided-message-id>",
+          "job_id": "<job-id>",
+          "agent_id": "<agent-id>",
+          "device_id": "<device-id>",
+          "timestamp": "<timestamp:number>",
+          "client": "<wire-client>"
+        },
+        "payload": {
+          "data": "<json-string:{text}>",
+          "nodeType": "<node-type>"
+        }
+      },
+      "token_refresh": {
+        "type": "token_refresh",
+        "metadata": {
+          "msg_id": "<generated-message-id>",
+          "job_id": "",
+          "agent_id": "<agent-id>",
+          "device_id": "<device-id>",
+          "timestamp": "<timestamp:number>",
+          "client": "<wire-client>"
+        },
+        "payload": {
+          "token": "<access-token>",
+          "refresh_token": "<refresh-token>",
+          "nodeType": "<node-type>"
+        }
+      }
+    },
+    "parserCases": [
+      {
+        "case": "valid-object-data",
+        "layer": "send_message",
+        "outcome": "accepted"
+      },
+      {
+        "case": "valid-json-string-data",
+        "layer": "send_message",
+        "outcome": "accepted"
+      },
+      {
+        "case": "extra-fields",
+        "layer": "send_message",
+        "outcome": "accepted"
+      },
+      {
+        "case": "missing-job-id",
+        "layer": "send_message",
+        "outcome": "rejected",
+        "reason": "send_message.metadata.job_id 缺失"
+      },
+      {
+        "case": "missing-from-node-id",
+        "layer": "send_message",
+        "outcome": "rejected",
+        "reason": "send_message.payload.from_node_id 缺失"
+      },
+      {
+        "case": "unsupported-business-type",
+        "layer": "send_message",
+        "outcome": "rejected",
+        "reason": "不支持的 LiViS 业务消息类型：notify"
+      },
+      {
+        "case": "blank-content",
+        "layer": "send_message",
+        "outcome": "rejected",
+        "reason": "send_message.payload.data.content 不能为空"
+      },
+      {
+        "case": "content-over-limit",
+        "layer": "send_message",
+        "outcome": "rejected",
+        "reason": "输入超过上限：9 > 8"
+      },
+      {
+        "case": "metadata-null",
+        "layer": "envelope",
+        "outcome": "rejected",
+        "reason": "LiViS message.metadata 格式无效"
+      },
+      {
+        "case": "payload-array",
+        "layer": "envelope",
+        "outcome": "rejected",
+        "reason": "LiViS message.payload 格式无效"
+      },
+      {
+        "case": "unknown-envelope-type",
+        "layer": "envelope",
+        "outcome": "accepted"
+      }
+    ],
+    "credentialPresence": {
+      "connect": {
+        "accessToken": true,
+        "refreshToken": true
+      },
+      "tokenRefresh": {
+        "accessToken": true,
+        "refreshToken": true
+      }
+    }
+  },
+  "idaas": {
+    "requests": [
+      {
+        "operation": "device-code",
+        "method": "POST",
+        "path": "/aux",
+        "contentType": "application/x-www-form-urlencoded",
+        "fields": [
+          "audience",
+          "client_id",
+          "offline_access",
+          "scope"
+        ],
+        "sensitiveFields": []
+      },
+      {
+        "operation": "device-code-force",
+        "method": "POST",
+        "path": "/aux",
+        "contentType": "application/x-www-form-urlencoded",
+        "fields": [
+          "audience",
+          "client_id",
+          "offline_access",
+          "prompt",
+          "scope"
+        ],
+        "sensitiveFields": []
+      },
+      {
+        "operation": "device-token",
+        "method": "POST",
+        "path": "/token",
+        "contentType": "application/x-www-form-urlencoded",
+        "fields": [
+          "client_id",
+          "device_code",
+          "grant_type"
+        ],
+        "sensitiveFields": [
+          "device_code"
+        ]
+      },
+      {
+        "operation": "refresh-token",
+        "method": "POST",
+        "path": "/token",
+        "contentType": "application/x-www-form-urlencoded",
+        "fields": [
+          "client_id",
+          "grant_type",
+          "refresh_token"
+        ],
+        "sensitiveFields": [
+          "refresh_token"
+        ]
+      },
+      {
+        "operation": "revoke",
+        "method": "POST",
+        "path": "/revoke",
+        "contentType": "application/x-www-form-urlencoded",
+        "fields": [
+          "client_id",
+          "token",
+          "token_type_hint"
+        ],
+        "sensitiveFields": [
+          "token"
+        ]
+      }
+    ]
+  },
+  "unknowns": [
+    "真实服务端字段必填性、可选性与额外字段处理",
+    "connected 与 token_refreshed 的真实关联字段",
+    "真实 ACK 去重、迟到 ACK、heartbeat 和断线恢复语义",
+    "真实 IDaaS 状态码、响应 shape、轮换、限流与大小上限"
+  ]
+}

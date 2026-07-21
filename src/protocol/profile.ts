@@ -1,11 +1,18 @@
 import { dirname, isAbsolute, resolve } from "node:path";
 import { asNonEmptyString, asPositiveInteger, asSha256, parseJsonObject, sha256 } from "../util.ts";
+import {
+  requireSupportedWireContract,
+  type CredentialMode,
+  type WireContractRevision,
+} from "./contract.ts";
 
 export interface ProtocolProfile {
-  schemaVersion: 1;
+  schemaVersion: 2;
   id: string;
   officialPluginVersion: string;
   wireProtocolVersion: number;
+  wireContractRevision: WireContractRevision;
+  credentialMode: CredentialMode;
   endpoints: {
     idaasBaseUrl: string;
     relayWebSocketUrl: string;
@@ -43,8 +50,17 @@ export interface ProtocolProfile {
 }
 
 export function runtimeContractSha256(profile: ProtocolProfile): string {
+  const wireContract = requireSupportedWireContract({
+    revision: profile.wireContractRevision,
+    credentialMode: profile.credentialMode,
+    wireProtocolVersion: profile.wireProtocolVersion,
+  });
   return sha256(JSON.stringify({
     wireProtocolVersion: profile.wireProtocolVersion,
+    wireContractRevision: profile.wireContractRevision,
+    credentialMode: profile.credentialMode,
+    localProbeArtifactPath: wireContract.localProbeArtifactPath,
+    localProbeArtifactSha256: wireContract.localProbeArtifactSha256,
     endpoints: profile.endpoints,
     oauth: profile.oauth,
     wireIdentity: profile.wireIdentity,
@@ -71,8 +87,8 @@ function httpsUrl(value: unknown, label: string, allowWebSocket = false): string
 
 export function parseProtocolProfile(text: string, label = "protocol profile"): ProtocolProfile {
   const root = parseJsonObject(text, label);
-  if (root.schemaVersion !== 1) {
-    throw new Error("只支持 schemaVersion=1 的 protocol profile");
+  if (root.schemaVersion !== 2) {
+    throw new Error("只支持 schemaVersion=2 的 protocol profile；旧 profile 必须显式迁移 wire contract 后重新锁定 SHA-256");
   }
   const endpoints = objectAt(root, "endpoints");
   const oauth = objectAt(root, "oauth");
@@ -86,6 +102,11 @@ export function parseProtocolProfile(text: string, label = "protocol profile"): 
   if (wireProtocolVersion !== 1) {
     throw new Error(`当前 daemon 只支持 LiViS wireProtocolVersion=1，收到 ${wireProtocolVersion}`);
   }
+  const wireContract = requireSupportedWireContract({
+    revision: root.wireContractRevision,
+    credentialMode: root.credentialMode,
+    wireProtocolVersion,
+  });
   if (
     upstream.requiredBundleMarkers.length === 0 ||
     upstream.requiredBundleMarkers.some((item) => typeof item !== "string" || item.trim() === "")
@@ -93,10 +114,12 @@ export function parseProtocolProfile(text: string, label = "protocol profile"): 
     throw new Error("profile.upstream.requiredBundleMarkers 必须包含非空字符串");
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: asNonEmptyString(root.id, "profile.id"),
     officialPluginVersion: asNonEmptyString(root.officialPluginVersion, "profile.officialPluginVersion"),
     wireProtocolVersion,
+    wireContractRevision: wireContract.revision,
+    credentialMode: wireContract.credentialMode,
     endpoints: {
       idaasBaseUrl: httpsUrl(endpoints.idaasBaseUrl, "profile.endpoints.idaasBaseUrl"),
       relayWebSocketUrl: httpsUrl(endpoints.relayWebSocketUrl, "profile.endpoints.relayWebSocketUrl", true),

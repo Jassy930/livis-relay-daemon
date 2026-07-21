@@ -13,6 +13,8 @@ bun run check
 
 公开仓库只提供无效占位值的 [`protocol-profiles/livis-authorized.example.json`](../protocol-profiles/livis-authorized.example.json)。从有权管理相关服务的一方取得参数，将 profile 保存到仓库外的私有位置；不要直接使用 example 连接服务。
 
+当前只接受 protocol profile schema v2，并要求 `wireContractRevision=livis-relay-v1-access-refresh-r1` 与 `credentialMode=access-and-refresh-token` 精确匹配代码 registry。两者描述当前仍向 Relay 发送 refresh token 的兼容基线，不代表服务端要求或目标安全策略。
+
 ## 3. 初始化
 
 ```bash
@@ -22,6 +24,8 @@ bun run src/index.ts init \
 ```
 
 `init` 会把已审核 LiViS profile 复制到 state directory，并把该文件的 SHA-256 固定到配置。它不会登录、绑定或启动服务。
+
+已有 schema v1 部署升级前必须停服务并备份 config/state directory，在仓库外人工迁移和复核 profile 后重新锁定 SHA；旧 supported proof 不可继承，必须重新执行 `upstream check`。当前没有自动修改 live profile/config 的迁移命令，未完成迁移时应保持旧 daemon，不得旁路校验。
 
 随后编辑配置：
 
