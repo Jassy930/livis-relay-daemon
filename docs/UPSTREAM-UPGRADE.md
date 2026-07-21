@@ -38,9 +38,12 @@ bun run src/index.ts upstream check
 - install script 的版本和 package URL；
 - `bundle.js` 中 handshake、消息、ACK、取消、token refresh 的结构化行为；
 - golden wire fixtures 与本项目 parser/builder；
+- [服务端协议证据账本](LIVIS-RELAY-PROTOCOL-BOUNDARY.md)中的对应消息、字段、未知项和历史 canary 是否仍成立；
 - `bun run check` 全绿。
 
 自动候选只能保持 IDaaS、relay、OAuth、wire identity、timing 和 wire protocol 运行契约不变。若这些字段变化，停止升级；需要新版 daemon、重新登录或 identity migration。
+
+官方客户端静态字段、artifact marker 和 fake Relay 都不能单独证明真实服务端兼容。任何 wire 字段、凭据流向、握手、ACK、heartbeat、在线刷新、取消或重试时序变化，都必须让旧 supported proof 与 canary 失效，并在精确最终 head 上重新完成获授权真实 Relay canary。
 
 ### 3. 显式激活
 

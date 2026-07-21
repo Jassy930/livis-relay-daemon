@@ -2,7 +2,7 @@
 
 ## 必须明确确认的事实
 
-- LiViS 当前公开的是 OpenClaw 接入，没有公开第三方 SDK 或稳定协议承诺。
+- 截至 2026-07-21，在[协议证据账本](LIVIS-RELAY-PROTOCOL-BOUNDARY.md)列明的 GitHub 与聚焦公开网页检索范围内，只找到 OpenClaw 接入线索，未发现可验证的第三方 SDK、服务端 schema 或稳定协议承诺；该阴性结果存在私有和未索引资料盲区。
 - 本项目只静态兼容官方 v2.0.0 artifact 中观察到的 wire 行为，不执行或复制官方 bundle。
 - 原 OpenClaw 插件的 `CommandAuthorized: true` 不适用于本项目。
 - 公开仓库不附带 live profile；example 中的端点、OAuth 和哈希均为无效占位值。
@@ -32,7 +32,7 @@
 - state directory：`0700`。
 - connector socket、配置、身份、secret、proof、candidate 与审批回执：`0600`。
 - connector 使用至少 32 字节随机 Bearer token，并做常量时间比较。
-- refresh token 只由 daemon 持有，不进入 SQLite、argv 或普通日志。
+- refresh token 只在 daemon state directory 持久化，不进入 SQLite、argv、普通日志或 Git。当前 v2.0.0 兼容基线仍会把它复制进 Relay `connect` / `token_refresh` 帧：历史高层 canary 发生在旧代码基线，但没有字段级 receipt，也不证明服务端要求该字段；这是待收口的显式安全例外。目标是 Relay 只接收短期 access token，但在真实 Relay canary 前不得宣称兼容，也不得设置静默泄露回退。证据和门禁见[服务端协议边界](LIVIS-RELAY-PROTOCOL-BOUNDARY.md)。
 - 一期不读取或发送文件，因此没有远程文件上传路径。
 
 ## Upstream 门禁
