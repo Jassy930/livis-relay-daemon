@@ -1,12 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
-import { lstat, open, realpath, unlink } from "node:fs/promises";
+import { type FileHandle, lstat, open, realpath, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { asNonEmptyString, asPositiveInteger, parseJsonObject } from "../util.ts";
 
 interface GuardIdentity {
   dev: number;
   ino: number;
+}
+
+interface GuardFileLease {
+  handle: FileHandle;
+  identity: GuardIdentity;
+  state: "linked" | "unlinked" | "released";
 }
 
 function isWithin(parent: string, child: string): boolean {
@@ -52,7 +58,21 @@ function assertOwnedGuardInfo(
   }
 }
 
-async function unlinkIfOwned(path: string, identity: GuardIdentity): Promise<boolean> {
+async function assertLeaseLinked(lease: GuardFileLease, path: string): Promise<void> {
+  if (lease.state !== "linked") {
+    throw new Error(`guard 文件已不再链接到原路径，拒绝操作：${path}`);
+  }
+  const parent = dirname(path);
+  if (await requirePrivateDirectory(parent, "guard parent directory") !== parent) {
+    throw new Error(`guard parent directory realpath 已变化，拒绝操作：${parent}`);
+  }
+  assertOwnedGuardInfo(await lease.handle.stat(), lease.identity, path);
+}
+
+async function unlinkIfOwned(path: string, lease: GuardFileLease): Promise<boolean> {
+  if (lease.state !== "linked") {
+    throw new Error(`guard 文件状态无效，拒绝重复 unlink：${path}`);
+  }
   let info;
   try {
     info = await lstat(path);
@@ -60,17 +80,42 @@ async function unlinkIfOwned(path: string, identity: GuardIdentity): Promise<boo
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
-  assertOwnedGuardInfo(info, identity, path);
+  await assertLeaseLinked(lease, path);
+  assertOwnedGuardInfo(info, lease.identity, path);
   await unlink(path);
-  await syncDirectory(dirname(path));
+  lease.state = "unlinked";
   return true;
+}
+
+async function finishGuardRelease(path: string, lease: GuardFileLease): Promise<void> {
+  if (lease.state === "released") return;
+  if (lease.state !== "unlinked") {
+    throw new Error(`guard 文件仍链接在原路径，拒绝提前关闭句柄：${path}`);
+  }
+  const parent = dirname(path);
+  if (await requirePrivateDirectory(parent, "guard parent directory") !== parent) {
+    throw new Error(`guard parent directory realpath 已变化，拒绝完成 release：${parent}`);
+  }
+  await syncDirectory(parent);
+  await lease.handle.close();
+  lease.state = "released";
+}
+
+async function discardGuardFile(path: string, lease: GuardFileLease): Promise<void> {
+  try {
+    if (lease.state === "linked") await unlinkIfOwned(path, lease);
+    if (lease.state === "unlinked") await syncDirectory(dirname(path));
+  } finally {
+    await lease.handle.close().catch(() => undefined);
+    lease.state = "released";
+  }
 }
 
 async function createGuardFile(
   path: string,
   text: string,
   existsMessage: string,
-): Promise<GuardIdentity> {
+): Promise<GuardFileLease> {
   let handle;
   try {
     handle = await open(path, "wx", 0o600);
@@ -81,36 +126,42 @@ async function createGuardFile(
     throw error;
   }
 
-  let identity: GuardIdentity | null = null;
+  let lease: GuardFileLease | null = null;
   try {
     const info = await handle.stat();
-    identity = { dev: info.dev, ino: info.ino };
+    const identity = { dev: info.dev, ino: info.ino };
     assertOwnedGuardInfo(info, identity, path);
+    lease = { handle, identity, state: "linked" };
     await handle.writeFile(text, "utf8");
     await handle.sync();
   } catch (error) {
-    await handle.close().catch(() => undefined);
-    if (identity) await unlinkIfOwned(path, identity).catch(() => undefined);
+    if (lease) await discardGuardFile(path, lease).catch(() => undefined);
+    else await handle.close().catch(() => undefined);
     throw error;
   }
-  await handle.close();
+  if (!lease) {
+    await handle.close().catch(() => undefined);
+    throw new Error(`guard 文件创建后未取得句柄身份：${path}`);
+  }
   try {
     await syncDirectory(dirname(path));
   } catch (error) {
-    await unlinkIfOwned(path, identity).catch(() => undefined);
+    await discardGuardFile(path, lease).catch(() => undefined);
     throw error;
   }
-  return identity;
+  return lease;
 }
 
-async function readOwnedGuard(path: string, identity: GuardIdentity): Promise<string> {
-  assertOwnedGuardInfo(await lstat(path), identity, path);
+async function readOwnedGuard(path: string, lease: GuardFileLease): Promise<string> {
+  await assertLeaseLinked(lease, path);
+  assertOwnedGuardInfo(await lstat(path), lease.identity, path);
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const info = await handle.stat();
-    assertOwnedGuardInfo(info, identity, path);
+    assertOwnedGuardInfo(info, lease.identity, path);
     const text = await handle.readFile("utf8");
-    assertOwnedGuardInfo(await lstat(path), identity, path);
+    await assertLeaseLinked(lease, path);
+    assertOwnedGuardInfo(await lstat(path), lease.identity, path);
     return text;
   } finally {
     await handle.close();
@@ -157,12 +208,10 @@ function parseOfflineGuard(text: string, path: string): OfflineGuardDocument {
  * fail closed。
  */
 export class DaemonOfflineGuard {
-  private released = false;
-
   private constructor(
     readonly path: string,
     readonly document: OfflineGuardDocument,
-    private readonly identity: GuardIdentity,
+    private readonly lease: GuardFileLease,
   ) {}
 
   static async acquire(
@@ -188,26 +237,30 @@ export class DaemonOfflineGuard {
       acquiredAt: new Date().toISOString(),
       nonce: randomUUID(),
     };
-    const identity = await createGuardFile(
+    const lease = await createGuardFile(
       canonicalSocketPath,
       `${JSON.stringify(document, null, 2)}\n`,
       `connector socket 路径已存在：${canonicalSocketPath}；必须先停止 daemon，并人工确认没有遗留 socket/guard`,
     );
-    return new DaemonOfflineGuard(canonicalSocketPath, document, identity);
+    return new DaemonOfflineGuard(canonicalSocketPath, document, lease);
   }
 
   async assertHeld(): Promise<void> {
-    const current = parseOfflineGuard(await readOwnedGuard(this.path, this.identity), this.path);
+    const current = parseOfflineGuard(await readOwnedGuard(this.path, this.lease), this.path);
     if (current.nonce !== this.document.nonce) {
       throw new Error("connector socket guard 所有权已变化");
     }
   }
 
   async release(): Promise<void> {
-    if (this.released) return;
-    await this.assertHeld();
-    await unlinkIfOwned(this.path, this.identity);
-    this.released = true;
+    if (this.lease.state === "released") return;
+    if (this.lease.state === "linked") {
+      await this.assertHeld();
+      if (!await unlinkIfOwned(this.path, this.lease)) {
+        throw new Error(`connector socket guard 已在 release 前消失：${this.path}`);
+      }
+    }
+    await finishGuardRelease(this.path, this.lease);
   }
 }
 
@@ -260,12 +313,10 @@ function parseProfileOperationGuard(text: string, path: string): ProfileOperatio
 
 /** 串行化会切换 profile/config 或写 profile-bound proof 的显式 CLI。 */
 export class ProfileOperationGuard {
-  private released = false;
-
   private constructor(
     readonly path: string,
     readonly document: ProfileOperationGuardDocument,
-    private readonly identity: GuardIdentity,
+    private readonly lease: GuardFileLease,
   ) {}
 
   static async acquire(stateDir: string, operation: ProfileOperation): Promise<ProfileOperationGuard> {
@@ -279,17 +330,17 @@ export class ProfileOperationGuard {
       acquiredAt: new Date().toISOString(),
       nonce: randomUUID(),
     };
-    const identity = await createGuardFile(
+    const lease = await createGuardFile(
       path,
       `${JSON.stringify(document, null, 2)}\n`,
       `profile operation guard 已存在：${path}；确认没有管理命令运行后再处理遗留 guard`,
     );
-    return new ProfileOperationGuard(path, document, identity);
+    return new ProfileOperationGuard(path, document, lease);
   }
 
   async assertHeld(): Promise<void> {
     const current = parseProfileOperationGuard(
-      await readOwnedGuard(this.path, this.identity),
+      await readOwnedGuard(this.path, this.lease),
       this.path,
     );
     if (current.nonce !== this.document.nonce) {
@@ -298,9 +349,13 @@ export class ProfileOperationGuard {
   }
 
   async release(): Promise<void> {
-    if (this.released) return;
-    await this.assertHeld();
-    await unlinkIfOwned(this.path, this.identity);
-    this.released = true;
+    if (this.lease.state === "released") return;
+    if (this.lease.state === "linked") {
+      await this.assertHeld();
+      if (!await unlinkIfOwned(this.path, this.lease)) {
+        throw new Error(`profile operation guard 已在 release 前消失：${this.path}`);
+      }
+    }
+    await finishGuardRelease(this.path, this.lease);
   }
 }

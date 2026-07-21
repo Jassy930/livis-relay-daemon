@@ -91,9 +91,12 @@ rollback 会先用 source backups 重建 target profile/config/runtime digest，
 混配 receipt。当前 config 为 source 或 fallback 时只验证、必要时修复 active v1，
 不再要求 target v2 文件存在；当前 config 为 target 时才验证 target。回滚准备
 记录与 pre-rollback config 先落盘，随后 proof quarantine，最后才发生 config
-提交或 active fallback profile 自愈提交。两层 guard 的私有父目录、inode、nonce
-和目录项持久性都会在提交前复核；source/fallback 的幂等 fast path 也在 guard
-内检查三份 proof，残留 proof 会触发只隔离 proof、不改 config/profile 的清理模式。
+提交或 active fallback profile 自愈提交。两层 guard 都会在生命周期内保持创建
+fd 打开，以固定原 inode，并与当前路径的 dev/inode、link count、类型、权限、
+nonce 和目录项持久性一并在提交前复核；私有父目录的类型、权限与 realpath 会在
+每次所有权检查和 release 完成前重验。这仍是协作锁，不是内核原子 CAS。
+source/fallback 的幂等 fast path 也在 guard 内检查三份 proof，残留 proof 会触发
+只隔离 proof、不改 config/profile 的清理模式。
 
 所有 CLI proof writer（`upstream check/activate`、`login` 与 `serve` 启动）以及
 普通 upstream rollback 都先获取 operation guard、再加载完整 context；这样迁移

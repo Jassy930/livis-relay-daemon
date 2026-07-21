@@ -133,6 +133,7 @@ describe("离线与 profile 操作 guard", () => {
     expect(() => server.start()).toThrow("connector socket 路径已存在且不是 socket");
     expect(await Bun.file(socketPath).exists()).toBeTrue();
 
+    await guard.assertHeld();
     await guard.release();
     expect(await Bun.file(socketPath).exists()).toBeFalse();
   });
@@ -171,18 +172,51 @@ describe("离线与 profile 操作 guard", () => {
     )).rejects.toThrow("connector socket parent directory 必须是目录且不能是 symlink");
   });
 
-  test("release 遇到 inode 替换或 symlink 时拒绝删除替代文件", async () => {
+  test("获取后父目录权限漂移会在 assert 与 release 时失败关闭", async () => {
+    const driftedState = join(directory.path, "drifted-state");
+    await mkdir(driftedState, { mode: 0o700 });
+    const guard = await ProfileOperationGuard.acquire(
+      driftedState,
+      "protocol-profile-migration",
+    );
+
+    await chmod(driftedState, 0o777);
+    await expect(guard.assertHeld()).rejects.toThrow("guard parent directory 权限过宽");
+    await expect(guard.release()).rejects.toThrow("guard parent directory 权限过宽");
+    expect(await Bun.file(guard.path).exists()).toBeTrue();
+
+    await chmod(driftedState, 0o700);
+    await guard.release();
+    expect(await Bun.file(guard.path).exists()).toBeFalse();
+  });
+
+  test("两种 guard 遇到 inode 替换或 symlink 时拒绝删除替代文件", async () => {
     const replaced = await ProfileOperationGuard.acquire(
       directory.path,
       "protocol-profile-migration",
     );
     const copiedDocument = await readFile(replaced.path, "utf8");
+    // 刻意保留原 nonce：实现必须靠长持有的创建句柄固定 inode，而不是内容变化识别替换。
     await rm(replaced.path);
     await writeFile(replaced.path, copiedDocument, { encoding: "utf8", mode: 0o600 });
     await expect(replaced.assertHeld()).rejects.toThrow("inode 已变化");
     await expect(replaced.release()).rejects.toThrow("inode 已变化");
     expect(await readFile(replaced.path, "utf8")).toBe(copiedDocument);
     await rm(replaced.path);
+
+    const socketPath = join(directory.path, "replaced-connector.sock");
+    const offline = await DaemonOfflineGuard.acquire(
+      socketPath,
+      directory.path,
+      "protocol-profile-migration",
+    );
+    const copiedOfflineDocument = await readFile(offline.path, "utf8");
+    await rm(offline.path);
+    await writeFile(offline.path, copiedOfflineDocument, { encoding: "utf8", mode: 0o600 });
+    await expect(offline.assertHeld()).rejects.toThrow("inode 已变化");
+    await expect(offline.release()).rejects.toThrow("inode 已变化");
+    expect(await readFile(offline.path, "utf8")).toBe(copiedOfflineDocument);
+    await rm(offline.path);
 
     const linked = await ProfileOperationGuard.acquire(
       directory.path,
