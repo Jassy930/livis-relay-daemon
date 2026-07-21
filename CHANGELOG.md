@@ -19,6 +19,7 @@
 
 ### 变更
 
+- 新增 LiViS IDaaS / Relay 服务端协议证据账本，分开真实 canary、官方客户端静态观察、fake Relay、工程推断与未知项，并为 wire 变化建立 Draft、脱敏 canary 和精确 head 门禁。
 - 一期受支持拓扑明确为一个 daemon、config、state directory 和专用 Hermes profile 只绑定一个 LiViS `node_id`（暂按设备来源标识理解）；多设备、跨设备会话和原地换设备不在当前范围内。
 - Hermes plugin 的开发测试依赖约束升级至 `pytest>=9.0.3,<10` 与 `pytest-asyncio>=1.3,<2`（当前锁定 9.1.1 / 1.4.0），修复旧版 pytest 的安全告警；运行时依赖保持不变。
 - `config.connector.resultStoreTimeoutMs` 通过 `hello_ack` 下发给 Hermes plugin，替代 plugin 侧硬编码 5 秒。

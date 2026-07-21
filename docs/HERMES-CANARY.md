@@ -2,6 +2,8 @@
 
 本文记录一期 Hermes bridge 的最小实网验收顺序与已知边界。所有账号、Agent ID、node ID、token 和完整业务消息都不得提交到仓库。
 
+本文是 canary 操作与历史结果，不是服务端规范。各步骤能证明和不能证明的协议事实，以[LiViS 服务端协议证据与支持边界](LIVIS-RELAY-PROTOCOL-BOUNDARY.md)为准。
+
 ## 验收前提
 
 - 使用隔离的 `HERMES_HOME`，不得复用或升级用户的默认 Hermes profile。

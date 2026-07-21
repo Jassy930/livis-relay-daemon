@@ -2,6 +2,8 @@
 
 公开仓库不附带可直接连接任何厂商生产服务的 live profile，也不默认复用官方 OAuth 客户端身份。
 
+profile 只固定一次获授权部署的参数与 artifact，不证明真实服务端要求或接受对应 wire。证据等级、历史 canary 与协议变化门禁见[LiViS 服务端协议证据与支持边界](../docs/LIVIS-RELAY-PROTOCOL-BOUNDARY.md)。
+
 使用者需要从有权管理相关服务的一方取得：
 
 - 获授权的 IDaaS、relay 和下载端点；
