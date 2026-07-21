@@ -1,16 +1,20 @@
 import { join } from "node:path";
-import type { ProtocolProfile } from "../protocol/profile.ts";
+import { runtimeContractSha256, type ProtocolProfile } from "../protocol/profile.ts";
+import type { CredentialMode, WireContractRevision } from "../protocol/contract.ts";
 import { asSha256, atomicWritePrivate, parseJsonObject } from "../util.ts";
 import type { UpstreamSnapshot } from "./checker.ts";
 
 export const UPSTREAM_PROOF_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-export const UPSTREAM_CHECKER_VERSION = 1;
+export const UPSTREAM_CHECKER_VERSION = 2;
 
 export interface SupportedUpstreamProof {
-  schemaVersion: 1;
+  schemaVersion: 2;
   checkerVersion: typeof UPSTREAM_CHECKER_VERSION;
   profileId: string;
   profileSha256: string;
+  runtimeContractSha256: string;
+  wireContractRevision: WireContractRevision;
+  credentialMode: CredentialMode;
   checkedAt: string;
   expiresAt: string;
   snapshot: UpstreamSnapshot;
@@ -50,10 +54,13 @@ export async function saveSupportedProof(options: {
   assertSnapshotMatchesProfile(options.snapshot, options.profile);
   const now = options.now ?? Date.now();
   const proof: SupportedUpstreamProof = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     checkerVersion: UPSTREAM_CHECKER_VERSION,
     profileId: options.profile.id,
     profileSha256: asSha256(options.profileSha256, "profileSha256"),
+    runtimeContractSha256: runtimeContractSha256(options.profile),
+    wireContractRevision: options.profile.wireContractRevision,
+    credentialMode: options.profile.credentialMode,
     checkedAt: options.snapshot.checkedAt,
     expiresAt: new Date(now + UPSTREAM_PROOF_MAX_AGE_MS).toISOString(),
     snapshot: options.snapshot,
@@ -73,18 +80,22 @@ export async function requireFreshSupportedProof(options: {
 }): Promise<SupportedUpstreamProof> {
   const path = supportedProofPath(options.stateDir, options.profileSha256);
   const root = parseJsonObject(await Bun.file(path).text(), path);
+  const expectedRuntimeContractSha256 = runtimeContractSha256(options.profile);
   if (
-    root.schemaVersion !== 1 ||
+    root.schemaVersion !== 2 ||
     root.checkerVersion !== UPSTREAM_CHECKER_VERSION ||
     root.profileId !== options.profile.id ||
     root.profileSha256 !== options.profileSha256 ||
+    root.runtimeContractSha256 !== expectedRuntimeContractSha256 ||
+    root.wireContractRevision !== options.profile.wireContractRevision ||
+    root.credentialMode !== options.profile.credentialMode ||
     typeof root.checkedAt !== "string" ||
     typeof root.expiresAt !== "string" ||
     root.snapshot === null ||
     typeof root.snapshot !== "object" ||
     Array.isArray(root.snapshot)
   ) {
-    throw new Error("upstream supported proof 格式无效或未绑定当前 active profile");
+    throw new Error("upstream supported proof 格式无效或未绑定当前 active profile / wire contract");
   }
   const expiresAt = Date.parse(root.expiresAt);
   if (!Number.isFinite(expiresAt) || expiresAt < (options.now ?? Date.now())) {

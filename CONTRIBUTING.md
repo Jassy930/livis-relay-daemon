@@ -4,7 +4,7 @@
 
 ## 开始之前
 
-1. 阅读 [服务端协议证据与支持边界](docs/LIVIS-RELAY-PROTOCOL-BOUNDARY.md)、[架构](docs/ARCHITECTURE.md)、[安全边界](docs/SECURITY.md) 和 [升级流程](docs/UPSTREAM-UPGRADE.md)。
+1. 阅读 [服务端协议证据与支持边界](docs/LIVIS-RELAY-PROTOCOL-BOUNDARY.md)、[本地协议探针](docs/PROTOCOL-PROBES.md)、[架构](docs/ARCHITECTURE.md)、[安全边界](docs/SECURITY.md) 和 [升级流程](docs/UPSTREAM-UPGRADE.md)。
 2. 功能改动建议先创建 issue，说明使用场景、协议证据和安全影响。
 3. 安全漏洞不要创建公开 issue，按 [SECURITY.md](SECURITY.md) 私下报告。
 
@@ -39,6 +39,7 @@ bun run check
 - 官方版本与最终下载 URL；
 - setup、install 和 package 的 SHA-256；
 - wire marker 与 golden fixture 的差异；
+- `wireContractRevision`、`credentialMode` 与本地 probe artifact 的差异；
 - 运行契约 fingerprint 是否变化；
 - `upstream check`、完整测试和回滚验证结果。
 - profile 参数的使用与再分发授权边界；不能公开的内容应保留在本地 ignored profile。
@@ -54,5 +55,7 @@ bun run check
 ```
 
 修改 IDaaS / Relay 表单、URL/query、帧字段、凭据流向、握手、ACK、heartbeat、在线刷新、取消或重试时序时，还必须按服务端协议证据文档声明证据等级和未知项。客户端 artifact 或 fake Relay 不能单独证明服务端兼容；缺少最终 head 的获授权真实 canary 时，PR 保持 Draft。
+
+wire 相关 PR 必须先运行 `bun run probe:protocol:update`，人工审阅 `protocol-probes/` 差异并建立新的 `wireContractRevision`；显式暂存候选后运行 `bun run wire-contract:append-only:check`。机器可读 registry、旧 definition 与旧 artifact 原始字节只能保留并新增，不得覆盖既有 revision 让 CI 重新变绿。
 
 维护者可能要求补充 fake relay、崩溃窗口、重复投递、取消竞态或真实 Hermes 候选版本 smoke 证据。

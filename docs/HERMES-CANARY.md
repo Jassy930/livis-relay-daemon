@@ -10,7 +10,7 @@
 - Hermes runtime、bridge 和 LiViS protocol profile 均位于项目审核的版本区间。
 - daemon 与 Hermes 两侧使用同一个且只包含唯一 `node_id` 的显式 allowlist；一期暂将该值视为本次 canary 的设备来源标识。`allowAllNodes` 和 `LIVIS_ALLOW_ALL_USERS` 都必须为 `false`。
 - Hermes 平台配置保持非流式、关闭 tool progress、中间消息、reasoning 和长任务通知。
-- `bun run src/index.ts doctor --online` 全部通过，`bun run src/index.ts status` 同时显示 relay handshake 与 connector ready。
+- `bun run probe:protocol:check` 与 `bun run src/index.ts doctor --online` 全部通过；`status` 显示预期的 wire revision/mode、relay handshake 与 connector ready。
 
 本 canary 只证明单个来源设备的闭环，不证明多设备接入、跨设备会话、设备 ID 轮换或状态迁移；不要在同一 config/state directory 中加入第二个 `node_id` 进行扩展测试。
 

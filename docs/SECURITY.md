@@ -7,6 +7,7 @@
 - 原 OpenClaw 插件的 `CommandAuthorized: true` 不适用于本项目。
 - 公开仓库不附带 live profile；example 中的端点、OAuth 和哈希均为无效占位值。
 - `bun run release:check` 只审核 `git ls-files -z` 返回的 index 内容，拒绝本地状态文件、官方 bundle、归档、生产域名和官方 OAuth client identity 指纹。生产域名仅允许在 Markdown/RST/TXT 安全说明中出现，OAuth identity 与私钥内容没有文档例外。
+- 本地 protocol probe 只使用固定哨兵、注入 fetch 和 loopback；公开发布门禁拒绝私有 probe 回执、raw frame、trace、HAR 与 pcap。probe 成功仍只是 S2。
 
 初始化时必须显式传入 `--acknowledge-unofficial-protocol`。这只是确认已知边界，不代表获得第三方授权。
 
@@ -41,7 +42,7 @@
 - setup/install script 上限 2 MiB，package 上限 64 MiB，默认下载超时 30 秒。
 - tar 拒绝绝对路径、`..`、超过 20000 个条目和超过 16 MiB 的 `bundle.js`。
 - 三份原始 artifact 按 SHA-256 保存，供候选审阅复现。
-- supported proof 与 active profile ID、profile SHA、artifact URL/哈希和 marker 绑定，有效期 24 小时。
+- supported proof 与 active profile ID/SHA、runtime contract SHA、wire revision、credential mode、artifact URL/哈希和 marker 绑定，有效期 24 小时；旧 proof 失败关闭。
 - daemon 每 6 小时复核；确认 drift/unknown 后停止新 job 并断开 LiViS。暂时网络失败只允许使用尚未过期的 proof。
 
 ## 认证生命周期

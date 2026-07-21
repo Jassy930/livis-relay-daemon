@@ -35,6 +35,7 @@ flowchart LR
 - Hermes connector 只开放权限 `0600` 的 Unix socket，不监听 TCP。
 - LiViS profile 按 SHA-256 固定；未知 wire protocol、版本或 artifact 漂移默认拒绝。
 - `login/serve` 要求近期 supported proof；daemon 每 6 小时在线复核。
+- `wireContractRevision + credentialMode` 同时绑定 profile、runtime digest 与 supported proof；机器可读 registry、append-only 历史门禁和本地脱敏 probe artifact 防止 wire 代码静默漂移或覆写旧基线。
 - Hermes runtime 与 bridge 都必须位于审核版本区间，未知未来版本不会自动放行。
 
 ## 开发验证
@@ -55,7 +56,7 @@ bun install --frozen-lockfile
 bun run check
 ```
 
-`bun run check` 会依次检查版本、文档链接与 Git tracked files，再执行 TypeScript 类型检查、全部 Bun 测试、`uv lock --check` 和 Hermes plugin pytest。首次初始化仓库时，应先用 `git add` 更新候选 index。
+`bun run check` 会依次检查版本、文档链接、Git tracked files、wire contract append-only 历史与本地 S2 protocol probe artifact，再执行 TypeScript 类型检查、全部 Bun 测试、`uv lock --check` 和 Hermes plugin pytest。其中公开发布与 append-only 门禁审核 Git index；probe generator、类型检查和测试读取当前工作区。运行前应先用 `git add` 精确暂存候选文件，并保持 staged/worktree 一致。
 
 截至 2026-07-18 的本地验收：
 
@@ -70,6 +71,7 @@ bun run check
 ## 使用入口
 
 - [LiViS 服务端协议证据与支持边界](docs/LIVIS-RELAY-PROTOCOL-BOUNDARY.md)
+- [本地协议探针](docs/PROTOCOL-PROBES.md)
 - [运行手册](docs/OPERATIONS.md)
 - [Hermes 实网 canary](docs/HERMES-CANARY.md)
 - [官方升级与回滚](docs/UPSTREAM-UPGRADE.md)

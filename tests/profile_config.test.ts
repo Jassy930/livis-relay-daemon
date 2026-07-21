@@ -1,7 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { join, resolve } from "node:path";
 import { initializeConfig, loadRelayConfig, parseRelayConfig } from "../src/config.ts";
-import { loadProtocolProfile, parseProtocolProfile } from "../src/protocol/profile.ts";
+import { loadProtocolProfile, parseProtocolProfile, runtimeContractSha256 } from "../src/protocol/profile.ts";
+import {
+  CURRENT_CREDENTIAL_MODE,
+  CURRENT_WIRE_CONTRACT_REVISION,
+  WIRE_CONTRACT_REGISTRY,
+} from "../src/protocol/contract.ts";
+import {
+  parseWireContractRegistryDocument,
+  requireCurrentWireContract,
+} from "../src/protocol/contract-registry.ts";
 import { atomicWritePrivate } from "../src/util.ts";
 import { temporaryDirectory, testConfig, testProfile } from "./helpers.ts";
 
@@ -20,7 +29,56 @@ describe("配置与协议 profile", () => {
     const profile = await testProfile();
     expect(profile.id).toBe("livis-test-v2.0.0");
     expect(profile.wireProtocolVersion).toBe(1);
+    expect(profile.wireContractRevision).toBe(CURRENT_WIRE_CONTRACT_REVISION);
+    expect(profile.credentialMode).toBe(CURRENT_CREDENTIAL_MODE);
+    expect(WIRE_CONTRACT_REGISTRY[profile.wireContractRevision]!.localProbeArtifactSha256).toHaveLength(64);
+    expect(runtimeContractSha256(profile)).toHaveLength(64);
     expect(profile.wireIdentity.nodeType).toBe("personal-device");
+  });
+
+  test("拒绝旧 schema、未知 revision 和不匹配的凭据模式", async () => {
+    const profile = await testProfile();
+    expect(() => parseProtocolProfile(JSON.stringify({ ...profile, schemaVersion: 1 }))).toThrow("旧 profile 必须显式迁移");
+    expect(() => parseProtocolProfile(JSON.stringify({
+      ...profile,
+      wireContractRevision: "unknown-wire-contract",
+    }))).toThrow("wireContractRevision");
+    expect(() => parseProtocolProfile(JSON.stringify({
+      ...profile,
+      credentialMode: "access-token-only",
+    }))).toThrow("credentialMode");
+  });
+
+  test("registry 旧 revision 只作历史账本，runtime 只接受 current", () => {
+    const historical = {
+      revision: "wire-r1",
+      credentialMode: "access-and-refresh-token" as const,
+      wireProtocolVersion: 1,
+      localProbeArtifactPath: "protocol-probes/local/wire-r1.json",
+      localProbeArtifactSha256: "1".repeat(64),
+    };
+    const current = {
+      revision: "wire-r2",
+      credentialMode: "access-token-only" as const,
+      wireProtocolVersion: 1,
+      localProbeArtifactPath: "protocol-probes/local/wire-r2.json",
+      localProbeArtifactSha256: "2".repeat(64),
+    };
+    const registry = parseWireContractRegistryDocument({
+      schemaVersion: 1,
+      currentRevision: current.revision,
+      contracts: [historical, current],
+    });
+    expect(() => requireCurrentWireContract(registry, {
+      revision: historical.revision,
+      credentialMode: historical.credentialMode,
+      wireProtocolVersion: historical.wireProtocolVersion,
+    })).toThrow("仅作为历史账本保留");
+    expect(requireCurrentWireContract(registry, {
+      revision: current.revision,
+      credentialMode: current.credentialMode,
+      wireProtocolVersion: current.wireProtocolVersion,
+    })).toEqual(current);
   });
 
   test("拒绝非 TLS 的官方端点", async () => {
