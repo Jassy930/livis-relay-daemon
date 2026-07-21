@@ -36,6 +36,7 @@ flowchart LR
 - LiViS profile 按 SHA-256 固定；未知 wire protocol、版本或 artifact 漂移默认拒绝。
 - `login/serve` 要求近期 supported proof；daemon 每 6 小时在线复核。
 - `wireContractRevision + credentialMode` 同时绑定 profile、runtime digest 与 supported proof；机器可读 registry、append-only 历史门禁和本地脱敏 probe artifact 防止 wire 代码静默漂移或覆写旧基线。
+- schema v1→v2 迁移采用固定 contract 人工确认、私有 PREPARED/备份、source→target 重建校验、持久化 guard、proof quarantine 和可自愈显式回滚；迁移命令不打开 SQLite。
 - Hermes runtime 与 bridge 都必须位于审核版本区间，未知未来版本不会自动放行。
 
 ## 开发验证

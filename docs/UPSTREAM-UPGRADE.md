@@ -7,6 +7,140 @@
 - 新版本先检查、留存 artifact、测试、人工审阅，再显式激活。
 - 激活只更新本地 profile 指针，不执行官方 OpenClaw 插件。
 
+## 现有部署的 protocol profile schema v1→v2 迁移
+
+这条迁移只处理仓库外的 active protocol profile 和 config pin，不打开
+`relay.db`，也不改变 SQLite `PRAGMA user_version`、wire 行为、OAuth 凭据或
+一期单设备边界。v1 只能显式映射到已审阅的固定基线：
+
+- `wireContractRevision=livis-relay-v1-access-refresh-r1`
+- `credentialMode=access-and-refresh-token`
+
+如果代码 registry 的 current revision 已离开该基线，命令会失败关闭，必须
+另写专用迁移；不能把 v1 自动声明成未来 contract。
+
+### 1. 停服与 dry-run
+
+先停止专用 Hermes Gateway 和 daemon，并在 launchd/systemd 中禁用自动拉起。
+确认没有活跃 job、待投递结果和其他 `upstream` / `profile` 管理命令。迁移会
+在实际 `config.connector.socketPath` 创建 0600 普通文件 guard：运行中 daemon
+会令获取失败，guard 存在期间新旧 ConnectorServer 都会因该路径不是 socket
+而失败关闭；人工停服仍是硬前置，不能只依赖文件检查。socket 父目录必须是
+stateDir 内的私有非 symlink 目录（0700 或更严格），否则 guard 无法阻止其他
+本地用户删除或替换，命令会在任何迁移写入前失败关闭。
+
+`upstream check/activate/rollback`、`login` 的 proof 刷新与 `serve` 启动阶段会
+在加载 profile 前获取同一 operation guard，避免用迁移前快照在回滚后写回旧
+proof 或旧 config。外部编辑器和 `init` 不接入该 guard；停服窗口内不得运行
+`init`、手工改写 config/profile 或从其他程序直接调用状态写 API。
+
+```bash
+CONFIG="$HOME/.livis-relay/config.json"
+
+bun run src/index.ts profile migrate-v2 \
+  --config "$CONFIG" \
+  --wire-contract-revision livis-relay-v1-access-refresh-r1 \
+  --credential-mode access-and-refresh-token \
+  --dry-run
+```
+
+dry-run 零写入、零网络，只输出 schema、哈希、目标路径和待执行门禁；不会输
+出端点、OAuth identity、token、Agent/node/device ID。确认输出仅包含以下
+变化：`schemaVersion:1→2`、新增 revision/mode，以及 config 的 profile 路径和
+SHA pin。必须保持 `LIVIS_RELAY_STATE_DIR` 未设置；若使用非默认配置，可通过
+`--config` 或 `LIVIS_RELAY_CONFIG` 选择，二者不要指向不同部署。
+
+### 2. 应用与提交点
+
+```bash
+bun run src/index.ts profile migrate-v2 \
+  --config "$CONFIG" \
+  --wire-contract-revision livis-relay-v1-access-refresh-r1 \
+  --credential-mode access-and-refresh-token \
+  --apply \
+  --acknowledge-reviewed-wire-contract \
+  --acknowledge-daemon-and-hermes-stopped
+```
+
+apply 会重新完成全部检查，不把先前 dry-run 当授权。顺序固定为：
+
+1. 在协作式 operation guard 内，对 config 和 active v1 profile 做初始及提交前
+   原始字节 SHA 校验；这能拒绝接入 guard 的并发命令与已发生的外部改写，但
+   不是文件系统提供的原子 compare-and-swap；
+2. 在 `stateDir/profile-migrations/<id>/` 以 0600 保存原 config 和原 v1 profile；
+   目录为 0700；
+3. 把新 v2 profile 写入只含 v2 文件的
+   `stateDir/protocol-profiles-v2/<sha>.json`，不覆盖原 v1；
+4. 以 0600 保存不可变 `PREPARED.json`；它只会在两份备份和目标 v2 profile
+   均已持久化后出现；
+5. 把 old SHA、new SHA 和 `last-supported.json` 的既有 proof 持久化移动到本次
+   私有 `proof-quarantine/`，目标目录先于源目录 fsync，不删除审计证据，也绝不
+   自动恢复；
+6. 最后 durable rename config；这是唯一提交点。异常后以 live config 的完整
+   SHA 判断仍在 source、已经 target 或发生未知并发修改；
+7. readback config/profile/proof 状态。验证失败时自动恢复原 config，但 proof
+   保持隔离，服务继续 fail closed。
+
+`CONFIG_COMMITTED.json` 与 `PROOF_REBUILD_REQUIRED.json` 是提交后的审计 marker；
+即使进程在 marker 前退出，`PREPARED.json` 加 live config SHA 仍是恢复真源。
+若 rename 已发生但父目录 fsync 未确认，命令会明确失败并故意保留两层 guard，
+不得只凭当前可见 SHA 宣称提交成功。命令不会修改或复制 `relay.db`。
+
+### 3. 重新生成 proof 并启动
+
+旧 proof 不可继承。apply 成功后保持服务停止，依次执行：
+
+```bash
+bun run src/index.ts upstream check --config "$CONFIG"
+bun run src/index.ts doctor --online --config "$CONFIG"
+```
+
+只有 `upstream check` 为 `supported`、新 schema v2 proof 已生成且 doctor 全绿，
+才重新启用 daemon 的自动拉起并按 daemon→Hermes 顺序启动。`doctor` 是迁移后
+独立运行门禁，不属于 profile migration；迁移命令自身不会实例化 `JobStore`。
+
+### 4. 显式回滚
+
+若尚未通过启动前验证，继续保持两个服务停止并使用 apply 输出的
+`receiptPath`：
+
+```bash
+bun run src/index.ts profile rollback-migration \
+  --config "$CONFIG" \
+  --receipt '/绝对路径/profile-migrations/<id>/PREPARED.json' \
+  --apply \
+  --acknowledge-daemon-and-hermes-stopped
+```
+
+回滚会验证 receipt、当前 config SHA、原 config/profile 备份和路径边界，并从
+备份重新构造 v2 profile、target config 与 runtime contract digest，确认
+source→target 确实属于同一次迁移。只有当前 config 仍为 target 时才要求 target
+v2 文件存在并验证它；已经回滚后，即使该 v2 文件已清理，幂等重试也不会再依赖
+它。
+
+执行顺序固定为：先写 `ROLLBACK_PREPARED-*` 与 `config.pre-rollback-*`，再隔离
+old/new/alias proof，最后准备 v1 profile 并提交 config。原 v1 文件若丢失、成为
+symlink、权限过宽或内容漂移，会把已验证备份写入只含 v1 文件的
+`protocol-profiles-v1-rollback/`，并生成确定性的 fallback config；损坏的普通
+fallback 会先持久化移动到 receipt 目录留证。若 config 已指向 fallback 而该
+文件后来丢失或损坏，fallback profile 的 durable rename 本身就是本次修复提交
+点，proof quarantine 必须先完成；其他回滚仍以 config durable rename 为提交点。
+重复回滚会在两层 guard 内验证当前 active v1，而不是只看 config SHA，必要时
+受控自愈；若发现任一 old/new/alias proof，哪怕 config 已是 v1，也会再次隔离
+proof 并要求重建。只有 active v1 有效且三份 proof 均不存在时才返回 no-op。
+
+恢复 v1 后必须切回迁移前的旧 daemon，再用旧版本重新执行其 `upstream check`
+生成 proof；当前 v2-only daemon 不会加载 v1。回滚只处理 profile/config/proof
+指针，不回滚 SQLite 或二进制。
+
+如果进程被强制终止，`profile-operation.guard` 或 connector socket 原路径的
+JSON guard 可能故意遗留以保持 fail closed。只有在确认 daemon、Hermes、相关
+CLI 和服务管理器都已停止，并核对普通文件中的 `kind`/`nonce` 属于本迁移后，
+才人工清理；guard 的父目录项与文件 inode 都会持久化并在提交前复核，不得自动
+删除未知 socket、symlink、被替换 inode 或 guard。尤其看到“durable rename 已
+发生，但目录 fsync 未确认”时，应先按 receipt 与 live config/profile SHA
+人工判定 source/target，再决定恢复或完成提交，不能先删 guard 重启服务。
+
 ## LiViS 更新流程
 
 ### 1. 检查

@@ -25,7 +25,7 @@ bun run src/index.ts init \
 
 `init` 会把已审核 LiViS profile 复制到 state directory，并把该文件的 SHA-256 固定到配置。它不会登录、绑定或启动服务。
 
-已有 schema v1 部署升级前必须停服务并备份 config/state directory，在仓库外人工迁移和复核 profile 后重新锁定 SHA；旧 supported proof 不可继承，必须重新执行 `upstream check`。当前没有自动修改 live profile/config 的迁移命令，未完成迁移时应保持旧 daemon，不得旁路校验。
+已有 schema v1 部署必须按[protocol profile v1→v2 迁移 runbook](UPSTREAM-UPGRADE.md#现有部署的-protocol-profile-schema-v1v2-迁移)处理：先确认 connector socket 父目录是 state directory 内的私有非 symlink 目录，再停止 daemon/Hermes 并禁用服务管理器自动拉起，执行零写入 dry-run，最后显式 apply。命令会保存原 config/profile 和 PREPARED receipt，以 config durable rename 为 apply 唯一提交点，隔离旧/新 supported proof，且不触碰 SQLite。迁移后必须重新执行 `upstream check` 与 `doctor --online` 才能启动；回滚 v1 后必须切回旧 daemon 并重新生成 proof，不得旁路校验。
 
 随后编辑配置：
 

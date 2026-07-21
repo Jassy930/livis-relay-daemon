@@ -68,3 +68,34 @@ LiViS 与 Hermes 使用不同门禁：
 自动生成的 LiViS 候选只能改变官方版本和 upstream artifact 信息。IDaaS、relay、OAuth、wire identity、timing 或 wire protocol 变化属于运行契约变化，必须随新版 daemon 审核和迁移，不能用候选文件直接放行。
 
 profile schema v2 的 revision/mode 必须命中代码内置 registry；supported proof 绑定同一 runtime digest。脱敏 probe 负责检测代码与已审阅 S2 wire 形状的偏移，但不承担真实服务端兼容证明。
+
+schema v1→v2 是独立的文件状态机，不复用普通 upstream activate/rollback，也
+不打开 `JobStore`：
+
+```text
+PREPARED（原 config/profile 备份 + target v2）
+  → proof quarantine（old SHA + new SHA + alias）
+  → CONFIG_COMMITTED（config durable rename，唯一提交点）
+  → PROOF_REBUILD_REQUIRED
+```
+
+apply/rollback 在协作式 operation guard 内对完整 config 与 profile 原始字节做
+初始及提交前 SHA 校验；它拒绝接入 guard 的并发命令和已发生的外部改写，但不是
+内核级原子 CAS，因此停服窗口仍禁止 `init` 或外部编辑器写文件。新 v2 与
+fallback v1 分别进入只含对应 schema 的独立目录。config readback 失败会恢复
+提交前 config，proof 仍保持隔离以失败关闭；rename 后目录 fsync 未确认则保留
+两层 guard 交给人工恢复。`relay.db`、SQLite `user_version` 和 wire runtime 都
+不属于这条迁移的状态所有权。
+
+rollback 会先用 source backups 重建 target profile/config/runtime digest，防止
+混配 receipt。当前 config 为 source 或 fallback 时只验证、必要时修复 active v1，
+不再要求 target v2 文件存在；当前 config 为 target 时才验证 target。回滚准备
+记录与 pre-rollback config 先落盘，随后 proof quarantine，最后才发生 config
+提交或 active fallback profile 自愈提交。两层 guard 的私有父目录、inode、nonce
+和目录项持久性都会在提交前复核；source/fallback 的幂等 fast path 也在 guard
+内检查三份 proof，残留 proof 会触发只隔离 proof、不改 config/profile 的清理模式。
+
+所有 CLI proof writer（`upstream check/activate`、`login` 与 `serve` 启动）以及
+普通 upstream rollback 都先获取 operation guard、再加载完整 context；这样迁移
+不会与预先读取的旧 profile 快照交错。运行中 daemon 由 connector socket 占用
+阻止离线迁移，`serve` 则持有 operation guard 直到 socket 启动成功。

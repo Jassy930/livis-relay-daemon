@@ -118,6 +118,12 @@ protocol profile schema v2 强制声明：
 
 ## 现有部署迁移边界
 
-schema v1 profile 没有 revision/mode，不能自动猜测后继续运行。升级 daemon 前必须停服务、备份 config/state directory，并在仓库外准备经过人工审阅的 schema v2 profile；只有确认其 wire 仍是当前 `access-and-refresh-token` 基线时，才能填写上述两个值并重新锁定 profile SHA。旧 supported proof 不可复用，迁移后必须重新执行 `upstream check`。
+schema v1 profile 没有 revision/mode，不能从 marker 或端点自动猜测后继续运
+行。项目提供显式 `profile migrate-v2`，但它只接受操作者逐字确认的
+`livis-relay-v1-access-refresh-r1 + access-and-refresh-token` 固定映射；该映射
+不再是 current 时会失败关闭，不会跟随未来 registry 漂移。
 
-本项目当前没有自动修改 live profile/config 的迁移命令。未完成迁移的现有部署应保持旧 daemon，不得为恢复运行绕过 profile 或 proof 校验。
+迁移要求停用 daemon/Hermes 与服务管理器自动拉起，先 dry-run，再保存私有
+PREPARED/备份，以 config durable rename 为唯一提交点。old/new/alias proof 会
+被移入私有 quarantine，迁移和回滚后都必须重新执行 `upstream check`。完整命
+令、崩溃恢复和回滚边界见[官方版本升级与回滚](UPSTREAM-UPGRADE.md#现有部署的-protocol-profile-schema-v1v2-迁移)。未完成迁移的部署应保持旧 daemon，不得旁路 profile 或 proof 校验。

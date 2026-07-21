@@ -166,6 +166,23 @@ export function parseProtocolProfile(text: string, label = "protocol profile"): 
   };
 }
 
+/**
+ * profile catalog 可保留迁移前的 schema v1 文件作为回滚证据，但 runtime
+ * 仍只接受 schema v2。只有明确的 v1 会被跳过；损坏 JSON 和未知 schema
+ * 继续失败关闭。
+ */
+export function parseProtocolProfileCatalogEntry(
+  text: string,
+  label = "protocol profile catalog entry",
+): ProtocolProfile | null {
+  const root = parseJsonObject(text, label);
+  if (root.schemaVersion === 1) return null;
+  if (root.schemaVersion !== 2) {
+    throw new Error(`${label} 使用未知 protocol profile schemaVersion：${String(root.schemaVersion)}`);
+  }
+  return parseProtocolProfile(text, label);
+}
+
 export async function loadProtocolProfile(
   profilePath: string,
   configPath: string,
