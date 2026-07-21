@@ -127,7 +127,7 @@ sequenceDiagram
 
 | 操作 | daemon 发送 / 接收 | 当前证据 | 服务端边界 |
 |---|---|---|---|
-| Device code | `POST /aux`：`client_id`、`scope + offline_access`、`audience`、`offline_access=true`；接收 `device_code`、`verification_uri_complete`、`expires_in`、`interval` | S4 完成真实 Device Flow；S2 覆盖字段校验 | 私有路径和必填性没有 S5 schema |
+| Device code | `POST /aux`：`client_id`、`scope + offline_access`、`audience`、`offline_access=true`；接收 `device_code`、`verification_uri_complete`、`expires_in`、`interval` | S4 完成真实 Device Flow；S2 只覆盖已登记成功形状和部分必需字段存在性 | 字段类型、取值范围、URI scheme、私有路径和服务端必填性尚无完整负向验证或 S5 schema |
 | Device token polling | `POST /token`：device-code grant、`device_code`、`client_id` | S4 观察到 `authorization_pending` + HTTP 428 并最终成功；S2 覆盖标准 HTTP 400 和 `slow_down` | HTTP 400/429 分支不是实网证据；以 OAuth `error` 而非状态码裁决 |
 | Access-token refresh | `POST /token`：refresh-token grant、`refresh_token`、`client_id`；接收 access token，可选轮换 refresh token | S2 覆盖成功、轮换、`invalid_grant` 等分支；当前代码路径暗示历史握手前可能经过该步骤，只能记为 S1 推断 | 没有独立真实 HTTP receipt；响应字段、轮换细节、所有错误状态和在线长期行为未知 |
 | Revoke | `POST /revoke`：token、`token_type_hint=refresh_token`、`client_id` | S2 代码与测试 | 当前没有真实 2xx、网络失败或拒绝 canary |
