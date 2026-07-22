@@ -112,6 +112,33 @@ test "$(cd "$LIVIS_HERMES_HOME" && pwd -P)" = "$LIVIS_HERMES_HOME" || {
 
 不要使用 `--clone` / `--clone-all`，也不要把插件启用到正在承载其他渠道的默认 Gateway。字符串路径正确不足以证明隔离；上述物理路径检查会在任何插件或 Gateway 写操作前拒绝末级及祖先的 symlink/canonical 漂移。插件目录必须同时包含三个文件：
 
+优先使用原子安装器。它要求显式的专用 profile 路径，先把旧插件和 `config.yaml` 备份到 `$LIVIS_HERMES_HOME/backups/livis-bridge/`，再通过同文件系统 rename 替换插件并启用 `plugins.enabled: livis-bridge`。任何提交阶段失败都会恢复旧插件和原配置；安装器不会启动或重启 Gateway：
+
+```bash
+bun run install:hermes -- install \
+  --hermes-home "$LIVIS_HERMES_HOME"
+```
+
+输出中的 `receiptPath` 是 `0600` 的回滚收据。查看可用收据：
+
+```bash
+bun run install:hermes -- receipts \
+  --hermes-home "$LIVIS_HERMES_HOME"
+```
+
+只有在停止专用 Hermes Gateway、确认当前插件和配置未在安装后被人工修改后，才允许回滚：
+
+```bash
+bun run install:hermes -- rollback \
+  --hermes-home "$LIVIS_HERMES_HOME" \
+  --receipt '/绝对路径/receipt.json' \
+  --acknowledge-rollback
+```
+
+回滚前会再备份当前插件和配置；哈希不匹配、收据越出当前 profile 的备份目录、收据属于其他 `HERMES_HOME` 或已回滚时都会失败关闭。安装崩溃遗留 `.livis-bridge-install.lock` 时，必须先确认没有其他安装进程，再人工处理锁文件和状态为 `prepared` 的收据。
+
+以下手工复制只作为安装器不可用时的回退流程：
+
 ```text
 $LIVIS_HERMES_HOME/plugins/livis-bridge/
 ├── plugin.yaml

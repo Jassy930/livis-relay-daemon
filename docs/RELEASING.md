@@ -7,6 +7,7 @@
 - `hermes-plugin/pyproject.toml`
 - `hermes-plugin/plugin.yaml`
 - `hermes-plugin/adapter.py` 的 `PLUGIN_VERSION`
+- `capabilities.json` 的 `package.version`
 
 `bun run version:check` 会拒绝不一致版本。
 
@@ -17,9 +18,32 @@
 3. 用 `git add` 更新候选 index，再执行 `bun run check`。其中 `release:check` 直接读取 `git ls-files -z` 与 index blob，不以 `.gitignore` 或工作区文件清单代替 tracked-files 审计。
 4. 确认公开树不包含 live profile、token、数据库、日志、私有 probe/raw trace、上游 artifact、`node_modules` 或 `.venv`。
 5. 等待 GitHub Actions 的 macOS/Linux 与 Python 3.11–3.13 矩阵通过。
-6. 从 Git tracked files 的干净 checkout 构建 Hermes plugin 归档，只包含 `plugin.yaml`、`__init__.py`、`adapter.py`、README、LICENSE 和 NOTICE。
-7. 对发布归档生成 SHA-256，做一次解压、plugin 加载和 UDS canary。
-8. 创建签名 tag `vX.Y.Z`，再创建 GitHub Release 并附归档与 SHA-256。
+6. 在空的 `dist/` 中执行 `bun run release:verify`。该命令构建源码包和 Hermes bridge 包，生成 `release-manifest.json`，再按 manifest 读回大小与 SHA-256 并解包审计。
+7. 对解包后的源码包运行敏感路径/内容门禁；bridge 包只允许 `plugin.yaml`、`__init__.py`、`adapter.py`、README、LICENSE、NOTICE、能力契约和 Schema。
+8. 使用审计通过的 bridge 包做一次 plugin 加载和 UDS canary。产物审计不替代真实 Hermes 或 LiViS 验证。
+9. 创建签名 tag `vX.Y.Z`，再创建 GitHub Release，附两个归档和 `release-manifest.json`。
+
+## 发布产物命令
+
+日常 `bun run check` 会在临时目录从当前工作树构建两份归档并执行同一解包审计，不会写入 `dist/`：
+
+```bash
+bun run release:artifact-check
+```
+
+正式发布必须从干净 checkout 构建，且 `dist/` 中不能已有同名文件：
+
+```bash
+bun run release:verify
+```
+
+生成内容：
+
+- `livis-relay-daemon-X.Y.Z.tar.gz`：明确白名单目录组成的源码发行包，不会包含 `.claude/`、`node_modules/`、`.venv/`、缓存或运行状态。
+- `livis-hermes-bridge-X.Y.Z.tar.gz`：最小 Hermes bridge 安装包。
+- `release-manifest.json`：记录版本、源码状态、Git commit、每个归档的唯一根目录、大小、SHA-256 和必需路径。只有干净 checkout 会记录 commit；日常工作树自检明确标记为 `working-tree` 且不绑定 commit。
+
+审计在解包前拒绝绝对路径、`..`、多根目录、超过 20000 个条目、符号链接和硬链接；解包后再次拒绝白名单外 bridge 文件、敏感路径、生产身份、私钥和运行状态。任何归档被修改后都会因 SHA-256 不匹配而失败。
 
 ## Tracked-files 安全门禁
 
@@ -39,6 +63,6 @@
 
 `bun run wire-contract:append-only:check` 还会把候选 Git index 与 base commit 比较：既有 registry definition 和 artifact 原始字节不可删除、改名或原地修改；每个候选最多新增一个 revision，且必须成为 current 接受 generator 重建校验。没有新增时不得切换 current。CI checkout 使用完整历史，并从 PR base SHA 或 push before SHA 取基线；基线不可读或不是当前 HEAD 祖先时失败关闭。首次 bootstrap 只有在 base 同时没有 registry 和任何 `protocol-probes/` 文件时才允许，且只能登记一个 current revision。
 
-该门禁只证明当前 Git index 未命中这些规则，不代替提交历史扫描、GitHub secret scanning 或人工 diff 审阅。
+tracked-files 门禁只证明当前 Git index 未命中这些规则；产物门禁只证明最终归档与 manifest 一致且解包内容通过当前规则。两者都不代替提交历史扫描、GitHub secret scanning、人工 diff 审阅或真实链路 canary。
 
 初始公开仓库只发布源码，不自动创建 Release；在跨语言 UDS canary 和真实 Hermes 候选版本验证完成前，不应把 `v0.1.0` 标记为稳定版。

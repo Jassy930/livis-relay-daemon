@@ -1,0 +1,208 @@
+{
+  "$schema": "./schemas/capabilities.schema.json",
+  "schemaVersion": 1,
+  "package": {
+    "name": "livis-relay-daemon",
+    "version": "0.1.0",
+    "license": "MIT",
+    "language": "zh-CN",
+    "phase": "phase1-hermes",
+    "officialEndorsement": false
+  },
+  "compatibility": {
+    "bun": ">=1.3.14",
+    "python": ">=3.11,<3.14",
+    "hermesRuntime": ">=0.15.1,<0.15.2",
+    "hermesBridge": ">=0.1.0,<0.2.0",
+    "livisReferenceClient": "2.0.0",
+    "livisProtocolStatus": "observed-not-publicly-versioned",
+    "lastReviewed": "2026-07-22"
+  },
+  "topology": {
+    "relayStateOwner": "livis-relayd",
+    "connectorTransport": "unix-websocket",
+    "connectorAuthentication": "bearer-and-lease-fencing",
+    "oneDaemonPerStateDirectory": true,
+    "dedicatedHermesProfileRequired": true
+  },
+  "capabilities": [
+    {
+      "id": "inbound_text",
+      "direction": "livis-to-hermes",
+      "status": "live-canary-verified",
+      "evidenceRefs": ["docs/HERMES-CANARY.md"],
+      "testRefs": ["tests/python_connector_integration.test.ts", "tests/relay_client.test.ts"],
+      "notes": "LiViS 文本任务可经 daemon 和 UDS connector 进入专用 Hermes Gateway。"
+    },
+    {
+      "id": "outbound_final_text",
+      "direction": "hermes-to-livis",
+      "status": "live-canary-verified",
+      "evidenceRefs": ["docs/HERMES-CANARY.md"],
+      "testRefs": ["tests/python_connector_integration.test.ts", "tests/relay_client.test.ts"],
+      "notes": "一期只允许单个纯文本 final result，并以 durable outbox 等待远端 ACK。"
+    },
+    {
+      "id": "durable_result_delivery",
+      "direction": "hermes-to-livis",
+      "status": "live-canary-verified",
+      "evidenceRefs": ["docs/HERMES-CANARY.md", "docs/ARCHITECTURE.md"],
+      "testRefs": ["tests/store.test.ts", "tests/relay_client.test.ts"],
+      "notes": "Agent 至多执行一次，结果至少投递一次；重启只重放未完成 outbox。"
+    },
+    {
+      "id": "request_cancellation",
+      "direction": "bidirectional",
+      "status": "offline-verified",
+      "evidenceRefs": ["docs/ARCHITECTURE.md", "docs/SECURITY.md"],
+      "testRefs": ["tests/store.test.ts", "tests/connector.test.ts", "hermes-plugin/tests/test_adapter.py"],
+      "notes": "取消为 best effort；无法证明工具线程退出时进入 CancelUnknown 并隔离 session。"
+    },
+    {
+      "id": "payload_conflict_detection",
+      "direction": "local",
+      "status": "offline-verified",
+      "evidenceRefs": ["docs/ARCHITECTURE.md"],
+      "testRefs": ["tests/store.test.ts"],
+      "notes": "同一 scope 和 job_id 的业务 payload hash 不一致时失败关闭。"
+    },
+    {
+      "id": "lease_fencing",
+      "direction": "local",
+      "status": "offline-verified",
+      "evidenceRefs": ["docs/ARCHITECTURE.md"],
+      "testRefs": ["tests/connector.test.ts", "tests/store.test.ts", "hermes-plugin/tests/test_adapter.py"],
+      "notes": "lease_id 和 run_generation 阻止旧 connector 或迟到结果完成新执行。"
+    },
+    {
+      "id": "upstream_drift_guard",
+      "direction": "local",
+      "status": "offline-verified",
+      "evidenceRefs": ["docs/UPSTREAM-UPGRADE.md", "docs/SECURITY.md"],
+      "testRefs": ["tests/upstream.test.ts", "tests/proof.test.ts", "tests/activation.test.ts"],
+      "notes": "active profile、artifact 哈希、wire marker 和近期 supported proof 不满足时拒绝新任务。"
+    },
+    {
+      "id": "hermes_bridge_installation",
+      "direction": "local",
+      "status": "operator-only",
+      "evidenceRefs": ["docs/OPERATIONS.md"],
+      "testRefs": ["tests/hermes_installer.test.ts"],
+      "notes": "只在操作者提供明确专用 HERMES_HOME 后原子安装；不会启动或重启 Gateway。"
+    },
+    {
+      "id": "document_delivery",
+      "direction": "hermes-to-livis",
+      "status": "unsupported",
+      "evidenceRefs": ["README.md"],
+      "testRefs": ["hermes-plugin/tests/test_adapter.py"],
+      "notes": "一期不读取或上传附件。"
+    },
+    {
+      "id": "streaming_and_tool_progress",
+      "direction": "hermes-to-livis",
+      "status": "unsupported",
+      "evidenceRefs": ["README.md", "docs/SECURITY.md"],
+      "testRefs": ["hermes-plugin/tests/test_adapter.py"],
+      "notes": "一期关闭 streaming、tool progress 和 interim assistant messages。"
+    },
+    {
+      "id": "remote_approval_and_admin",
+      "direction": "bidirectional",
+      "status": "unsupported",
+      "evidenceRefs": ["README.md", "docs/SECURITY.md"],
+      "testRefs": ["hermes-plugin/tests/test_adapter.py"],
+      "notes": "不支持远程审批、远程更新或其他管理命令。"
+    },
+    {
+      "id": "unsolicited_push",
+      "direction": "hermes-to-livis",
+      "status": "unsupported",
+      "evidenceRefs": ["README.md"],
+      "testRefs": [],
+      "notes": "一期只响应 LiViS 发起的 on-demand 请求。"
+    }
+  ],
+  "safetyDefaults": {
+    "allowAllNodes": false,
+    "allowAllHermesUsers": false,
+    "streaming": false,
+    "toolProgress": false,
+    "remoteApproval": false,
+    "remoteAdmin": false,
+    "unknownProtocol": "fail-closed"
+  },
+  "commands": {
+    "readOnly": [
+      "capabilities",
+      "status",
+      "doctor",
+      "version"
+    ],
+    "localStateMutation": [
+      "init",
+      "upstream check",
+      "upstream activate",
+      "upstream rollback",
+      "session release",
+      "install-hermes-plugin install",
+      "install-hermes-plugin rollback"
+    ],
+    "externalStateMutation": [
+      "login",
+      "logout",
+      "serve"
+    ],
+    "explicitAcknowledgementRequired": [
+      "init --acknowledge-unofficial-protocol",
+      "upstream activate --acknowledge-reviewed-profile",
+      "upstream rollback --acknowledge-rollback",
+      "install-hermes-plugin rollback --acknowledge-rollback"
+    ]
+  },
+  "network": {
+    "productionEndpointsBundled": false,
+    "officialOauthIdentityBundled": false,
+    "authorizedProfileRequired": true,
+    "connectorListensOnTcp": false
+  },
+  "localData": [
+    {
+      "path": "<stateDir>/secrets.json",
+      "mode": "0600",
+      "contains": ["refresh token", "connector bearer token"],
+      "retention": "operator-managed"
+    },
+    {
+      "path": "<stateDir>/identity.json",
+      "mode": "0600",
+      "contains": ["relay agent id", "device id"],
+      "retention": "operator-managed"
+    },
+    {
+      "path": "<stateDir>/relay.db*",
+      "mode": "0600",
+      "contains": ["node id", "message content", "delivery and execution state"],
+      "retention": "until-explicit-cleanup"
+    },
+    {
+      "path": "<stateDir>/",
+      "mode": "0700",
+      "contains": ["protocol profile", "supported proof", "upstream audit artifact"],
+      "retention": "operator-managed"
+    }
+  ],
+  "release": {
+    "artifacts": ["source-tarball", "hermes-bridge-tarball"],
+    "manifest": "release-manifest.json",
+    "requiredGates": [
+      "version consistency",
+      "capability schema and reference validation",
+      "tracked-file public release audit",
+      "archive extraction and content audit",
+      "TypeScript typecheck",
+      "Bun tests",
+      "Hermes pytest"
+    ]
+  }
+}

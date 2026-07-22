@@ -11,6 +11,12 @@
 - daemon 与新配置的版本统一提升为 0.1.1，并内建 bridge 0.1.1 安全下限；存量配置若仍允许 0.1.0 会在启动前失败关闭，必须在停服升级中显式更新并同步安装 bridge。
 - bridge 会把非有限、不可解析或超出平台日期范围的远端 job timestamp 降级为当前 UTC 时间，避免异常元数据在输入门禁结算前中止 background task 并遗留 `Dispatching` job。
 
+### 新增
+
+- 新增严格 JSON Schema 约束的 `capabilities.json`，并提供只读 CLI、证据引用和一致性门禁。
+- 新增 Hermes bridge 原子安装器、私有配置备份、失败自动恢复和哈希绑定回滚收据。
+- 新增源码包与 bridge 包构建、SHA-256 manifest、路径预检和解包后发布产物审计。
+
 ### 修复
 
 - Codex failed turn 现在识别 0.145.0 实测到的 legacy history 投影缺陷：权威 `turn/completed=failed` 可能被同一 thread 的 `thread/read` 回读成 `systemError + completed tail`。例外版本 allowlist 只含精确 `0.145.0`；只有当前 failed 通知绑定同一 turn，或同一 app-server client epoch 的内存 marker、raw turns hash 与 SQLite checkpoint 完全一致时，才把 tail 的业务语义归一化为 failed。raw history 状态不改写，fresh start、重启、recovery、其他状态组合和其他版本仍失败关闭。provider 原始错误、JSON-RPC message/data 与 app-server stderr 不写入 JobStore/Relay/共享日志，失效凭据会以脱敏分类在同一事务中完成失败结算与 quarantine，关闭失败继续向上报告。提交 `65f00c1` 的一次性真实 canary 运行态为非支持的 `account_type=chatgpt`；它只验证 structured `unauthorized` 会收口为 `Failed + Pending outbox + failed ledger + active clear + credential quarantine`，不再误落成 `Interrupted + recovery_required`，不能作为 API-key 凭据或成功模型 turn 的证据。

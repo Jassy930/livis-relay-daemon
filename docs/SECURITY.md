@@ -101,6 +101,7 @@ daemon 0.1.1 内建 bridge 0.1.1 安全下限。配置中的 `hermes.bridgeMinim
 - LiViS 一期没有附件或文件上传路径。Codex agent 可以读写其专用 workspace；该目录
   必须只放允许远程执行影响的内容，不得包含 daemon secret、其他项目 checkout 或
   用户默认 Codex profile。
+- Hermes bridge 原子安装备份位于专用 profile 的 `backups/livis-bridge/`，目录和回滚收据为私有本地状态，不得提交或上传。安装器不读取 daemon token，也不启动或重启 Gateway。
 
 ## Codex 工具沙箱
 

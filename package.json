@@ -29,7 +29,9 @@
   "scripts": {
     "start": "bun run src/index.ts serve",
     "cli": "bun run src/index.ts",
+    "install:hermes": "bun run scripts/install-hermes-plugin.ts",
     "version:check": "bun run scripts/check-versions.ts",
+    "capabilities:check": "bun run scripts/check-capabilities.ts",
     "docs:check": "bun run scripts/check-doc-links.ts",
     "release:check": "bun run scripts/check-public-release.ts",
     "wire-contract:append-only:check": "bun run scripts/check-wire-contract-append-only.ts --allow-bootstrap",
@@ -38,11 +40,14 @@
     "probe:protocol:check": "bun run scripts/probe-protocol-local.ts --check",
     "probe:protocol:test": "bun test tests/protocol_probe_artifact.test.ts tests/auth_contract_probe.test.ts tests/relay_wire_probe.test.ts",
     "smoke:codex:app-server": "bun run src/index.ts codex smoke-app-server",
+    "release:build": "bun run scripts/build-release.ts",
+    "release:artifact-check": "bun run scripts/check-release-artifacts.ts",
+    "release:verify": "bun run version:check && bun run capabilities:check && bun run release:check && bun run release:build && bun run scripts/check-release-artifacts.ts --manifest dist/release-manifest.json",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "test:hermes": "cd hermes-plugin && uv lock --check && PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider -q",
     "test:coverage": "bun test --coverage",
-    "check": "bun run version:check && bun run docs:check && bun run release:check && bun run wire-contract:append-only:check && bun run probe:protocol:check && bun run typecheck && bun test && bun run test:hermes"
+    "check": "bun run version:check && bun run capabilities:check && bun run docs:check && bun run release:check && bun run release:artifact-check && bun run wire-contract:append-only:check && bun run probe:protocol:check && bun run typecheck && bun test && bun run test:hermes"
   },
   "dependencies": {
     "ws": "^8.18.3"
@@ -50,7 +55,9 @@
   "devDependencies": {
     "@types/bun": "^1.2.22",
     "@types/ws": "^8.18.1",
-    "typescript": "^5.9.2"
+    "ajv": "^8.20.0",
+    "typescript": "^5.9.2",
+    "yaml": "^2.9.0"
   },
   "engines": {
     "bun": ">=1.3.14"

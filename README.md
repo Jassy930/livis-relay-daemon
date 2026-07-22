@@ -52,6 +52,17 @@ flowchart LR
 - schema v1→v2 迁移采用固定 contract 人工确认、私有 PREPARED/备份、source→target 重建校验、持久化 guard、proof quarantine 和可自愈显式回滚；迁移命令不打开 SQLite。
 - Hermes runtime/bridge 与 Codex CLI 都必须位于各自审核版本区间；Codex 当前固定为 `[0.145.0, 0.146.0)`，未知未来版本不会自动放行。
 
+## 机器可读能力
+
+[`capabilities.json`](capabilities.json) 是能力范围、证据等级、安全默认值、命令权限和发布产物的机器可读事实源。可只读输出并验证：
+
+```bash
+bun run src/index.ts capabilities
+bun run capabilities:check
+```
+
+JSON Schema 与证据等级规则见 [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md)。握手成功、离线测试或上游格式声明都不能自动提升为真实链路已验证。
+
 ## 开发验证
 
 ### 环境要求
@@ -80,7 +91,7 @@ git clone https://github.com/Jassy930/livis-relay-daemon.git && cd livis-relay-d
 
 这条命令只准备开发环境，不会安装常驻服务，也不会生成连接生产服务所需的 live profile。后续配置步骤见[运行手册](docs/OPERATIONS.md)。
 
-`bun run check` 会依次检查版本、文档链接、Git tracked files、wire contract append-only 历史与本地 S2 protocol probe artifact，再执行 TypeScript 类型检查、全部 Bun 测试、`uv lock --check` 和 Hermes plugin pytest。其中公开发布与 append-only 门禁审核 Git index；probe generator、类型检查和测试读取当前工作区。运行前应先用 `git add` 精确暂存候选文件，并保持 staged/worktree 一致。
+`bun run check` 会依次检查版本、能力契约、文档链接、Git tracked files、发布归档、wire contract append-only 历史与本地 S2 protocol probe artifact，再执行 TypeScript 类型检查、全部 Bun 测试、`uv lock --check` 和 Hermes plugin pytest。其中公开发布、能力与 append-only 门禁审核 Git index；probe generator、类型检查和测试读取当前工作区。运行前应先用 `git add` 精确暂存候选文件，并保持 staged/worktree 一致。
 
 验证结果必须绑定精确提交，不能沿用 README 中的固定测试数量或旧 canary 结论。当前候选应在精确 staged tree 上运行 `bun run check`；实际测试数量以该次输出为准。
 
@@ -141,6 +152,7 @@ canary 外，合并文档或 `plutil -lint` 通过不代表用户服务已被修
 - [运行手册](docs/OPERATIONS.md)
 - [Codex app-server 执行后端](docs/CODEX-APPSERVER.md)
 - [Codex LiViS 人在环 E2E canary](docs/CODEX-E2E-CANARY.md)
+- [机器可读能力契约](docs/CAPABILITIES.md)
 - [Hermes 实网 canary](docs/HERMES-CANARY.md)
 - [官方升级与回滚](docs/UPSTREAM-UPGRADE.md)
 - [普通 profile 激活事务](docs/PROFILE-ACTIVATION.md)

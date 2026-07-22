@@ -2,7 +2,14 @@
 
 该目录是 Hermes 用户 plugin 的源码与测试环境，不是可发布 wheel。`pyproject.toml` 只用于通过 uv 锁定 `websockets` 和 pytest 依赖。
 
-当前 monorepo 不能直接作为 `hermes plugins install owner/repo` 的 plugin 根目录使用。先用 `hermes profile create livis-test --no-skills --no-alias` 创建隔离 profile，再将以下三个文件复制到该 profile 的 plugin 目录：
+当前 monorepo 不能直接作为 `hermes plugins install owner/repo` 的 plugin 根目录使用。先用 `hermes profile create livis-test --no-skills --no-alias` 创建隔离 profile，再从仓库根目录执行原子安装器：
+
+```bash
+bun run install:hermes -- install \
+  --hermes-home "$HOME/.hermes/profiles/livis-test"
+```
+
+安装器原子替换以下三个文件，备份并更新该 profile 的 `config.yaml`，但不会启动或重启 Gateway：
 
 ```text
 ~/.hermes/profiles/livis-test/plugins/livis-bridge/
@@ -11,7 +18,7 @@
 └── adapter.py
 ```
 
-然后执行：
+需要手工回退时，复制文件后再执行：
 
 ```bash
 HERMES_HOME="$HOME/.hermes/profiles/livis-test" \
@@ -36,4 +43,4 @@ uv sync --frozen
 PYTHONDONTWRITEBYTECODE=1 uv run python -m pytest -p no:cacheprovider -q
 ```
 
-升级时先停止专用 Hermes Gateway 与 daemon，备份旧 plugin 目录和 daemon state directory，再覆盖上述三个文件；同时把私有 Relay 配置的 `hermes.bridgeMinimumVersion` 显式更新并读回为至少 `0.1.1`，然后重新运行完整门禁。daemon 0.1.1 会拒绝仍允许 bridge 0.1.0 的存量配置。不要从 LiViS 远程渠道执行 `/update`、`/sethome` 或其他 Hermes 命令，也不要在未指定 `HERMES_HOME` 时启用、停用或启动本插件。
+升级时先停止专用 Hermes Gateway 与 daemon，备份 daemon state directory，再运行原子安装器并保留输出的 `receiptPath`；同时把私有 Relay 配置的 `hermes.bridgeMinimumVersion` 显式更新并读回为至少 `0.1.1`，然后重新运行完整门禁。回滚必须显式传入同一 `HERMES_HOME`、收据绝对路径和 `--acknowledge-rollback`。daemon 0.1.1 会拒绝仍允许 bridge 0.1.0 的存量配置。不要从 LiViS 远程渠道执行 `/update`、`/sethome` 或其他 Hermes 命令，也不要在未指定 `HERMES_HOME` 时启用、停用或启动本插件。

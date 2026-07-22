@@ -7,6 +7,9 @@ if (typeof packageJson.version !== "string" || packageJson.version === "") {
 }
 
 const expected = packageJson.version;
+const capabilities = await Bun.file(resolve(root, "capabilities.json")).json() as {
+  package?: { version?: unknown };
+};
 const checks: Array<{ path: string; pattern: RegExp; label: string }> = [
   {
     path: "src/daemon.ts",
@@ -31,6 +34,9 @@ const checks: Array<{ path: string; pattern: RegExp; label: string }> = [
 ];
 
 const mismatches: string[] = [];
+if (capabilities.package?.version !== expected) {
+  mismatches.push(`capabilities.json package.version: ${String(capabilities.package?.version)} != ${expected}`);
+}
 for (const check of checks) {
   const text = await Bun.file(resolve(root, check.path)).text();
   const actual = text.match(check.pattern)?.[1];

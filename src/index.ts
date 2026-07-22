@@ -19,6 +19,7 @@ import {
   ensureCodexRuntimeLayout,
   pinCodexCommand,
 } from "./backends/codex/runtime-layout.ts";
+import { validateCapabilityManifest } from "./capabilities.ts";
 import { IdaasClient } from "./auth/idaas.ts";
 import { IdentityStore } from "./identity.ts";
 import { Logger, errorMessage } from "./logger.ts";
@@ -186,6 +187,11 @@ async function commandInit(args: string[]): Promise<void> {
 async function commandConnectorToken(args: string[]): Promise<void> {
   const context = await loadContext(optionValue(args, "--config"));
   process.stdout.write(`${context.secretValues.connectorToken}\n`);
+}
+
+async function commandCapabilities(): Promise<void> {
+  const { manifest } = await validateCapabilityManifest(PROJECT_ROOT);
+  process.stdout.write(`${JSON.stringify(manifest, null, 2)}\n`);
 }
 
 async function refreshOrRequireSupportedProof(
@@ -719,6 +725,7 @@ async function commandCodexSmokeAppServer(args: string[]): Promise<void> {
 function printHelp(): void {
   process.stdout.write(`livis-relay-daemon ${DAEMON_VERSION}\n\n`);
   process.stdout.write("命令：\n");
+  process.stdout.write("  capabilities\n");
   process.stdout.write("  init --profile PATH [--config PATH] [--acknowledge-unofficial-protocol]\n");
   process.stdout.write("  login [--force] [--no-open] [--config PATH]\n");
   process.stdout.write("  logout [--config PATH]\n");
@@ -740,6 +747,9 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const [command, subcommand] = args;
   switch (command) {
+    case "capabilities":
+      await commandCapabilities();
+      break;
     case "init":
       await commandInit(args);
       break;
