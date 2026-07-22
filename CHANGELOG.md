@@ -11,7 +11,7 @@
 - `logout` 现在只在 IDaaS revoke 返回 2xx 后清除本地 refresh token；远端非 2xx 或网络失败会令命令失败并保留本地可恢复凭据，不再虚假报告撤销成功。
 - 重复 `cancel_chat` 现在保持 `Cancelling`，不会误降为 `Cancelled` 并绕过 `CancelUnknown` 与 session 隔离；取消状态转移改为 SQLite 原子条件更新，迟到 cancel 不再回退 `Interrupted` 或其他终态。
 - 结果重试不再覆盖旧的投递 ID；首次投递的延迟 ACK 在重试开始后仍能关联原 job。
-- 驱逐失活 connector 后，旧 socket 的延迟 `close` 回调不再误清理复用同一 ID 的新连接。
+- 驱逐失活 connector 时会先结算旧 generation 的活跃 lease 并隔离相关 session，再接纳新连接；结算仅在持久化成功后标记完成，首次 SQLite/I/O 失败可由 takeover 或迟到 `close` 重试；旧 socket 的入站消息不再影响复用同一 ID 的新 generation。
 - `ack_send_result` 的 `ref_msg_id` 现在会按持久化投递记录回查真实 job，引用投递 `msg_id` 的 ACK 不再丢失。
 - connector Unix socket 发送遇到背压（Bun `send()` 返回 -1）不再误判为失败，避免同一 job 被重置后重复派发。
 - IDaaS refresh 失效以 OAuth error 值为准：`invalid_grant`（常见 HTTP 400）同样清除本地 refresh token 并终止重连；refresh 请求补充 `client_id`。

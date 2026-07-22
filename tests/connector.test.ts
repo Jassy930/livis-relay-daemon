@@ -40,23 +40,48 @@ function messageReader(socket: WebSocket) {
   };
 }
 
+async function waitFor(predicate: () => boolean, label: string, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      throw new Error(`等待 ${label} 超时`);
+    }
+    await Bun.sleep(5);
+  }
+}
+
 describe("Hermes connector Unix WebSocket", () => {
   let directory: Awaited<ReturnType<typeof temporaryDirectory>>;
   let store: JobStore;
   let server: ConnectorServer;
   const token = "x".repeat(43);
-  const events: Array<{ type: string; jobId?: string }> = [];
+  const events: Array<{ type: string; jobId?: string; affected?: number }> = [];
 
   beforeEach(async () => {
     directory = await temporaryDirectory();
     store = new JobStore(join(directory.path, "relay.db"), "account:agent");
     const handlers: ConnectorServerHandlers = {
       onReady: async (hello: ConnectorHello) => { events.push({ type: "ready", jobId: hello.connectorId }); },
-      onAccepted: async (message) => { events.push({ type: "accepted", jobId: message.jobId }); },
-      onResult: async (message) => { events.push({ type: "result", jobId: message.jobId }); },
-      onFailed: async (message) => { events.push({ type: "failed", jobId: message.jobId }); },
-      onCancelled: async (message) => { events.push({ type: "cancelled", jobId: message.jobId }); },
-      onDisconnected: async (connectorId) => { events.push({ type: "disconnected", jobId: connectorId }); },
+      onAccepted: async (message, connectorId) => {
+        store.markRunning(message.jobId, connectorId, message.leaseId);
+        events.push({ type: "accepted", jobId: message.jobId });
+      },
+      onResult: async (message) => {
+        store.finishSuccess(message.jobId, message.leaseId, JSON.stringify({ text: message.text }));
+        events.push({ type: "result", jobId: message.jobId });
+      },
+      onFailed: async (message) => {
+        store.finishFailure(message.jobId, message.leaseId, JSON.stringify({ text: "failed" }), message.error);
+        events.push({ type: "failed", jobId: message.jobId });
+      },
+      onCancelled: async (message) => {
+        store.markCancelUnknown(message.jobId, message.leaseId, "connector reported cancellation");
+        events.push({ type: "cancelled", jobId: message.jobId });
+      },
+      onDisconnected: async (connectorId) => {
+        const affected = store.markConnectorDisconnected(connectorId);
+        events.push({ type: "disconnected", jobId: connectorId, affected });
+      },
       status: () => ({ test: true }),
     };
     server = new ConnectorServer({
@@ -129,6 +154,10 @@ describe("Hermes connector Unix WebSocket", () => {
 
     client.close();
     await new Promise((resolve) => client.once("close", resolve));
+    await waitFor(
+      () => events.some((event) => event.type === "disconnected" && event.jobId === "hermes-test"),
+      "connector 断开结算",
+    );
   });
 
   test("拒绝不兼容 connector protocol", async () => {
@@ -153,7 +182,7 @@ describe("Hermes connector Unix WebSocket", () => {
     client.close();
   });
 
-  test("替换失活连接时旧 close 不误清理新连接", async () => {
+  test("替换失活连接先结算旧 lease，并 fence 复用 ID 的旧 generation", async () => {
     const oldClient = openWebSocket(server.socketPath, token);
     const readOld = messageReader(oldClient);
     await new Promise<void>((resolve, reject) => {
@@ -171,10 +200,20 @@ describe("Hermes connector Unix WebSocket", () => {
     }));
     expect((await readOld()).type).toBe("hello_ack");
 
-    const activeSocket = (server as unknown as {
+    store.ingest(incomingJob("stale-job"), "stale-session");
+    store.markAcked("stale-job");
+    const staleJob = store.claimForDispatch("stale-job", "hermes-reused", "stale-lease")!;
+    expect(server.sendJob(staleJob)).toBeTrue();
+    expect((await readOld()).type).toBe("job");
+    oldClient.send(JSON.stringify({ type: "accepted", jobId: "stale-job", leaseId: "stale-lease" }));
+    await waitFor(() => store.require("stale-job").status === "Running", "旧 connector job 进入 Running");
+
+    const internals = server as unknown as {
       activeSocket: { data: { lastPongAt: number } };
-    }).activeSocket;
-    activeSocket.data.lastPongAt = 0;
+      handleMessage(socket: unknown, raw: string): Promise<void>;
+    };
+    const oldServerSocket = internals.activeSocket;
+    oldServerSocket.data.lastPongAt = 0;
     const oldClosed = new Promise<void>((resolve) => oldClient.once("close", () => resolve()));
 
     const newClient = openWebSocket(server.socketPath, token);
@@ -194,14 +233,38 @@ describe("Hermes connector Unix WebSocket", () => {
     }));
     expect((await readNew()).type).toBe("hello_ack");
     await oldClosed;
-    await Bun.sleep(5);
+    await waitFor(() => events.filter((event) => event.type === "ready").length === 2, "新 connector ready");
 
     expect(server.ready).toBeTrue();
-    expect(events.filter((event) => event.type === "ready")).toHaveLength(2);
-    expect(events.filter((event) => event.type === "disconnected")).toHaveLength(0);
+    expect(store.require("stale-job").status).toBe("Interrupted");
+    expect(store.listQuarantinedSessions().some((entry) => entry.sessionKey === "stale-session")).toBeTrue();
+    expect(events.filter((event) => ["ready", "disconnected"].includes(event.type)).map((event) => event.type))
+      .toEqual(["ready", "disconnected", "ready"]);
+    expect(events.filter((event) => event.type === "disconnected"))
+      .toEqual([{ type: "disconnected", jobId: "hermes-reused", affected: 1 }]);
+
+    store.ingest(incomingJob("new-job"), "new-session");
+    store.markAcked("new-job");
+    const newJob = store.claimForDispatch("new-job", "hermes-reused", "new-lease")!;
+    expect(server.sendJob(newJob)).toBeTrue();
+    expect((await readNew()).type).toBe("job");
+    newClient.send(JSON.stringify({ type: "accepted", jobId: "new-job", leaseId: "new-lease" }));
+    await waitFor(() => store.require("new-job").status === "Running", "新 connector job 进入 Running");
+
+    await expect(internals.handleMessage(oldServerSocket, JSON.stringify({
+      type: "result",
+      jobId: "new-job",
+      leaseId: "new-lease",
+      text: "stale result",
+    }))).rejects.toThrow("generation 已失效");
+    expect(store.require("new-job").status).toBe("Running");
+    expect(events.some((event) => event.type === "result" && event.jobId === "new-job")).toBeFalse();
+    expect(server.ready).toBeTrue();
+    expect(events.filter((event) => event.type === "disconnected")).toHaveLength(1);
 
     newClient.close();
     await new Promise((resolve) => newClient.once("close", resolve));
+    await waitFor(() => events.filter((event) => event.type === "disconnected").length === 2, "新 connector 断开结算");
   });
 
   test("只接受已审核 Hermes 和 bridge 版本范围", async () => {
@@ -277,5 +340,46 @@ describe("Hermes connector Unix WebSocket", () => {
     expect((await readNew()).type).toBe("hello_ack");
     newClient.close();
     await new Promise((resolve) => newClient.once("close", resolve));
+    await waitFor(
+      () => events.some((event) => event.type === "disconnected" && event.jobId === "new-hermes"),
+      "已审核 connector 断开结算",
+    );
+  });
+});
+
+describe("Connector 断连 durable 结算", () => {
+  test("断连结算首次失败后不会永久标记为已处理", async () => {
+    let settlementAttempts = 0;
+    const socket = {
+      data: {
+        connectorId: "retry-connector",
+        disconnectHandled: false,
+      },
+    };
+    const server = Object.create(ConnectorServer.prototype) as ConnectorServer;
+    const internals = server as unknown as {
+      handlers: Pick<ConnectorServerHandlers, "onDisconnected">;
+      settleDisconnected(candidate: typeof socket): Promise<void>;
+    };
+    internals.handlers = {
+      onDisconnected: async (connectorId) => {
+        settlementAttempts += 1;
+        expect(connectorId).toBe("retry-connector");
+        if (settlementAttempts === 1) {
+          throw new Error("synthetic settlement failure");
+        }
+      },
+    };
+
+    await expect(internals.settleDisconnected(socket)).rejects.toThrow("synthetic settlement failure");
+    expect(settlementAttempts).toBe(1);
+    expect(socket.data.disconnectHandled).toBeFalse();
+
+    await internals.settleDisconnected(socket);
+    expect(settlementAttempts).toBe(2);
+    expect(socket.data.disconnectHandled).toBeTrue();
+
+    await internals.settleDisconnected(socket);
+    expect(settlementAttempts).toBe(2);
   });
 });
