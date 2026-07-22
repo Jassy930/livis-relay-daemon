@@ -16,6 +16,13 @@
   </array>
   <key>WorkingDirectory</key>
   <string>__PROJECT_DIR__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:__HOME__/.bun/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -25,6 +32,11 @@
   </dict>
   <key>ProcessType</key>
   <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <!-- plist 整数 63 等于八进制 077。 -->
+  <key>Umask</key>
+  <integer>63</integer>
   <key>StandardOutPath</key>
   <string>__HOME__/.livis-relay/daemon.stdout.log</string>
   <key>StandardErrorPath</key>

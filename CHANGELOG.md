@@ -6,6 +6,7 @@
 
 ### 修复
 
+- 本地 `status` 请求增加 3 秒硬超时，避免 connector socket 已接受但 daemon 不响应时让 launchd 启动验收无界卡住。
 - 结果 ACK 重试耗尽后改为持久化退避并自动恢复；在线、重连与重启都不会再遗留永久 `AckFailed`，退避期间的迟到 ACK 仍可完成投递。
 - WebSocket `send()` 同步失败会原子撤销未出进程的投递 attempt，恢复前一个真实投递 ID 与时间；没有真实 attempt 的 ACK 不再误结算或清除当前 ACK timer。
 - CLI、`serve` 启动与 daemon 周期 supported-proof writer 统一使用可验证的 `ProfileOperationGuard` lease；proof 目录逐层固定为 `0700` 并持久化，keyed/alias 半写会按精确内容逆序补偿，绝对到期边界改为 `expiresAt <= now`。
@@ -30,6 +31,7 @@
 
 ### 变更
 
+- macOS Relay LaunchAgent 模板补齐显式 `HOME`、可解析 Bun/Hermes 的 `PATH`、10 秒启动节流与 `077` umask；运行手册固定稳定 checkout、Relay/Hermes 双 LaunchAgent 的安装、启停、升级、日志和分层验收，并把历史服务级记录与旧基线测试数量降为参考信息。
 - JobStore schema 升级为 v3；fresh、v1、v2 数据库在取得 SQLite `IMMEDIATE` 写锁后统一裁决并原子迁移，提交前验证 integrity 与 foreign keys，失败时完整回滚。
 - 新增完全离线的 IDaaS / Relay S2 protocol probe、机器可读 wire contract registry、append-only 历史门禁、精确 artifact 发布白名单与严格 fake Relay 场景；当前风险以“观察”记录，不升级为服务端事实。
 - protocol profile 升级为 schema v2，强制绑定 `wireContractRevision + credentialMode`；runtime digest、supported proof 与 status 同步绑定，旧 profile/proof 失败关闭。

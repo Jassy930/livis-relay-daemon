@@ -15,6 +15,7 @@ import {
   type ProtocolProfile,
 } from "./protocol/profile.ts";
 import { SecretStore } from "./secrets.ts";
+import { fetchDaemonStatus } from "./status-client.ts";
 import {
   ProfileOperationGuard,
   rethrowAfterProfileOperationCleanup,
@@ -526,10 +527,10 @@ async function commandDoctor(args: string[]): Promise<void> {
 
 async function commandStatus(args: string[]): Promise<void> {
   const context = await loadContext(optionValue(args, "--config"));
-  const response = await fetch("http://localhost/v1/status", {
-    unix: context.config.connector.socketPath,
-    headers: { Authorization: `Bearer ${context.secretValues.connectorToken}` },
-  });
+  const response = await fetchDaemonStatus(
+    context.config.connector.socketPath,
+    context.secretValues.connectorToken,
+  );
   process.stdout.write(`${await response.text()}\n`);
   if (!response.ok) process.exitCode = 1;
 }
