@@ -3,8 +3,9 @@ import { chmod, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { IdentityStore } from "../src/identity.ts";
 import { SecretStore } from "../src/secrets.ts";
+import { JobStore } from "../src/state/store.ts";
 import { atomicWritePrivate, sha256 } from "../src/util.ts";
-import { temporaryDirectory, testConfig, testProfile } from "./helpers.ts";
+import { incomingJob, temporaryDirectory, testConfig, testProfile } from "./helpers.ts";
 
 const PROJECT_ROOT = resolve(import.meta.dir, "..");
 
@@ -150,6 +151,89 @@ describe("Codex doctor 启动前安全门禁", () => {
       expect(serve.stderr).toContain("不会退回 Hermes 或 Codex");
     } finally {
       await state.cleanup();
+    }
+  });
+
+  test("doctor 对异 backend 非终态 backlog 失败且报告可观测明细", async () => {
+    const state = await temporaryDirectory("livis-codex-doctor-inactive-backlog-state-");
+    const external = await temporaryDirectory("livis-codex-doctor-inactive-backlog-command-");
+    try {
+      await chmod(state.path, 0o700);
+      const profile = await testProfile();
+      const profileText = `${JSON.stringify(profile, null, 2)}\n`;
+      const profilePath = join(state.path, "protocol-profiles", "active.json");
+      await atomicWritePrivate(profilePath, profileText);
+      await new SecretStore(state.path).initialize();
+      const identity = await new IdentityStore(state.path, profile).initialize();
+
+      const command = join(external.path, "codex");
+      await writeFile(command, "#!/bin/sh\nprintf 'codex-cli 0.145.0\\n'\n", { mode: 0o700 });
+      const configPath = join(state.path, "config.json");
+      const base = testConfig(state.path);
+      await atomicWritePrivate(configPath, `${JSON.stringify({
+        ...base,
+        profile: profilePath,
+        profileSha256: sha256(profileText),
+        execution: { backend: "codex" },
+        codex: {
+          ...base.codex,
+          command,
+          acknowledgeRemoteExecution: true,
+        },
+      }, null, 2)}\n`);
+
+      const store = new JobStore(
+        join(state.path, "relay.db"),
+        IdentityStore.scopeKey(identity),
+      );
+      try {
+        store.ingest(incomingJob("legacy-hermes-backlog"), "legacy-session", "hermes");
+        store.markAcked("legacy-hermes-backlog");
+      } finally {
+        store.close();
+      }
+
+      const child = Bun.spawn([
+        process.execPath,
+        "run",
+        "src/index.ts",
+        "doctor",
+        "--config",
+        configPath,
+      ], {
+        cwd: PROJECT_ROOT,
+        env: {
+          ...process.env,
+          LIVIS_RELAY_CONFIG: undefined,
+          LIVIS_RELAY_STATE_DIR: undefined,
+        },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ]);
+      const report = JSON.parse(stdout) as {
+        ok: boolean;
+        checks: Array<{ name: string; ok: boolean; detail: string }>;
+      };
+      expect(exitCode).toBe(1);
+      expect(stderr).toBe("");
+      expect(report.ok).toBeFalse();
+      const backlogCheck = report.checks.find((check) =>
+        check.name === "execution_backend_backlog"
+      );
+      expect(backlogCheck).toMatchObject({ ok: false });
+      expect(JSON.parse(backlogCheck!.detail)).toEqual([{
+        backend: "hermes",
+        count: 1,
+        oldestCreatedAt: expect.any(Number),
+      }]);
+    } finally {
+      await Promise.all([state.cleanup(), external.cleanup()]);
     }
   });
 });

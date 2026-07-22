@@ -44,9 +44,10 @@ class FakeCodexBackend implements ExecutionBackend {
 }
 
 interface DaemonInternals {
+  connector: { start(): void };
   executionBackend: ExecutionBackend;
   store: JobStore;
-  relay: { notifyOutboxPending(): Promise<void> };
+  relay: { start(): void; notifyOutboxPending(): Promise<void> };
   dispatchPending(): Promise<void>;
   onExecutionReady(event: ExecutionReadyEvent): Promise<void>;
   onExecutionAccepted(event: ExecutionAcceptedEvent): Promise<void>;
@@ -137,7 +138,71 @@ function enqueue(internals: DaemonInternals, sessionKey: string, jobId: string):
   internals.store.markAcked(jobId);
 }
 
+function seedInactiveHermesTerminal(
+  store: JobStore,
+  status: "Succeeded" | "Failed" | "Cancelled" | "Rejected" | "Interrupted" | "CancelUnknown",
+): void {
+  const jobId = `legacy-hermes-${status.toLowerCase()}`;
+  const connectorId = `legacy-connector-${status.toLowerCase()}`;
+  const leaseId = `legacy-lease-${status.toLowerCase()}`;
+  store.ingest(incomingJob(jobId), `legacy-session-${status.toLowerCase()}`, "hermes");
+  store.markAcked(jobId);
+
+  if (status === "Cancelled") {
+    store.requestCancel(jobId);
+  } else if (status === "Rejected") {
+    store.reject(jobId, JSON.stringify({ text: "legacy rejected" }), "legacy rejection");
+  } else {
+    store.claimForDispatch(jobId, connectorId, leaseId);
+    store.markRunning(jobId, connectorId, leaseId);
+    if (status === "Succeeded") {
+      store.finishSuccess(jobId, leaseId, JSON.stringify({ text: "legacy success" }));
+    } else if (status === "Failed") {
+      store.finishFailure(
+        jobId,
+        leaseId,
+        JSON.stringify({ text: "legacy failure" }),
+        "legacy failure",
+      );
+    } else if (status === "Interrupted") {
+      store.markConnectorDisconnected(connectorId);
+    } else {
+      store.requestCancel(jobId);
+      store.markCancelUnknown(jobId, leaseId, "legacy cancellation unknown");
+    }
+  }
+
+  expect(store.require(jobId).status).toBe(status);
+}
+
 describe("RelayDaemon execution backend 接线", () => {
+  test("异 backend 的全部终态不进入 backlog，也不阻断当前 backend 启动", async () => {
+    const fixture = await daemonFixture("livis-daemon-inactive-backend-terminal-");
+    try {
+      for (const status of [
+        "Succeeded",
+        "Failed",
+        "Cancelled",
+        "Rejected",
+        "Interrupted",
+        "CancelUnknown",
+      ] as const) {
+        seedInactiveHermesTerminal(fixture.internals.store, status);
+      }
+
+      expect(fixture.internals.store.listBackendBacklog()).toEqual([]);
+      // 这里只验证 daemon 的 backend backlog 启动门禁；测试沙箱不允许监听 UDS，
+      // Relay 网络循环也不属于本用例边界。
+      fixture.internals.connector.start = () => undefined;
+      fixture.internals.relay.start = () => undefined;
+      await fixture.daemon.start();
+      expect(fixture.backend.dispatched).toEqual([]);
+      expect(fixture.daemon.status()).toMatchObject({ backendBacklog: [] });
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   test("配置切换遇到旧 backend 非终态 backlog 时启动失败关闭", async () => {
     const fixture = await daemonFixture("livis-daemon-inactive-backend-backlog-");
     try {

@@ -36,7 +36,8 @@ flowchart LR
 - cancel/final 使用 CAS 决定唯一赢家；ambiguous execution 不自动重跑。
 - Hermes connector 只开放权限 `0600` 的 Unix socket，不监听 TCP。
 - `execution.backend` 固定为 Hermes/Codex/Claude 三选一；Claude 尚未实现并在 `doctor`/`serve` 失败关闭，不会回退到其他 backend。
-- Codex 由 daemon 通过 stdio app-server 直接管理；JobStore schema v6 在 v5 的 job 目标 backend 绑定之上，继续固定账号身份强度、请求/实际模型、安全配置、feature 快照和单调 thread-tail checkpoint，配置或 thread 尾部漂移均失败关闭。
+- Codex 由 daemon 通过 stdio app-server 直接管理；当前 JobStore schema v7 以数据库 trigger 强制 `jobs.target_backend` 不可变，在 v6 的账号、模型、安全配置与 thread-tail checkpoint 之上新增 append-only execution attempt 账本。`jobs/outbox` 仍是业务状态真源，`backend_sessions` 只保存可变的当前 session 与恢复锚点。
+- 切换 backend 前必须先用原 backend 排空其 `Received/Acked/Dispatching/Running/Cancelling` 积压；`serve` 会在启动 backend 或 Relay 前拒绝异 backend 非终态 job，`doctor` 的 `execution_backend_backlog` 与 `status.backendBacklog/recentJobs[].latestAttempt` 提供本地观测。终态历史不会阻止切换，未完成的 outbox 投递仍独立恢复。
 - Codex 只在完整 turn deadline 内的 terminal `turn/completed` 后返回一个 agent final；超时先请求 interrupt，再按固定 grace 失败关闭。工具网络关闭、workspace 是唯一可写根，审批请求默认拒绝。
 - Codex app-server 使用 workspace 外的宿主 HOME/TMPDIR，agent 使用 workspace 内独立 HOME/TMPDIR；关闭时按独立 POSIX 进程组执行 `SIGTERM → SIGKILL → 收口确认`。
 - Codex app-server 只在无内存/SQLite active attempt、无 recovery/quarantine 且持久 Store anchor 未漂移的 idle 状态自动恢复；daemon 生命周期累计最多按 `250/1000/5000 ms` 尝试三次，只恢复并回读同一 thread。活动 turn 期间退出仍失败关闭并要求人工处置，绝不自动重放。
@@ -78,7 +79,7 @@ git clone https://github.com/Jassy930/livis-relay-daemon.git && cd livis-relay-d
 
 验证结果必须绑定精确提交，不能沿用 README 中的固定测试数量或旧 canary 结论。当前候选应在精确 staged tree 上运行 `bun run check`；实际测试数量以该次输出为准。
 
-2026-07-18 曾在旧代码基线上留下 Hermes 0.15.1 前台纯文本闭环的高层人工摘要；同期 LaunchAgent 记录也只证明服务存活、online doctor、Relay handshake 与 connector ready。它们都早于后续 protocol profile v2、单设备边界、Relay 资源门禁和 JobStore v3，更早于当前 JobStore v6，且没有绑定当前最终提交的完整 receipt，因此只作历史参考，不能证明当前版本或 launchd 常驻消息闭环已经通过。证据边界和当前验收步骤见 [`docs/HERMES-CANARY.md`](docs/HERMES-CANARY.md)。
+2026-07-18 曾在旧代码基线上留下 Hermes 0.15.1 前台纯文本闭环的高层人工摘要；同期 LaunchAgent 记录也只证明服务存活、online doctor、Relay handshake 与 connector ready。它们都早于后续 protocol profile v2、单设备边界、Relay 资源门禁和 JobStore v3，更早于当前 JobStore v7，且没有绑定当前最终提交的完整 receipt，因此只作历史参考，不能证明当前版本或 launchd 常驻消息闭环已经通过。证据边界和当前验收步骤见 [`docs/HERMES-CANARY.md`](docs/HERMES-CANARY.md)。
 
 Codex 的真实 `thread/start` 安全回读已经命中 workspace-only、无工具网络和审批关闭边界；但由于验证环境的外层 sandbox 无法可靠嵌套 Seatbelt，恶意凭据读取负向 canary 尚未完成。因此 Codex 仍是 Draft/受控开发功能，不应宣称生产上线，完整门禁见 [`docs/CODEX-APPSERVER.md`](docs/CODEX-APPSERVER.md)。
 

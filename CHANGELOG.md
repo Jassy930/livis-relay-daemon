@@ -36,7 +36,9 @@
 
 ### 变更
 
-- 执行后端配置固定为 Hermes/Codex/Claude 三选一；Claude 尚未实现时 `doctor` 与 `serve` 明确失败关闭。JobStore v5 让 job 首次入库即不可变绑定目标 backend，配置切换不再接管旧积压；含待派发 job 的 v4 数据库必须显式声明原始 backend，否则迁移事务回滚。当前 schema v6 继续绑定 Codex 账号身份摘要/强度、请求与实际模型、模型 provider、安全配置 SHA、feature 快照 SHA 和单调 thread-tail checkpoint；旧 v5 session 只有在没有 active/recovery 证据时才允许首次安全补绑。
+- 执行后端配置固定为 Hermes/Codex/Claude 三选一；Claude 尚未实现时 `doctor` 与 `serve` 明确失败关闭。JobStore v5 让 job 首次入库绑定目标 backend，含待派发 job 的 v4 数据库必须显式声明原始 backend；v6 继续绑定 Codex 账号身份摘要/强度、请求与实际模型、模型 provider、安全配置 SHA、feature 快照 SHA 和单调 thread-tail checkpoint，旧 v5 session 只有在没有 active/recovery 证据时才允许首次安全补绑。
+- JobStore schema 升级为 v7：SQLite trigger 强制 `jobs.target_backend` 不可变，并新增拒绝 UPDATE/DELETE 的 `execution_attempt_events` 账本，永久保留 job/backend/session/lease/execution、Codex thread/turn 与 runtime/model/account/安全摘要。v6 active attempt 以 `legacy_active_imported` 导入，不猜测更早历史。
+- backend 切换新增失败关闭门禁：`serve` 在启动 execution backend 或 Relay 前拒绝异 backend 非终态积压；`doctor.execution_backend_backlog`、`status.backendBacklog` 与 `recentJobs[].latestAttempt` 提供观测。终态 job 不阻止切换，outbox 仍独立投递。
 - macOS Relay LaunchAgent 模板补齐显式 `HOME`、可解析 Bun/Hermes 的 `PATH`、10 秒启动节流与 `077` umask；运行手册固定稳定 checkout、Relay/Hermes 双 LaunchAgent 的安装、启停、升级、日志和分层验收，并把历史服务级记录与旧基线测试数量降为参考信息。
 - JobStore schema 升级为 v3；fresh、v1、v2 数据库在取得 SQLite `IMMEDIATE` 写锁后统一裁决并原子迁移，提交前验证 integrity 与 foreign keys，失败时完整回滚。
 - 新增完全离线的 IDaaS / Relay S2 protocol probe、机器可读 wire contract registry、append-only 历史门禁、精确 artifact 发布白名单与严格 fake Relay 场景；当前风险以“观察”记录，不升级为服务端事实。

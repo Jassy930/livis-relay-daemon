@@ -981,6 +981,110 @@ describe("backend session durability", () => {
     )).toBeNull();
   });
 
+  test("execution attempt event 写入失败会回滚 claim、accepted 与 terminal", () => {
+    const jobId = "attempt-event-insert-failure";
+    ensureSession();
+    store.bindBackendThread(backend, sessionKey, "thread-1");
+    store.ingest(incomingJob(jobId), sessionKey, backend);
+    store.markAcked(jobId);
+
+    const installFailure = () => {
+      const database = new Database(databasePath, { strict: true });
+      try {
+        database.exec(`
+          CREATE TRIGGER fail_execution_attempt_event_insert
+          BEFORE INSERT ON execution_attempt_events
+          BEGIN
+            SELECT RAISE(ABORT, 'injected execution attempt event failure');
+          END;
+        `);
+      } finally {
+        database.close();
+      }
+    };
+    const removeFailure = () => {
+      const database = new Database(databasePath, { strict: true });
+      try {
+        database.exec("DROP TRIGGER fail_execution_attempt_event_insert;");
+      } finally {
+        database.close();
+      }
+    };
+
+    installFailure();
+    expect(() => store.claimForBackendDispatch(
+      jobId,
+      backend,
+      "codex:process-1",
+      "lease-1",
+    )).toThrow("injected execution attempt event failure");
+    expect(store.require(jobId)).toMatchObject({
+      status: "Acked",
+      connectorId: null,
+      leaseId: null,
+      runGeneration: 0,
+    });
+    expect(store.getBackendSession(backend, sessionKey)).toMatchObject({
+      activeJobId: null,
+      activeLeaseId: null,
+      activeRunGeneration: null,
+    });
+    expect(store.listExecutionAttemptEvents(jobId)).toEqual([]);
+
+    removeFailure();
+    const claimed = store.claimForBackendDispatch(
+      jobId,
+      backend,
+      "codex:process-1",
+      "lease-1",
+    )!;
+    installFailure();
+    expect(() => store.markBackendRunning(
+      jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-1",
+    )).toThrow("injected execution attempt event failure");
+    expect(store.require(jobId).status).toBe("Dispatching");
+    expect(store.getBackendSession(backend, sessionKey)).toMatchObject({
+      activeJobId: jobId,
+      activeLeaseId: "lease-1",
+      activeRunGeneration: claimed.runGeneration,
+      activeTurnId: null,
+    });
+    expect(store.listExecutionAttemptEvents(jobId).map((event) => event.eventType))
+      .toEqual(["reserved"]);
+
+    removeFailure();
+    store.markBackendRunning(
+      jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-1",
+    );
+    installFailure();
+    expect(() => store.finishBackendSuccess(
+      jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-1",
+      '{"text":"done"}',
+    )).toThrow("injected execution attempt event failure");
+    expect(store.require(jobId)).toMatchObject({ status: "Running", outbox: null });
+    expect(store.getBackendSession(backend, sessionKey)).toMatchObject({
+      activeJobId: jobId,
+      activeLeaseId: "lease-1",
+      activeRunGeneration: claimed.runGeneration,
+      activeTurnId: "turn-1",
+    });
+    expect(store.listExecutionAttemptEvents(jobId).map((event) => event.eventType))
+      .toEqual(["reserved", "accepted"]);
+    removeFailure();
+  });
+
   test("terminal、outbox 与 active attempt 原子提交", () => {
     const claimed = prepareRunningJob();
     store.markBackendRunning(
@@ -1233,6 +1337,50 @@ describe("backend session durability", () => {
       [2, 1, "reserved"],
       [2, 2, "accepted"],
       [2, 3, "failed"],
+    ]);
+  });
+
+  test("execution attempt 默认窗口保留最新 100 条并按时间正序返回", () => {
+    const jobId = "attempt-event-window";
+    let claimed = prepareRunningJob(jobId);
+    for (let generation = 1; generation <= 51; generation += 1) {
+      expect(claimed.runGeneration).toBe(generation);
+      expect(store.resetUnsentBackendDispatch(
+        jobId,
+        backend,
+        `lease-${generation}`,
+        claimed.runGeneration,
+      )).toBeTrue();
+      if (generation < 51) {
+        claimed = store.claimForBackendDispatch(
+          jobId,
+          backend,
+          "codex:process-1",
+          `lease-${generation + 1}`,
+        )!;
+      }
+    }
+
+    const recent = store.listExecutionAttemptEvents(jobId);
+    expect(recent).toHaveLength(100);
+    expect(recent[0]).toMatchObject({
+      runGeneration: 2,
+      sequence: 1,
+      eventType: "reserved",
+    });
+    expect(recent.at(-1)).toMatchObject({
+      runGeneration: 51,
+      sequence: 2,
+      eventType: "not_sent",
+    });
+    expect(store.listExecutionAttemptEvents(jobId, 3).map((event) => [
+      event.runGeneration,
+      event.sequence,
+      event.eventType,
+    ])).toEqual([
+      [50, 2, "not_sent"],
+      [51, 1, "reserved"],
+      [51, 2, "not_sent"],
     ]);
   });
 

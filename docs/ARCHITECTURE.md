@@ -63,8 +63,9 @@ Pending → Delivering → Delivered
 
 `Succeeded` 只表示 Agent final 已持久化；远端完成还要求 outbox 收到 `ack_send_result`。重启时：
 
-- job 首次入库时会把所选 provider 写入不可变的 `jobs.target_backend`；重复投递或后续
-  配置切换都不会改写。未派发 job 只有在当前 backend 与该绑定一致时才可继续派发。
+- job 首次入库时会把所选 provider 写入 `jobs.target_backend`，schema v7 的 SQLite
+  trigger 会拒绝后续改写；重复投递或配置切换都不能重新绑定。未派发 job 只有在当前
+  backend 与该绑定一致时才可继续派发。
 - `Dispatching/Running/Cancelling` 属于 ambiguous execution，不自动重跑。
 - 未 ACK 的结果只重发 outbox，每次生成新的 `msg_id`，保留原 `job_id` 和结果内容。
 
@@ -81,20 +82,34 @@ Pending → Delivering → Delivered
 `Pending`、`Delivering` 或 `AckFailed` 收敛到 `Delivered`；从未投递的结果不接受
 ACK。
 
-JobStore schema v3 曾为 outbox 增加 `next_attempt_at`，schema v4 新增
-`backend_sessions`，schema v5 为每个 job 增加不可变 `target_backend`；当前 schema v6
-又为 Codex session 增加账号身份、请求/实际模型、安全配置与 feature 摘要，以及单调
-thread-tail checkpoint。v1-v3
-数据只可能来自 Hermes，可确定性回填为 `hermes`；v4 已可能来自 Hermes 或 Codex，若
-仍有 `Received/Acked` 积压，迁移必须由操作者用
-`execution.legacyV4JobBackend` 显式声明其原始 backend，否则整笔事务回滚。fresh、v1、v2、
-v3 和 v4 数据库都在
-同一个 `BEGIN IMMEDIATE` 事务内完成版本读取、DDL、旧 `AckFailed` 恢复为
-`Pending`、完整性与外键检查以及最终版本提交。版本裁决发生在取得写锁之后，避免
-两个 opener 同时按旧版本迁移；任一步失败会回滚全部 DDL/DML 和
-`PRAGMA user_version`。v5 旧 session 只有在没有 active attempt、recovery 或 quarantine
-时，才允许在真实 app-server 安全回读后一次性补绑 v6 元数据；不能仅靠数据库迁移猜测
-账号、模型或 thread 尾部。
+JobStore schema v3 曾为 outbox 增加 `next_attempt_at`，schema v4 新增可变的
+`backend_sessions`，schema v5 为每个 job 增加 `target_backend`，schema v6 为 Codex
+session 增加账号身份、请求/实际模型、安全配置与 feature 摘要，以及单调 thread-tail
+checkpoint。当前 schema v7 再以 trigger 强制 `jobs.target_backend` 不可变，并新增
+`execution_attempt_events` append-only 账本。三类状态职责必须分开理解：
+
+- `jobs` 与 `outbox` 是执行裁决和结果投递的业务真源；
+- `backend_sessions` 是可更新的当前 session、active attempt 与 recovery anchor，不能
+  代替永久历史；
+- `execution_attempt_events` 永久记录 `reserved/accepted/not_sent/cancelled_not_sent/`
+  `succeeded/failed/cancel_unknown/interrupted/legacy_active_imported`，并绑定 job、backend、
+  session、lease、execution、Codex thread/turn 以及可得的 runtime、model、account、
+  安全配置与 feature 摘要；UPDATE/DELETE 均由 SQLite trigger 拒绝。
+
+fresh 数据库直接创建为 v7，v1-v6 数据库都在同一个 `BEGIN IMMEDIATE` 事务内完成版本
+读取、DDL、旧 `AckFailed` 恢复为 `Pending`、完整性与外键检查以及最终版本提交。版本
+裁决发生在取得写锁之后，避免两个 opener 同时按旧版本迁移；任一步失败会回滚全部
+DDL/DML 和 `PRAGMA user_version`。v1-v3 数据只可能来自 Hermes，可确定性回填为
+`hermes`；v4 已可能来自 Hermes 或 Codex，若仍有 `Received/Acked` 积压，迁移必须由
+操作者用 `execution.legacyV4JobBackend` 声明其原始 backend。v5 旧 session 只有在没有
+active attempt、recovery 或 quarantine 时，才允许在真实 app-server 安全回读后一次性
+补绑 v6 元数据；v6→v7 会把当时可证明的 active attempt 作为
+`legacy_active_imported` 导入，不猜测更早事件，也不把 ambiguous execution 变成可重试。
+
+backend 切换只允许发生在其他 backend 没有 `Received/Acked/Dispatching/Running/`
+`Cancelling` job 时。`serve` 在启动 execution backend 和 Relay 前失败关闭；终态
+`Succeeded/Failed/Cancelled/Rejected/Interrupted/CancelUnknown` 不阻止切换，残留 outbox
+仍由独立投递状态机继续处理。
 
 取消意图在 SQLite `IMMEDIATE` 事务内按当前状态原子转移：`Received/Acked` 可直接进入 `Cancelled`，`Dispatching/Running` 只能进入 `Cancelling`。重复 cancel 保持 `Cancelling`，迟到 cancel 不会回退 `Interrupted` 或任何终态；Hermes connector 确认已发出 `/stop`，或 Codex app-server 接受 `turn/interrupt`，都不能证明工具副作用已经停止，daemon 仍须记录 `CancelUnknown` 并隔离 session。
 

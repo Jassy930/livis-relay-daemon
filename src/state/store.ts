@@ -1896,13 +1896,20 @@ export class JobStore {
       });
   }
 
+  /**
+   * 返回最近的 limit 条 execution attempt 事件，并保持从旧到新的时间顺序。
+   * 超过窗口的更旧事件会被截断，最新 attempt 不会因默认上限而被隐藏。
+   */
   listExecutionAttemptEvents(jobId: string, limit = 100): StoredExecutionAttemptEvent[] {
     return this.database
       .query<ExecutionAttemptEventRow, [string, string, number]>(`
-        SELECT * FROM execution_attempt_events
-        WHERE scope_key=? AND job_id=?
+        SELECT * FROM (
+          SELECT * FROM execution_attempt_events
+          WHERE scope_key=? AND job_id=?
+          ORDER BY run_generation DESC,sequence DESC
+          LIMIT ?
+        ) recent_events
         ORDER BY run_generation ASC,sequence ASC
-        LIMIT ?
       `)
       .all(this.scopeKey, jobId, limit)
       .map(rowToExecutionAttemptEvent);
