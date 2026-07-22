@@ -32,7 +32,7 @@
 
 - state directory：`0700`。
 - connector socket、配置、身份、secret、proof、candidate 与审批回执：`0600`。
-- schema v1→v2 迁移新建的私有目录会在 fsync 前显式固定并精确读回 `0700`；若上次进程在 `mkdir` 与固定权限之间退出，重试会受控修复只缺 owner 权限的已有目录。durable 临时文件与两类 guard 会在各自创建 fd 上显式固定并精确读回 `0600` 后才写入、同步或 rename。不能只依赖 `mkdir` / `open` 的 mode 参数，因为进程 umask 仍可能移除 owner 权限。
+- schema v1→v2 迁移和 supported-proof writer 新建的私有目录会在 fsync 前显式固定并精确读回 `0700`；若上次进程在 `mkdir` 与固定权限之间退出，重试会受控修复只缺 owner 权限的已有目录。durable 临时文件与两类 guard 会在各自创建 fd 上显式固定并精确读回 `0600` 后才写入、同步或 rename。不能只依赖 `mkdir` / `open` 的 mode 参数，因为进程 umask 仍可能移除 owner 权限。
 - `config.connector.socketPath` 的父目录必须是 state directory 内的私有非 symlink 目录；profile 迁移会在该路径创建并持久化普通文件 guard。创建 fd 会保持打开到安全 release，以固定原 inode，并与当前路径交叉复核 dev/inode、link count、文件类型、权限和 nonce；父目录的类型、私有权限与 realpath 也会在每次所有权检查和 release 完成前重验。位于 `/tmp` 等共享目录或 state directory 外的 socket 不属于迁移支持边界。
 - connector 使用至少 32 字节随机 Bearer token，并做常量时间比较。
 - refresh token 只在 daemon state directory 持久化，不进入 SQLite、argv、普通日志或 Git。当前 v2.0.0 兼容基线仍会把它复制进 Relay `connect` / `token_refresh` 帧：历史高层 canary 发生在旧代码基线，但没有字段级 receipt，也不证明服务端要求该字段；这是待收口的显式安全例外。目标是 Relay 只接收短期 access token，但在真实 Relay canary 前不得宣称兼容，也不得设置静默泄露回退。证据和门禁见[服务端协议边界](LIVIS-RELAY-PROTOCOL-BOUNDARY.md)。
@@ -46,8 +46,8 @@
 - 三份原始 artifact 按 SHA-256 保存，供候选审阅复现。
 - supported proof 与 active profile ID/SHA、runtime contract SHA、wire revision、credential mode、artifact URL/哈希和 marker 绑定，有效期 24 小时；旧 proof 失败关闭。
 - schema v1→v2 迁移和回滚会把 old SHA、new SHA 与 `last-supported` proof 持久化移入 0700 私有 quarantine，永不自动恢复；两条方向都必须重新在线生成 proof。apply 以 config durable rename 为唯一提交点；回滚通常同样提交 config，但已生效 fallback 的自愈以 fallback profile durable rename 为提交点，且 proof 必须先隔离。receipt/backups 会重新构造并核对完整 source→target 关系，PREPARED/备份与 target/fallback profile 均为 0600，命令不打开 SQLite。
-- migration、upstream 管理命令、`login` proof 刷新和 `serve` 启动共享 profile operation guard，并在持锁后加载完整 context；外部编辑器与 `init` 不受该协作锁约束，停服迁移期间仍必须禁止它们写 config/profile。rename 后父目录 fsync 未确认时会保留 guard 并要求人工按 receipt/SHA 恢复，不得按当前可见内容自动放行。
-- daemon 每 6 小时复核；确认 drift/unknown 后停止新 job 并断开 LiViS。暂时网络失败只允许使用尚未过期的 proof。
+- migration、upstream 管理命令、`login` proof 刷新、`serve` 启动和 daemon 周期 proof writer 共享 profile operation guard；CLI 在持锁后加载完整 context，daemon 写入前后验证同一 guard 仍属于当前 state directory。外部编辑器与 `init` 不受该协作锁约束，停服迁移期间仍必须禁止它们写 config/profile。rename 后父目录 fsync 未确认时会保留 guard 并要求人工按 receipt/SHA 恢复，不得按当前可见内容自动放行。
+- daemon 每 6 小时主动复核，但 `expiresAt` 是独立的绝对硬门禁：one-shot deadline、Relay admission 与 dispatch 都同步检查，到期即停止 ingest/ACK/claim/send 并断开 LiViS；timer 延迟、guard busy 或暂时网络失败都不能延长 proof。Relay 停止失败时 blocker 持续有效并允许后续入口重试 stop；恢复路径等待完整停止后会再次检查新 proof，等待期间跨期不得清除 blocker、重连或派发。停止 daemon 会等待在途复核和关门，返回后不得再写 proof、重连或派发。
 
 ## 认证生命周期
 

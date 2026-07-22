@@ -13,7 +13,14 @@ import {
 import { join } from "node:path";
 import { ConnectorServer, type ConnectorServerHandlers } from "../src/connector/server.ts";
 import { Logger } from "../src/logger.ts";
-import { DaemonOfflineGuard, ProfileOperationGuard } from "../src/state/offline-guard.ts";
+import {
+  DaemonOfflineGuard,
+  ProfileOperationCleanupError,
+  ProfileOperationGuard,
+  ProfileOperationGuardFinalizationError,
+  rethrowAfterProfileOperationCleanup,
+  withProfileOperationGuardRelease,
+} from "../src/state/offline-guard.ts";
 import { temporaryDirectory } from "./helpers.ts";
 
 async function runBunEval(script: string, label: string): Promise<void> {
@@ -181,6 +188,108 @@ describe("离线与 profile 操作 guard", () => {
       await guard.assertHeld();
       await guard.release();
     }
+  });
+
+  test("work 与 guard release 同时失败时保留主错误、顺序和 fail-closed guard", async () => {
+    const guard = await ProfileOperationGuard.acquire(directory.path, "upstream-activate");
+    const primaryError = new Error(
+      `profile 激活失败；配置备份：${join(directory.path, "config-backups", "backup.json")}`,
+    );
+    let failure: unknown;
+    try {
+      await withProfileOperationGuardRelease(guard, "upstream activate", async () => {
+        await chmod(guard.path, 0o400);
+        throw primaryError;
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(ProfileOperationGuardFinalizationError);
+    const aggregate = failure as ProfileOperationGuardFinalizationError;
+    expect(aggregate.errors[0]).toBe(primaryError);
+    expect(aggregate.errors[1]).toBeInstanceOf(Error);
+    expect(aggregate.message).toContain(primaryError.message);
+    expect(aggregate.message).toContain(guard.path);
+    expect(aggregate.message).toContain("类型、权限或 inode 已变化");
+    expect(await Bun.file(guard.path).exists()).toBeTrue();
+
+    await chmod(guard.path, 0o600);
+    await guard.release();
+  });
+
+  test("work 成功但 guard release 失败时原样报告 release 错误", async () => {
+    const guard = await ProfileOperationGuard.acquire(directory.path, "upstream-rollback");
+    let failure: unknown;
+    try {
+      await withProfileOperationGuardRelease(guard, "upstream rollback", async () => {
+        await chmod(guard.path, 0o400);
+        return "ok";
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(ProfileOperationGuardFinalizationError);
+    expect((failure as Error).message).toContain("类型、权限或 inode 已变化");
+    expect(await Bun.file(guard.path).exists()).toBeTrue();
+
+    await chmod(guard.path, 0o600);
+    await guard.release();
+  });
+
+  test("serve 启动的同步 stop 与异步 guard release 失败按固定顺序聚合", async () => {
+    const primaryError = new Error("synthetic serve startup failure");
+    const stopError = new Error("synthetic synchronous daemon stop failure");
+    const releaseError = new Error("synthetic asynchronous guard release failure");
+    const cleanupOrder: string[] = [];
+    let failure: unknown;
+    try {
+      await rethrowAfterProfileOperationCleanup("serve 启动", primaryError, [
+        {
+          label: "daemon stop",
+          run: () => {
+            cleanupOrder.push("daemon stop");
+            throw stopError;
+          },
+        },
+        {
+          label: "profile operation guard release",
+          run: async () => {
+            cleanupOrder.push("profile operation guard release");
+            throw releaseError;
+          },
+        },
+      ]);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(cleanupOrder).toEqual(["daemon stop", "profile operation guard release"]);
+    expect(failure).toBeInstanceOf(ProfileOperationCleanupError);
+    const aggregate = failure as ProfileOperationCleanupError;
+    expect(aggregate.errors).toEqual([primaryError, stopError, releaseError]);
+    expect(aggregate.cleanupFailures.map(({ label }) => label)).toEqual([
+      "daemon stop",
+      "profile operation guard release",
+    ]);
+    expect(aggregate.message).toContain(primaryError.message);
+  });
+
+  test("serve 启动清理全部成功时原样抛出 primary error", async () => {
+    const primaryError = new Error("synthetic primary only");
+    let failure: unknown;
+    try {
+      await rethrowAfterProfileOperationCleanup("serve 启动", primaryError, [
+        { label: "daemon stop", run: () => undefined },
+        { label: "profile operation guard release", run: async () => undefined },
+      ]);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBe(primaryError);
   });
 
   test("release 只删除 nonce 属于自己的 guard", async () => {

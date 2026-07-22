@@ -44,6 +44,17 @@ bun run src/index.ts upstream check
 
 只有输出 `compatibility: "supported"` 且 exit code 为 0，才会生成 active profile 的 supported proof。检查只下载并静态读取 artifact，不执行官方脚本。
 
+CLI、`serve` 启动和 daemon 六小时周期复核都通过 state directory 中同一个
+`profile-operation.guard` 写 proof。周期复核若恰逢激活、回滚或其他 proof writer
+持锁，proof 尚未过期时会记录并跳过本轮；到达 proof 的绝对 `expiresAt` 后，daemon
+会在 admission 与 dispatch 同步关闭门禁，即使 one-shot timer 延迟也不会继续接收、
+ACK、claim 或 send。Relay 停止失败不会开放门禁，后续入站、派发或复核会重试停止。
+
+不要为消除“guard 已存在”而删除文件；先确认是否有活跃命令，崩溃遗留 guard 按升级
+runbook 的 inode/nonce 流程处理。`serve` 启动失败若同时发生 daemon stop 或 guard
+release 错误，日志会按主错误、stop、release 顺序聚合；必须先处理最前面的主错误，
+并保留无法安全释放的 guard 作为 fail-closed 证据。
+
 ## 5. 登录 LiViS
 
 ```bash

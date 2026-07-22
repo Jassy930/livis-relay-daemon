@@ -15,7 +15,13 @@ import {
   type ProtocolProfile,
 } from "./protocol/profile.ts";
 import { SecretStore } from "./secrets.ts";
-import { ProfileOperationGuard, type ProfileOperation } from "./state/offline-guard.ts";
+import {
+  ProfileOperationGuard,
+  rethrowAfterProfileOperationCleanup,
+  rethrowAfterProfileOperationGuardRelease,
+  withProfileOperationGuardRelease,
+  type ProfileOperation,
+} from "./state/offline-guard.ts";
 import { JobStore } from "./state/store.ts";
 import { UpstreamChecker, buildCandidateProfile } from "./upstream/checker.ts";
 import { activateReviewedProfile, rollbackProfileConfig } from "./upstream/activation.ts";
@@ -86,8 +92,11 @@ async function loadProfileOperationContext(
     }
     return { context, guard };
   } catch (error) {
-    await guard.release();
-    throw error;
+    return rethrowAfterProfileOperationGuardRelease(
+      guard,
+      `加载 ${operation} 上下文`,
+      error,
+    );
   }
 }
 
@@ -159,6 +168,7 @@ async function commandConnectorToken(args: string[]): Promise<void> {
 
 async function refreshOrRequireSupportedProof(
   context: Awaited<ReturnType<typeof loadContext>>,
+  guard: ProfileOperationGuard,
 ): Promise<SupportedUpstreamProof> {
   let snapshot;
   try {
@@ -183,16 +193,16 @@ async function refreshOrRequireSupportedProof(
     profile: context.profile,
     profileSha256: context.config.profileSha256,
     snapshot,
-  })).proof;
+  }, guard)).proof;
 }
 
 async function commandLogin(args: string[]): Promise<void> {
   const { context, guard } = await loadProfileOperationContext(args, "login");
-  try {
+  await withProfileOperationGuardRelease(guard, "login", async () => {
     if (!context.config.security.acknowledgeUnofficialProtocol) {
       throw new Error("登录前必须确认第三方兼容协议边界");
     }
-    await refreshOrRequireSupportedProof(context);
+    await refreshOrRequireSupportedProof(context, guard);
     const auth = new IdaasClient(context.profile, context.secrets);
     const deviceCode = await auth.requestDeviceCode(hasFlag(args, "--force"));
     process.stdout.write(`请在浏览器完成登录：\n${deviceCode.verification_uri_complete}\n`);
@@ -207,9 +217,7 @@ async function commandLogin(args: string[]): Promise<void> {
       onPending: () => process.stdout.write("."),
     });
     process.stdout.write(`\n登录成功。LiViS Agent ID：${context.identity.agentId}\n`);
-  } finally {
-    await guard.release();
-  }
+  });
 }
 
 async function commandLogout(args: string[]): Promise<void> {
@@ -222,7 +230,7 @@ async function commandServe(args: string[]): Promise<void> {
   const { context, guard } = await loadProfileOperationContext(args, "serve-start");
   let daemon: RelayDaemon | null = null;
   try {
-    const upstreamProof = await refreshOrRequireSupportedProof(context);
+    const upstreamProof = await refreshOrRequireSupportedProof(context, guard);
     daemon = RelayDaemon.create({
       config: context.config,
       profile: context.profile,
@@ -232,24 +240,35 @@ async function commandServe(args: string[]): Promise<void> {
       upstreamProofExpiresAt: Date.parse(upstreamProof.expiresAt),
     });
     daemon.start();
-  } catch (error) {
-    if (daemon) await daemon.stop().catch(() => undefined);
-    await guard.release();
-    throw error;
+  } catch (primaryError) {
+    return rethrowAfterProfileOperationCleanup(
+      "serve 启动",
+      primaryError,
+      [
+        ...(daemon
+          ? [{ label: "daemon stop", run: () => daemon!.stop() }]
+          : []),
+        { label: "profile operation guard release", run: () => guard.release() },
+      ],
+    );
   }
   if (!daemon) throw new Error("daemon 启动状态异常");
+  const runningDaemon = daemon;
   try {
     await guard.release();
-  } catch (error) {
-    await daemon.stop();
-    throw error;
+  } catch (primaryError) {
+    return rethrowAfterProfileOperationCleanup(
+      "serve 启动阶段释放 profile operation guard",
+      primaryError,
+      [{ label: "daemon stop", run: () => runningDaemon.stop() }],
+    );
   }
-  await new Promise<void>((resolvePromise) => {
+  await new Promise<void>((resolvePromise, rejectPromise) => {
     let stopping = false;
     const stop = () => {
       if (stopping) return;
       stopping = true;
-      void daemon.stop().finally(resolvePromise);
+      void runningDaemon.stop().then(resolvePromise, rejectPromise);
     };
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
@@ -258,7 +277,7 @@ async function commandServe(args: string[]): Promise<void> {
 
 async function commandUpstreamCheck(args: string[]): Promise<void> {
   const { context, guard } = await loadProfileOperationContext(args, "upstream-check");
-  try {
+  await withProfileOperationGuardRelease(guard, "upstream check", async () => {
     const profileDirectory = dirname(resolveProfilePath(context.config.profile, context.path));
     const catalog = await loadProfileCatalog([profileDirectory, BUILTIN_PROFILE_DIRECTORY]);
     const artifactDirectory = join(context.config.stateDir, "upstream-artifacts", "sha256");
@@ -289,7 +308,7 @@ async function commandUpstreamCheck(args: string[]): Promise<void> {
         profile: context.profile,
         profileSha256: context.config.profileSha256,
         snapshot,
-      })
+      }, guard)
       : null;
     process.stdout.write(`${JSON.stringify({
       ...snapshot,
@@ -301,9 +320,7 @@ async function commandUpstreamCheck(args: string[]): Promise<void> {
     if (snapshot.compatibility !== "supported") {
       process.exitCode = 2;
     }
-  } finally {
-    await guard.release();
-  }
+  });
 }
 
 async function commandUpstreamActivate(args: string[]): Promise<void> {
@@ -314,7 +331,7 @@ async function commandUpstreamActivate(args: string[]): Promise<void> {
   if (!candidatePathRaw) throw new Error("用法：upstream activate --profile PATH --acknowledge-reviewed-profile");
   const candidatePath = expandHome(candidatePathRaw);
   const { context, guard } = await loadProfileOperationContext(args, "upstream-activate");
-  try {
+  await withProfileOperationGuardRelease(guard, "upstream activate", async () => {
     const candidateProfile = parseProtocolProfile(await Bun.file(candidatePath).text(), candidatePath);
     const liveSnapshot = await new UpstreamChecker().check(candidateProfile, [candidateProfile]);
     const activated = await activateReviewedProfile({
@@ -331,7 +348,7 @@ async function commandUpstreamActivate(args: string[]): Promise<void> {
       profile: candidateProfile,
       profileSha256: activated.receipt.activated.profileSha256,
       snapshot: liveSnapshot,
-    });
+    }, guard);
     process.stdout.write(`${JSON.stringify({
       ok: true,
       activatedProfile: activated.receipt.activated,
@@ -341,9 +358,7 @@ async function commandUpstreamActivate(args: string[]): Promise<void> {
       supportedProofPath: supportedProof.path,
       restartRequired: true,
     }, null, 2)}\n`);
-  } finally {
-    await guard.release();
-  }
+  });
 }
 
 async function commandUpstreamRollback(args: string[]): Promise<void> {
