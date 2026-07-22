@@ -19,6 +19,7 @@ import {
   durableMkdirPrivate,
   durableRename,
   durableUnlink,
+  acquirePrivateFileTextLease,
   parseJsonObject,
   readOptionalPrivateFileText,
   readPrivateFileText as readVerifiedPrivateText,
@@ -893,15 +894,9 @@ export async function rollbackProfileConfig(options: {
     throw new Error("备份配置属于不同 stateDir，拒绝恢复");
   }
   const restoredProfilePath = resolveProfilePath(backupConfig.profile, options.configPath);
-  const restoredProfileInfo = await lstat(restoredProfilePath);
-  const restoredProfileIdentity = {
-    dev: restoredProfileInfo.dev,
-    ino: restoredProfileInfo.ino,
-  };
   const restoredProfileText = await readVerifiedPrivateText(
     restoredProfilePath,
     "待恢复 profile",
-    restoredProfileIdentity,
   );
   if (sha256(restoredProfileText) !== backupConfig.profileSha256) {
     throw new Error("待恢复 profile 内容 SHA 与配置备份不一致");
@@ -934,8 +929,19 @@ export async function rollbackProfileConfig(options: {
     `.${basename(options.configPath)}.${operationId}.rollback-staged`,
   );
   let stagingLease: PrivateStagingFileLease | null = null;
+  let restoredProfileLease: Awaited<ReturnType<typeof acquirePrivateFileTextLease>> | null = null;
   let configCommitAttempted = false;
   try {
+    restoredProfileLease = await acquirePrivateFileTextLease(
+      restoredProfilePath,
+      "待恢复 profile",
+    );
+    if (
+      sha256(restoredProfileLease.text) !== backupConfig.profileSha256 ||
+      parseProtocolProfile(restoredProfileLease.text, restoredProfilePath).id !== restoredProfile.id
+    ) {
+      throw new Error("待恢复 profile 在回滚 staging 前发生变化，拒绝继续");
+    }
     stagingLease = await createPrivateStagingFile({
       path: stagingPath,
       text: rollbackConfigText,
@@ -958,7 +964,7 @@ export async function rollbackProfileConfig(options: {
     const commitRestoredProfileText = await readVerifiedPrivateText(
       restoredProfilePath,
       "待恢复 profile",
-      restoredProfileIdentity,
+      restoredProfileLease.identity,
     );
     if (
       sha256(commitRestoredProfileText) !== backupConfig.profileSha256 ||
@@ -1033,6 +1039,9 @@ export async function rollbackProfileConfig(options: {
   } finally {
     if (stagingLease) {
       await releasePrivateStagingFile(stagingLease).catch(() => undefined);
+    }
+    if (restoredProfileLease) {
+      await restoredProfileLease.handle.close().catch(() => undefined);
     }
   }
 }

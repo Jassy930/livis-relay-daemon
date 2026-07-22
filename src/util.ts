@@ -19,6 +19,13 @@ export interface PrivateFileIdentity {
   ino: number;
 }
 
+export interface PrivateFileTextLease {
+  path: string;
+  text: string;
+  identity: PrivateFileIdentity;
+  handle: FileHandle;
+}
+
 function assertPrivateFileInfo(
   info: Stats,
   path: string,
@@ -37,11 +44,11 @@ function assertPrivateFileInfo(
   }
 }
 
-export async function readPrivateFileText(
+export async function acquirePrivateFileTextLease(
   path: string,
   label: string,
   expectedIdentity?: PrivateFileIdentity,
-): Promise<string> {
+): Promise<PrivateFileTextLease> {
   const absolutePath = resolve(path);
   const pathInfo = await lstat(absolutePath);
   assertPrivateFileInfo(pathInfo, absolutePath, label, expectedIdentity);
@@ -58,9 +65,28 @@ export async function readPrivateFileText(
     const text = await handle.readFile("utf8");
     assertPrivateFileInfo(await handle.stat(), absolutePath, label, openedInfo);
     assertPrivateFileInfo(await lstat(absolutePath), absolutePath, label, openedInfo);
-    return text;
+    return {
+      path: absolutePath,
+      text,
+      identity: { dev: openedInfo.dev, ino: openedInfo.ino },
+      handle,
+    };
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function readPrivateFileText(
+  path: string,
+  label: string,
+  expectedIdentity?: PrivateFileIdentity,
+): Promise<string> {
+  const lease = await acquirePrivateFileTextLease(path, label, expectedIdentity);
+  try {
+    return lease.text;
   } finally {
-    await handle.close();
+    await lease.handle.close();
   }
 }
 
