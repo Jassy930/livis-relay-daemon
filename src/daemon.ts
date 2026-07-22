@@ -231,6 +231,16 @@ export class RelayDaemon {
         "尚未确认通过 Codex 远程执行 LiViS 请求；请审阅安全边界后设置 codex.acknowledgeRemoteExecution=true",
       );
     }
+    const inactiveBacklog = this.store
+      .listBackendBacklog()
+      .filter((item) => item.backend !== this.executionBackend.kind);
+    if (inactiveBacklog.length > 0) {
+      throw new Error(
+        `检测到不属于当前 ${this.executionBackend.kind} backend 的非终态 job：` +
+        `${inactiveBacklog.map((item) => `${item.backend}=${item.count}`).join(", ")}；` +
+        "拒绝静默搁置或改绑，必须先切回原 backend 排空并按运维手册复核",
+      );
+    }
     const recovery = this.store.recoverAfterRestart();
     this.logger.info("SQLite 恢复完成", recovery);
     if (this.executionBackend.kind === "codex") {
@@ -286,6 +296,7 @@ export class RelayDaemon {
   }
 
   status(): Record<string, unknown> {
+    const backendBacklog = this.store.listBackendBacklog();
     return {
       version: DAEMON_VERSION,
       upstream: {
@@ -295,6 +306,7 @@ export class RelayDaemon {
       },
       relay: this.relay.status(),
       execution: this.executionBackend.status(),
+      backendBacklog,
       connector: {
         ready: this.connector.ready,
         connectorId: this.connector.connectorId,
@@ -302,6 +314,20 @@ export class RelayDaemon {
       },
       quarantinedSessions: this.store.listQuarantinedSessions(),
       recentJobs: this.store.listRecent(20).map((job) => ({
+        latestAttempt: (() => {
+          const event = this.store.latestExecutionAttemptEvent(job.jobId);
+          return event
+            ? {
+                runGeneration: event.runGeneration,
+                sequence: event.sequence,
+                backend: event.backend,
+                providerSessionId: event.providerSessionId,
+                providerOperationId: event.providerOperationId,
+                eventType: event.eventType,
+                createdAt: event.createdAt,
+              }
+            : null;
+        })(),
         jobId: job.jobId,
         targetBackend: job.targetBackend,
         status: job.status,

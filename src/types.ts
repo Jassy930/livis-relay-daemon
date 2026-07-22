@@ -24,6 +24,21 @@ export type JobStatus =
 
 export type OutboxStatus = "Pending" | "Delivering" | "Delivered" | "AckFailed";
 
+/**
+ * 单次执行 attempt 的 append-only 审计事件。事件只记录已经持久提交的事实，
+ * 不参与自动重放或状态裁决。
+ */
+export type ExecutionAttemptEventType =
+  | "reserved"
+  | "accepted"
+  | "not_sent"
+  | "cancelled_not_sent"
+  | "succeeded"
+  | "failed"
+  | "cancel_unknown"
+  | "interrupted"
+  | "legacy_active_imported";
+
 /** 只有已经稳定落盘的 terminal turn 才能成为恢复 checkpoint。 */
 export type BackendCheckpointTurnStatus = "completed" | "failed" | "interrupted";
 
@@ -86,6 +101,43 @@ export interface StoredOutbox {
   updatedAt: number;
   deliveredAt: number | null;
   ackedAt: number | null;
+}
+
+/**
+ * job → backend session → provider operation 的永久审计映射。
+ *
+ * Codex 当前把 thread/turn 分别写入 providerSessionId/providerOperationId；
+ * Hermes connector v1 没有等价的 provider-native 标识，因此对应字段可以为空。
+ */
+export interface StoredExecutionAttemptEvent {
+  scopeKey: string;
+  jobId: string;
+  runGeneration: number;
+  sequence: number;
+  backend: ExecutionBackendKind;
+  sessionKey: string;
+  leaseId: string;
+  backendExecutionId: string;
+  providerSessionId: string | null;
+  providerOperationId: string | null;
+  runtimeVersion: string | null;
+  requestedModel: string | null;
+  effectiveModel: string | null;
+  modelProvider: string | null;
+  accountType: string | null;
+  accountSubjectSha256: string | null;
+  securityConfigSha256: string | null;
+  featureSnapshotSha256: string | null;
+  eventType: ExecutionAttemptEventType;
+  reason: string | null;
+  createdAt: number;
+}
+
+/** 尚未进入终态、仍会影响 backend 切换的 durable job 汇总。 */
+export interface BackendBacklogCount {
+  backend: ExecutionBackendKind;
+  count: number;
+  oldestCreatedAt: number;
 }
 
 /**

@@ -45,6 +45,7 @@ interface DatabaseHealth {
   outboxColumns: string[];
   backendSessionColumns: string[];
   jobColumns: string[];
+  executionAttemptEventColumns: string[];
 }
 
 function databaseHealth(databasePath: string): DatabaseHealth {
@@ -67,15 +68,27 @@ function databaseHealth(databasePath: string): DatabaseHealth {
       .query<{ name: string }, []>("PRAGMA table_info(jobs)")
       .all()
       .map((column) => column.name);
-    return { version, integrity, foreignKeyViolations, outboxColumns, backendSessionColumns, jobColumns };
+    const executionAttemptEventColumns = database
+      .query<{ name: string }, []>("PRAGMA table_info(execution_attempt_events)")
+      .all()
+      .map((column) => column.name);
+    return {
+      version,
+      integrity,
+      foreignKeyViolations,
+      outboxColumns,
+      backendSessionColumns,
+      jobColumns,
+      executionAttemptEventColumns,
+    };
   } finally {
     database.close();
   }
 }
 
-function expectHealthyV6(databasePath: string): void {
+function expectHealthyV7(databasePath: string): void {
   const health = databaseHealth(databasePath);
-  expect(health.version).toBe(6);
+  expect(health.version).toBe(7);
   expect(health.integrity).toBe("ok");
   expect(health.foreignKeyViolations).toEqual([]);
   expect(health.outboxColumns).toContain("next_attempt_at");
@@ -86,7 +99,17 @@ function expectHealthyV6(databasePath: string): void {
   expect(health.backendSessionColumns).toContain("checkpoint_turn_count");
   expect(health.backendSessionColumns).toContain("checkpoint_turns_sha256");
   expect(health.jobColumns).toContain("target_backend");
+  expect(health.executionAttemptEventColumns).toContain("provider_session_id");
+  expect(health.executionAttemptEventColumns).toContain("provider_operation_id");
+  expect(health.executionAttemptEventColumns).toContain("event_type");
 }
+
+const DROP_V7_EXECUTION_ATTEMPTS = `
+  DROP TRIGGER execution_attempt_events_no_update;
+  DROP TRIGGER execution_attempt_events_no_delete;
+  DROP TABLE execution_attempt_events;
+  DROP TRIGGER jobs_target_backend_immutable;
+`;
 
 const DROP_V6_BACKEND_METADATA = `
   DROP TRIGGER backend_sessions_v6_metadata_insert_required;
@@ -117,21 +140,28 @@ const DROP_V5_JOB_BACKEND = `
   CREATE INDEX idx_jobs_dispatch ON jobs(scope_key,status,cancel_requested,session_key,created_at);
 `;
 
+function downgradeV7ToV6(databasePath: string): void {
+  const database = new Database(databasePath, { strict: true });
+  database.exec(`${DROP_V7_EXECUTION_ATTEMPTS} PRAGMA user_version=6;`);
+  database.close();
+}
+
 function downgradeV6ToV5(databasePath: string): void {
   const database = new Database(databasePath, { strict: true });
-  database.exec(`${DROP_V6_BACKEND_METADATA} PRAGMA user_version=5;`);
+  database.exec(`${DROP_V7_EXECUTION_ATTEMPTS} ${DROP_V6_BACKEND_METADATA} PRAGMA user_version=5;`);
   database.close();
 }
 
 function downgradeV6ToV4(databasePath: string): void {
   const database = new Database(databasePath, { strict: true });
-  database.exec(`${DROP_V6_BACKEND_METADATA} ${DROP_V5_JOB_BACKEND} PRAGMA user_version=4;`);
+  database.exec(`${DROP_V7_EXECUTION_ATTEMPTS} ${DROP_V6_BACKEND_METADATA} ${DROP_V5_JOB_BACKEND} PRAGMA user_version=4;`);
   database.close();
 }
 
 function downgradeV4ToV2(databasePath: string): void {
   const database = new Database(databasePath, { strict: true });
   database.exec(`
+    ${DROP_V7_EXECUTION_ATTEMPTS}
     ${DROP_V6_BACKEND_METADATA}
     ${DROP_V5_JOB_BACKEND}
     DROP TABLE backend_sessions;
@@ -147,6 +177,7 @@ function downgradeV4ToV2(databasePath: string): void {
 function downgradeV4ToV1(databasePath: string): void {
   const database = new Database(databasePath, { strict: true });
   database.exec(`
+    ${DROP_V7_EXECUTION_ATTEMPTS}
     ${DROP_V6_BACKEND_METADATA}
     ${DROP_V5_JOB_BACKEND}
     DROP TABLE backend_sessions;
@@ -162,7 +193,7 @@ function downgradeV4ToV1(databasePath: string): void {
 
 function downgradeV4ToV3(databasePath: string): void {
   const database = new Database(databasePath, { strict: true });
-  database.exec(`${DROP_V6_BACKEND_METADATA} ${DROP_V5_JOB_BACKEND} DROP TABLE backend_sessions; PRAGMA user_version=3;`);
+  database.exec(`${DROP_V7_EXECUTION_ATTEMPTS} ${DROP_V6_BACKEND_METADATA} ${DROP_V5_JOB_BACKEND} DROP TABLE backend_sessions; PRAGMA user_version=3;`);
   database.close();
 }
 
@@ -211,6 +242,20 @@ describe("durable jobs + outbox", () => {
     expect(store.claimForDispatch("provider-bound", "hermes-connector", "lease-hermes"))
       .toBeNull();
     expect(store.require("provider-bound").status).toBe("Acked");
+    expect(store.listBackendBacklog()).toEqual([{
+      backend: "codex",
+      count: 1,
+      oldestCreatedAt: first.job.createdAt,
+    }]);
+
+    const direct = new Database(join(directory.path, "relay.db"), { strict: true });
+    try {
+      expect(() => direct.query(
+        "UPDATE jobs SET target_backend='hermes' WHERE scope_key=? AND job_id=?",
+      ).run("account:agent", "provider-bound")).toThrow("jobs.target_backend is immutable");
+    } finally {
+      direct.close();
+    }
   });
 
   test("SQLite 主文件、WAL 和 SHM 都是 0600", () => {
@@ -230,6 +275,31 @@ describe("durable jobs + outbox", () => {
     const completed = store.finishSuccess("job-1", "lease-1", '{"text":"done"}');
     expect(completed.status).toBe("Succeeded");
     expect(completed.outbox?.status).toBe("Pending");
+    expect(store.listExecutionAttemptEvents("job-1").map((event) => ({
+      eventType: event.eventType,
+      backend: event.backend,
+      providerSessionId: event.providerSessionId,
+      backendExecutionId: event.backendExecutionId,
+    }))).toEqual([
+      {
+        eventType: "reserved",
+        backend: "hermes",
+        providerSessionId: null,
+        backendExecutionId: "connector",
+      },
+      {
+        eventType: "accepted",
+        backend: "hermes",
+        providerSessionId: null,
+        backendExecutionId: "connector",
+      },
+      {
+        eventType: "succeeded",
+        backend: "hermes",
+        providerSessionId: null,
+        backendExecutionId: "connector",
+      },
+    ]);
     expect(store.startResultDelivery("job-1", "result-msg-1", false)?.retryCount).toBe(0);
     expect(store.startResultDelivery("job-1", "result-msg-2", true)?.retryCount).toBe(1);
     expect(store.findJobIdByOutboxMessageId("result-msg-1")).toBe("job-1");
@@ -238,6 +308,33 @@ describe("durable jobs + outbox", () => {
     expect(store.markOutboxDelivered("job-1")?.status).toBe("Delivered");
     expect(store.markOutboxDelivered("no-such-job")).toBeNull();
     expect(store.integrityCheck()).toBe("ok");
+  });
+
+  test("execution attempt ledger 拒绝 UPDATE/DELETE", () => {
+    store.ingest(incomingJob("attempt-append-only"), "session-append-only");
+    store.markAcked("attempt-append-only");
+    store.claimForDispatch("attempt-append-only", "connector", "lease-append-only");
+    store.markRunning("attempt-append-only", "connector", "lease-append-only");
+    store.finishFailure(
+      "attempt-append-only",
+      "lease-append-only",
+      '{"text":"failed"}',
+      "synthetic failure",
+    );
+
+    const direct = new Database(join(directory.path, "relay.db"), { strict: true });
+    try {
+      expect(() => direct.query(
+        "UPDATE execution_attempt_events SET reason='tampered' WHERE job_id='attempt-append-only'",
+      ).run()).toThrow("execution_attempt_events is append-only");
+      expect(() => direct.query(
+        "DELETE FROM execution_attempt_events WHERE job_id='attempt-append-only'",
+      ).run()).toThrow("execution_attempt_events is append-only");
+    } finally {
+      direct.close();
+    }
+    expect(store.listExecutionAttemptEvents("attempt-append-only").map((event) => event.eventType))
+      .toEqual(["reserved", "accepted", "failed"]);
   });
 
   test("旧 lease 的 final 无效", () => {
@@ -266,7 +363,7 @@ describe("durable jobs + outbox", () => {
     expect(store.findJobIdByOutboxMessageId("legacy-result-msg")).toBe("job-migrated");
     expect(store.integrityCheck()).toBe("ok");
     store.close();
-    expectHealthyV6(databasePath);
+    expectHealthyV7(databasePath);
     store = new JobStore(databasePath, "account:agent");
   });
 
@@ -506,7 +603,7 @@ describe("durable jobs + outbox", () => {
     expect(pendingCancelCount(databasePath)).toBe(PENDING_CANCEL_MAX_ROWS);
   });
 
-  test("schema v2 迁移到 v6 时补 GC 索引，并在 daemon 恢复时清除历史 intent", () => {
+  test("schema v2 迁移到 v7 时补 GC 索引，并在 daemon 恢复时清除历史 intent", () => {
     const databasePath = join(directory.path, "relay.db");
     store.ingest(incomingJob("matched-job"), "session-1");
     store.close();
@@ -540,7 +637,7 @@ describe("durable jobs + outbox", () => {
       .all().map((row) => row.name);
     migrated.close();
     expect(indexes).toContain("idx_pending_cancels_gc");
-    expect(version?.user_version).toBe(6);
+    expect(version?.user_version).toBe(7);
     expect(outboxColumns).toContain("next_attempt_at");
   });
 
@@ -915,6 +1012,8 @@ describe("backend session durability", () => {
     expect(store.require(claimed.jobId).status).toBe("Running");
     expect(store.require(claimed.jobId).outbox).toBeNull();
     expect(store.getBackendSession(backend, sessionKey)?.activeJobId).toBe(claimed.jobId);
+    expect(store.listExecutionAttemptEvents(claimed.jobId).map((event) => event.eventType))
+      .toEqual(["reserved", "accepted"]);
 
     const cleanup = new Database(databasePath);
     cleanup.exec("DROP TRIGGER fail_active_clear;");
@@ -933,6 +1032,18 @@ describe("backend session durability", () => {
     expect(session.activeJobId).toBeNull();
     expect(session.activeTurnId).toBeNull();
     expect(session.recoveryRequired).toBeFalse();
+    const attemptEvents = store.listExecutionAttemptEvents(claimed.jobId);
+    expect(attemptEvents.map((event) => event.eventType))
+      .toEqual(["reserved", "accepted", "succeeded"]);
+    expect(attemptEvents.map((event) => event.providerSessionId))
+      .toEqual(["thread-1", "thread-1", "thread-1"]);
+    expect(attemptEvents.map((event) => event.providerOperationId))
+      .toEqual([null, "turn-1", "turn-1"]);
+    expect(attemptEvents.at(-1)).toMatchObject({
+      runtimeVersion: "0.1.0",
+      effectiveModel: BACKEND_SESSION_METADATA.effectiveModel,
+      modelProvider: BACKEND_SESSION_METADATA.modelProvider,
+    });
   });
 
   test("重启保留 active evidence 并要求显式 release recovery", () => {
@@ -960,6 +1071,9 @@ describe("backend session durability", () => {
     expect(store.releaseSessionRecovery(sessionKey)).toBeTrue();
     expect(store.getBackendSession(backend, sessionKey)).toBeNull();
     expect(store.listQuarantinedSessions()).toHaveLength(0);
+    expect(store.listExecutionAttemptEvents(claimed.jobId).map((event) => event.eventType))
+      .toEqual(["reserved", "accepted", "interrupted"]);
+    expect(store.latestExecutionAttemptEvent(claimed.jobId)?.providerOperationId).toBe("turn-1");
     expect(store.releaseSessionRecovery(sessionKey)).toBeFalse();
   });
 
@@ -1073,6 +1187,53 @@ describe("backend session durability", () => {
     expect(session.activeTurnId).toBeNull();
     expect(session.recoveryRequired).toBeFalse();
     expect(store.listQuarantinedSessions()).toHaveLength(0);
+    expect(store.listExecutionAttemptEvents(claimed.jobId).map((event) => event.eventType))
+      .toEqual(["reserved", "cancelled_not_sent"]);
+  });
+
+  test("not_sent 重派使用新 generation，旧 attempt 历史不会被覆盖", () => {
+    const first = prepareRunningJob("codex-not-sent-retry");
+    expect(store.resetUnsentBackendDispatch(
+      first.jobId,
+      backend,
+      "lease-1",
+      first.runGeneration,
+    )).toBeTrue();
+    const second = store.claimForBackendDispatch(
+      first.jobId,
+      backend,
+      "codex:process-1",
+      "lease-2",
+    )!;
+    expect(second.runGeneration).toBe(first.runGeneration + 1);
+    store.markBackendRunning(
+      second.jobId,
+      backend,
+      "lease-2",
+      second.runGeneration,
+      "turn-2",
+    );
+    store.finishBackendFailure(
+      second.jobId,
+      backend,
+      "lease-2",
+      second.runGeneration,
+      "turn-2",
+      '{"text":"failed"}',
+      "synthetic failure",
+    );
+
+    expect(store.listExecutionAttemptEvents(first.jobId).map((event) => [
+      event.runGeneration,
+      event.sequence,
+      event.eventType,
+    ])).toEqual([
+      [1, 1, "reserved"],
+      [1, 2, "not_sent"],
+      [2, 1, "reserved"],
+      [2, 2, "accepted"],
+      [2, 3, "failed"],
+    ]);
   });
 
   test("backend disconnect 按 executionId 批量收口 active jobs", () => {
@@ -1138,20 +1299,132 @@ describe("backend session durability", () => {
   });
 });
 
-describe("SQLite schema v6 migration", () => {
-  test("fresh 数据库直接创建 v6，重复打开保持完整", async () => {
-    const directory = await temporaryDirectory("livis-store-fresh-v6-");
+describe("SQLite schema v7 migration", () => {
+  test("fresh 数据库直接创建 v7，重复打开保持完整", async () => {
+    const directory = await temporaryDirectory("livis-store-fresh-v7-");
     const databasePath = join(directory.path, "relay.db");
     try {
       const first = new JobStore(databasePath, "account:agent");
       first.close();
-      expectHealthyV6(databasePath);
+      expectHealthyV7(databasePath);
 
       const reopened = new JobStore(databasePath, "account:agent");
       reopened.close();
-      expectHealthyV6(databasePath);
+      expectHealthyV7(databasePath);
     } finally {
       await directory.cleanup();
+    }
+  });
+
+  test("v6 active attempt 只导入可证明快照，恢复后继续 append-only 时间线", async () => {
+    const directory = await temporaryDirectory("livis-store-v6-attempt-import-");
+    const databasePath = join(directory.path, "relay.db");
+    const sessionKey = "livis:legacy-active";
+    let migrated: JobStore | null = null;
+    try {
+      const seed = new JobStore(databasePath, "account:agent");
+      seed.ensureBackendSession({
+        ...BACKEND_SESSION_METADATA,
+        backend: "codex",
+        sessionKey,
+        sessionHash: "a".repeat(64),
+        cwd: join(directory.path, "workspace"),
+        cliVersion: "0.145.0",
+      });
+      seed.bindBackendThread("codex", sessionKey, "legacy-thread");
+      seed.ingest(incomingJob("legacy-active-job"), sessionKey, "codex");
+      seed.markAcked("legacy-active-job");
+      const claimed = seed.claimForBackendDispatch(
+        "legacy-active-job",
+        "codex",
+        "codex:legacy-thread",
+        "legacy-lease",
+      )!;
+      seed.markBackendRunning(
+        claimed.jobId,
+        "codex",
+        "legacy-lease",
+        claimed.runGeneration,
+        "legacy-turn",
+      );
+      seed.close();
+      downgradeV7ToV6(databasePath);
+
+      migrated = new JobStore(databasePath, "account:agent");
+      expect(migrated.listExecutionAttemptEvents("legacy-active-job")).toMatchObject([{
+        sequence: 1,
+        eventType: "legacy_active_imported",
+        providerSessionId: "legacy-thread",
+        providerOperationId: "legacy-turn",
+      }]);
+      expect(migrated.recoverAfterRestart()).toMatchObject({ interrupted: 1 });
+      expect(migrated.listExecutionAttemptEvents("legacy-active-job").map((event) => event.eventType))
+        .toEqual(["legacy_active_imported", "interrupted"]);
+      expectHealthyV7(databasePath);
+    } finally {
+      migrated?.close();
+      await directory.cleanup();
+    }
+  });
+
+  test("v6 Codex active attempt 与 session fence 不一致时拒绝迁移", async () => {
+    for (const mismatch of ["job", "lease", "generation"] as const) {
+      const directory = await temporaryDirectory(`livis-store-v6-attempt-${mismatch}-mismatch-`);
+      const databasePath = join(directory.path, "relay.db");
+      try {
+        const sessionKey = `livis:legacy-${mismatch}`;
+        const seed = new JobStore(databasePath, "account:agent");
+        seed.ensureBackendSession({
+          ...BACKEND_SESSION_METADATA,
+          backend: "codex",
+          sessionKey,
+          sessionHash: "a".repeat(64),
+          cwd: join(directory.path, "workspace"),
+          cliVersion: "0.145.0",
+        });
+        seed.bindBackendThread("codex", sessionKey, `thread-${mismatch}`);
+        seed.ingest(incomingJob(`legacy-${mismatch}`), sessionKey, "codex");
+        seed.ingest(incomingJob(`other-${mismatch}`), sessionKey, "codex");
+        seed.markAcked(`legacy-${mismatch}`);
+        const claimed = seed.claimForBackendDispatch(
+          `legacy-${mismatch}`,
+          "codex",
+          `codex:thread-${mismatch}`,
+          `lease-${mismatch}`,
+        )!;
+        seed.markBackendRunning(
+          claimed.jobId,
+          "codex",
+          `lease-${mismatch}`,
+          claimed.runGeneration,
+          `turn-${mismatch}`,
+        );
+        seed.close();
+        downgradeV7ToV6(databasePath);
+
+        const database = new Database(databasePath, { strict: true });
+        if (mismatch === "job") {
+          database.query(`UPDATE backend_sessions SET active_job_id=?
+                          WHERE backend='codex' AND session_key=?`)
+            .run(`other-${mismatch}`, sessionKey);
+        } else if (mismatch === "lease") {
+          database.query(`UPDATE backend_sessions SET active_lease_id='wrong-lease'
+                          WHERE backend='codex' AND session_key=?`)
+            .run(sessionKey);
+        } else {
+          database.query(`UPDATE backend_sessions SET active_run_generation=active_run_generation+1
+                          WHERE backend='codex' AND session_key=?`)
+            .run(sessionKey);
+        }
+        database.close();
+
+        expect(() => new JobStore(databasePath, "account:agent"))
+          .toThrow("Codex 审计事件缺少 session 锚点");
+        expect(databaseHealth(databasePath).version).toBe(6);
+        expect(databaseHealth(databasePath).executionAttemptEventColumns).toEqual([]);
+      } finally {
+        await directory.cleanup();
+      }
     }
   });
 
@@ -1223,7 +1496,7 @@ describe("SQLite schema v6 migration", () => {
         effectiveModel: "gpt-drift",
       })).toThrow("immutable metadata");
       migrated.close();
-      expectHealthyV6(databasePath);
+      expectHealthyV7(databasePath);
     } finally {
       await directory.cleanup();
     }
@@ -1275,13 +1548,21 @@ describe("SQLite schema v6 migration", () => {
       expect(migrated.getBackendSession("codex", sessionInput.sessionKey)?.accountType)
         .toBeNull();
       migrated.close();
+      const reopened = new JobStore(databasePath, "account:agent");
+      try {
+        expect(reopened.listExecutionAttemptEvents("legacy-active").map((event) => event.eventType))
+          .toEqual(["legacy_active_imported", "interrupted"]);
+      } finally {
+        reopened.close();
+      }
+      expectHealthyV7(databasePath);
     } finally {
       await directory.cleanup();
     }
   });
 
-  test("schema v3 原地升级到 v6", async () => {
-    const directory = await temporaryDirectory("livis-store-v3-to-v6-");
+  test("schema v3 原地升级到 v7", async () => {
+    const directory = await temporaryDirectory("livis-store-v3-to-v7-");
     const databasePath = join(directory.path, "relay.db");
     try {
       const seed = new JobStore(databasePath, "account:agent");
@@ -1290,7 +1571,7 @@ describe("SQLite schema v6 migration", () => {
 
       const migrated = new JobStore(databasePath, "account:agent");
       migrated.close();
-      expectHealthyV6(databasePath);
+      expectHealthyV7(databasePath);
     } finally {
       await directory.cleanup();
     }
@@ -1334,7 +1615,7 @@ describe("SQLite schema v6 migration", () => {
       expect(migrated.listDispatchable("codex").map((job) => job.jobId))
         .toEqual(["legacy-pending"]);
       migrated.close();
-      expectHealthyV6(databasePath);
+      expectHealthyV7(databasePath);
       expect(() => new JobStore(databasePath, "account:agent", {
         legacyV4JobBackend: "hermes",
       })).toThrow("SQLite v5 已按 codex 绑定原 v4 积压");
@@ -1344,7 +1625,7 @@ describe("SQLite schema v6 migration", () => {
   });
 
   test("并发 opener 在取得 IMMEDIATE 写锁后才裁决版本", async () => {
-    const directory = await temporaryDirectory("livis-store-concurrent-v6-");
+    const directory = await temporaryDirectory("livis-store-concurrent-v7-");
     const databasePath = join(directory.path, "relay.db");
     const readyPath = join(directory.path, "child-ready");
     const proceedPath = join(directory.path, "child-proceed");
@@ -1377,7 +1658,7 @@ describe("SQLite schema v6 migration", () => {
             },
           });
           store.close();
-          process.stdout.write("opened-v6");
+          process.stdout.write("opened-v7");
         `,
       ], {
         cwd: join(import.meta.dir, ".."),
@@ -1414,9 +1695,9 @@ describe("SQLite schema v6 migration", () => {
 
       const [exitCode, childStdout, childStderr] = await Promise.all([child.exited, stdout, stderr]);
       expect(exitCode).toBe(0);
-      expect(childStdout).toBe("opened-v6");
+      expect(childStdout).toBe("opened-v7");
       expect(childStderr).toBe("");
-      expectHealthyV6(databasePath);
+      expectHealthyV7(databasePath);
     } finally {
       if (blocker) {
         if (!committed) {
@@ -1436,8 +1717,8 @@ describe("SQLite schema v6 migration", () => {
     }
   });
 
-  test("外键检查失败会回滚全部 v2→v6 DDL 与版本号", async () => {
-    const directory = await temporaryDirectory("livis-store-rollback-v6-");
+  test("外键检查失败会回滚全部 v2→v7 DDL 与版本号", async () => {
+    const directory = await temporaryDirectory("livis-store-rollback-v7-");
     const databasePath = join(directory.path, "relay.db");
     try {
       const seed = new JobStore(databasePath, "account:agent");

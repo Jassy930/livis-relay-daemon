@@ -138,6 +138,27 @@ function enqueue(internals: DaemonInternals, sessionKey: string, jobId: string):
 }
 
 describe("RelayDaemon execution backend 接线", () => {
+  test("配置切换遇到旧 backend 非终态 backlog 时启动失败关闭", async () => {
+    const fixture = await daemonFixture("livis-daemon-inactive-backend-backlog-");
+    try {
+      fixture.internals.store.ingest(
+        incomingJob("legacy-hermes-backlog"),
+        fixture.sessionKey,
+        "hermes",
+      );
+      fixture.internals.store.markAcked("legacy-hermes-backlog");
+      await expect(fixture.daemon.start()).rejects.toThrow(
+        "不属于当前 codex backend 的非终态 job",
+      );
+      expect(fixture.daemon.status()).toMatchObject({
+        backendBacklog: [{ backend: "hermes", count: 1 }],
+      });
+      expect(fixture.backend.dispatched).toHaveLength(0);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   test("backend ready 恢复时重新拒绝未授权 Acked job，绝不派发", async () => {
     const fixture = await daemonFixture("livis-daemon-codex-unauthorized-recovery-");
     try {
@@ -215,6 +236,16 @@ describe("RelayDaemon execution backend 接线", () => {
           ready: true,
           executionId: "codex:thread-test",
         },
+        backendBacklog: [],
+        recentJobs: [{
+          jobId: claimed.jobId,
+          latestAttempt: {
+            backend: "codex",
+            providerSessionId: "thread-test",
+            providerOperationId: "turn-result",
+            eventType: "succeeded",
+          },
+        }],
       });
     } finally {
       await fixture.cleanup();

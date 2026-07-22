@@ -572,6 +572,13 @@ async function commandDoctor(args: string[]): Promise<void> {
     ok: quarantines.length === 0,
     detail: quarantines.length === 0 ? "none" : JSON.stringify(quarantines),
   });
+  const backendBacklog = store.listBackendBacklog();
+  const inactiveBacklog = backendBacklog.filter((item) => item.backend !== backendKind);
+  checks.push({
+    name: "execution_backend_backlog",
+    ok: inactiveBacklog.length === 0,
+    detail: backendBacklog.length === 0 ? "none" : JSON.stringify(backendBacklog),
+  });
   store.close();
   try {
     const proof = await requireFreshSupportedProof({
