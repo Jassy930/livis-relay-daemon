@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from enum import Enum
 import importlib.util
 from pathlib import Path
+import re
 from types import ModuleType, SimpleNamespace
 import sys
 from typing import Any
@@ -28,6 +29,14 @@ class Platform:
 
     def __init__(self, value: str):
         self.value = value
+
+
+@dataclass
+class HomeChannel:
+    platform: Platform
+    chat_id: str
+    name: str
+    thread_id: str | None = None
 
 
 class MessageType(Enum):
@@ -69,12 +78,24 @@ class BasePlatformAdapter:
         self.connected = False
         self.fatal_error = None
         self.handled_events: list[MessageEvent] = []
+        self._active_sessions: dict[str, Any] = {}
+        self._session_tasks: dict[str, Any] = {}
 
     def build_source(self, **kwargs):
         return SimpleNamespace(platform=self.platform, **kwargs)
 
     async def handle_message(self, event: MessageEvent) -> None:
         self.handled_events.append(event)
+
+    def _heal_stale_session_lock(self, session_key: str) -> bool:
+        if session_key not in self._active_sessions:
+            return False
+        task = self._session_tasks.get(session_key)
+        if task is None or not task.done():
+            return False
+        self._active_sessions.pop(session_key, None)
+        self._session_tasks.pop(session_key, None)
+        return True
 
     def _mark_connected(self) -> None:
         self.connected = True
@@ -91,6 +112,7 @@ def _install_gateway_stubs() -> None:
     gateway.__path__ = []
     config = ModuleType("gateway.config")
     config.Platform = Platform
+    config.HomeChannel = HomeChannel
     platforms = ModuleType("gateway.platforms")
     platforms.__path__ = []
     base = ModuleType("gateway.platforms.base")
@@ -100,10 +122,35 @@ def _install_gateway_stubs() -> None:
     base.ProcessingOutcome = ProcessingOutcome
     base.SendResult = SendResult
 
+    restart_patterns = (
+        re.compile(r"^(?:please\s+)?restart\s+(?:the\s+)?gateway[.!?\s]*$", re.IGNORECASE),
+        re.compile(r"^(?:please\s+)?restart\s+(?:the\s+)?hermes\s+gateway[.!?\s]*$", re.IGNORECASE),
+        re.compile(r"^(?:please\s+)?restart\s+hermes[.!?\s]*$", re.IGNORECASE),
+    )
+
+    def coerce_plaintext_gateway_command(event: MessageEvent) -> None:
+        if event.message_type is not MessageType.TEXT:
+            return
+        text = (event.text or "").strip()
+        if not text or text.startswith("/"):
+            return
+        if getattr(event.source, "chat_type", None) != "dm":
+            return
+        if any(pattern.match(text) for pattern in restart_patterns):
+            event.text = "/restart"
+
+    base.coerce_plaintext_gateway_command = coerce_plaintext_gateway_command
+    tools = ModuleType("tools")
+    tools.__path__ = []
+    approval = ModuleType("tools.approval")
+    approval.has_blocking_approval = lambda _session_key: False
+
     sys.modules["gateway"] = gateway
     sys.modules["gateway.config"] = config
     sys.modules["gateway.platforms"] = platforms
     sys.modules["gateway.platforms.base"] = base
+    sys.modules["tools"] = tools
+    sys.modules["tools.approval"] = approval
 
 
 @pytest.fixture(scope="session")
@@ -126,6 +173,7 @@ def clean_livis_environment(monkeypatch):
         "LIVIS_ALLOWED_USERS",
         "LIVIS_ALLOW_ALL_USERS",
         "LIVIS_PHASE1_READ_ONLY_ACK",
+        "LIVIS_HOME_CHANNEL",
         "LIVIS_RELAY_CONNECT_TIMEOUT",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -138,6 +186,7 @@ def secure_environment(monkeypatch, tmp_path):
         "LIVIS_RELAY_TOKEN": "t" * 32,
         "LIVIS_ALLOWED_USERS": "trusted-node-1",
         "LIVIS_PHASE1_READ_ONLY_ACK": "true",
+        "LIVIS_HOME_CHANNEL": "livis:test-agent-id",
     }
     for key, value in values.items():
         monkeypatch.setenv(key, value)
@@ -146,7 +195,11 @@ def secure_environment(monkeypatch, tmp_path):
 
 @pytest.fixture
 def config():
-    return SimpleNamespace(extra={})
+    return SimpleNamespace(
+        extra={},
+        home_channel=None,
+        gateway_restart_notification=True,
+    )
 
 
 @pytest.fixture

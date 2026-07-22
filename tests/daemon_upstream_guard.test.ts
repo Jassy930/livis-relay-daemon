@@ -8,7 +8,7 @@ import { Logger } from "../src/logger.ts";
 import { SecretStore } from "../src/secrets.ts";
 import { ProfileOperationGuard } from "../src/state/offline-guard.ts";
 import type { JobStore } from "../src/state/store.ts";
-import type { RelayEnvelope, StoredJob } from "../src/types.ts";
+import type { ConnectorInboundMessage, RelayEnvelope, StoredJob } from "../src/types.ts";
 import type { UpstreamSnapshot } from "../src/upstream/checker.ts";
 import { supportedProofPath, UPSTREAM_PROOF_MAX_AGE_MS } from "../src/upstream/proof.ts";
 import { atomicWritePrivate, sha256 } from "../src/util.ts";
@@ -37,6 +37,10 @@ interface DaemonInternals {
   onRelayConnected(): Promise<void>;
   onRelayIncoming(envelope: RelayEnvelope): Promise<void>;
   dispatchPending(): Promise<void>;
+  onConnectorFailed(
+    message: Extract<ConnectorInboundMessage, { type: "failed" }>,
+    connectorId: string,
+  ): Promise<void>;
   armUpstreamProofExpiry(): boolean;
   isUpstreamProofExpired(now?: number): boolean;
   upstreamChecker: { check(): Promise<UpstreamSnapshot> };
@@ -49,6 +53,7 @@ interface DaemonInternals {
     readonly ready: boolean;
     readonly connectorId: string | null;
     sendJob(job: StoredJob): boolean;
+    acknowledgeResult(jobId: string, leaseId: string): void;
     stop(): void;
   };
   relay: {
@@ -58,6 +63,73 @@ interface DaemonInternals {
   };
   store: JobStore;
 }
+
+describe("daemon connector failed durable transition", () => {
+  test("v1 failed 可从 Dispatching 持久化失败并在 durable outbox 后确认同一 lease", async () => {
+    const fixture = await createDaemonFixture(
+      "livis-daemon-connector-failed-",
+      Date.now() + 60_000,
+    );
+    try {
+      const jobId = "remote-input-rejected";
+      const leaseId = "lease-remote-input-rejected";
+      fixture.internals.store.ingest(incomingJob(jobId), "livis:test-agent-id");
+      fixture.internals.store.markAcked(jobId);
+      const claimed = fixture.internals.store.claimForDispatch(
+        jobId,
+        "hermes-test",
+        leaseId,
+      );
+      expect(claimed?.status).toBe("Dispatching");
+
+      const acknowledgements: Array<{
+        jobId: string;
+        leaseId: string;
+        status: string;
+        outboxStatus: string | undefined;
+      }> = [];
+      let notifications = 0;
+      fixture.internals.connector.acknowledgeResult = (ackJobId, ackLeaseId) => {
+        const durable = fixture.internals.store.require(ackJobId);
+        acknowledgements.push({
+          jobId: ackJobId,
+          leaseId: ackLeaseId,
+          status: durable.status,
+          outboxStatus: durable.outbox?.status,
+        });
+      };
+      fixture.internals.relay.notifyOutboxPending = async () => {
+        notifications += 1;
+      };
+
+      await fixture.internals.onConnectorFailed({
+        type: "failed",
+        jobId,
+        leaseId,
+        error: "LiViS 远程渠道不允许执行 Hermes 命令",
+        retryable: false,
+      }, "hermes-test");
+
+      const failed = fixture.internals.store.require(jobId);
+      expect(failed.status).toBe("Failed");
+      expect(failed.leaseId).toBe(leaseId);
+      expect(failed.error).toBe("LiViS 远程渠道不允许执行 Hermes 命令");
+      expect(failed.outbox?.status).toBe("Pending");
+      expect(JSON.parse(failed.outbox!.resultJson)).toEqual({
+        text: "Hermes 暂时无法完成该请求，请稍后重试。",
+      });
+      expect(acknowledgements).toEqual([{
+        jobId,
+        leaseId,
+        status: "Failed",
+        outboxStatus: "Pending",
+      }]);
+      expect(notifications).toBe(1);
+    } finally {
+      await cleanupDaemonFixture(fixture);
+    }
+  });
+});
 
 interface DaemonFixture {
   directory: Awaited<ReturnType<typeof temporaryDirectory>>;

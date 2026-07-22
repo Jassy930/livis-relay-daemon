@@ -4,6 +4,13 @@
 
 ## [未发布]
 
+### 安全
+
+- Hermes bridge 0.1.1 在建立 job 映射、发送 connector v1 `accepted` 和进入 dispatcher 前拒绝全部远程斜杠命令及 Hermes 0.15.1 的自然语言重启别名；active session、blocking approval 或状态不可读时同样通过当前 lease 的 v1 `failed` 失败关闭。拒绝结果等待 daemon 的 durable `result_stored`，ACK 超时会清理本地 waiter 并关闭 connector；offer tombstone 与 admission reservation 关闭 cancel 和相邻 job 的接纳竞态。daemon 内部 cancel `/stop` 保持独立路径，不引入 connector v2 或 JobStore schema 迁移。
+- Hermes home channel 改为本地必填的 `LIVIS_HOME_CHANNEL=livis:<agent_id>`，并强制关闭 gateway 启停通知；远程 `/sethome` 不再是初始化或 canary 步骤。
+- daemon 与新配置的版本统一提升为 0.1.1，并内建 bridge 0.1.1 安全下限；存量配置若仍允许 0.1.0 会在启动前失败关闭，必须在停服升级中显式更新并同步安装 bridge。
+- bridge 会把非有限、不可解析或超出平台日期范围的远端 job timestamp 降级为当前 UTC 时间，避免异常元数据在输入门禁结算前中止 background task 并遗留 `Dispatching` job。
+
 ### 修复
 
 - 本地 `status` 请求增加 3 秒硬超时，避免 connector socket 已接受但 daemon 不响应时让 launchd 启动验收无界卡住。

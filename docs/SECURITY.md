@@ -16,8 +16,10 @@
 - `allowAllNodes=false`；进入 `serve` 或实网 canary 前，`security.allowedNodeIds` 必须恰好包含一个获准 `node_id`。
 - `LIVIS_ALLOW_ALL_USERS` 必须为空/false；`LIVIS_ALLOWED_USERS` 必须只包含与 daemon 完全相同的唯一 `node_id`，`*` 和多个值都不属于一期受支持配置。
 - `LIVIS_PHASE1_READ_ONLY_ACK=true` 只在专用 Hermes profile 已关闭写工具后设置。
+- `LIVIS_HOME_CHANNEL` 必须由本地从当前 state directory 的 `identity.json.agentId` 构造为精确的 `livis:<agent_id>`；禁止通过远程 `/sethome` 写入或改变它。
+- 专用 Hermes profile 的 `gateway_restart_notification` 必须为 `false`，避免向没有 active job/lease 的 LiViS channel 主动发送启停通知。
 - Hermes streaming、tool progress、interim message、附件和远程审批全部关闭。
-- Hermes runtime 审核范围默认是 `[0.15.1, 0.15.2)`；bridge 范围是 `[0.1.0, 0.2.0)`。
+- Hermes runtime 审核范围默认是 `[0.15.1, 0.15.2)`；带远程输入门禁的 bridge 范围是 `[0.1.1, 0.2.0)`，旧 `0.1.0` 必须拒绝。
 - 未知版本、哈希、wire protocol 或运行契约变化 fail closed。
 
 ## 设备来源边界
@@ -27,6 +29,16 @@
 一套 daemon、config、state directory 与专用 Hermes profile 只能绑定一个来源设备。不得同时放行第二个 `node_id`，不得在同一状态目录中原地替换 `node_id`，也不得假设不同设备可以继承同一个 Hermes session、job、quarantine 或 outbox。设备更换和多设备支持必须先定义上游 ID 稳定性、账号绑定、状态迁移、回滚与真实设备 canary，再作为独立方案评审。
 
 当前版本尚未在 daemon 与 Hermes 两侧把“恰好一个 ID”实现为代码级硬门禁：解析器仍接受多值配置，运行前必须人工读回双侧 allowlist。该残余意味着文档只定义受支持拓扑，不能被表述为已完成逐帧设备认证；尤其 `cancel_chat` 只有 `job_id`、没有来源 `node_id`，其身份边界仍依赖已建立的 Relay 连接和一期单设备部署约束。
+
+## Hermes 远程输入门禁
+
+LiViS 只承载普通模型输入，不是 Hermes 的控制面或审批面。bridge 在创建 job/message/chat/lease 映射、发送 connector v1 `accepted` 和调用 Hermes dispatcher 之前，先调用 Hermes 0.15.1 自身的 `coerce_plaintext_gateway_command()`，随后拒绝所有去除首尾空白后以 `/` 开头的文本。因此 `/sethome`、`/stop`、`/restart`、`/approve`、`/always`、`/yolo`、未知未来命令，以及 `restart gateway`、`restart the hermes gateway`、`restart hermes` 等会被归一化的重启别名都不会进入 Hermes handler。
+
+普通文本还必须同时满足以下条件才能 `accepted`：消息 chat ID 精确等于本地 `LIVIS_HOME_CHANNEL`；可从 bound message handler 安全定位当前 GatewayRunner 并计算 Hermes session key；stale session guard 已按 Hermes 0.15.1 规则自愈；当前没有 active session；`tools.approval.has_blocking_approval(session_key)` 为 false。runner、session、active guard 或 approval 状态任一项缺失、异常或不可验证时都发送 connector v1 `failed` 并停止，不把 `yes`、`always` 或普通文本当成审批答复排队。
+
+这里复用已有 v1 `failed`：daemon 只在当前 `jobId + leaseId` 上把 `Dispatching/Running` 持久化为 `Failed`、写入通用失败答复 outbox，随后才回 `result_stored`；bridge 必须在收到该 job 的同一 websocket generation 上等待 durable ACK，超时或 lease 不匹配时只关闭原连接，不能把未确认拒绝当成已完成，也不能误关期间建立的新连接。job offer 一到达就建立 tombstone，使门禁前的 cancel 只回 `cancelled` 而不会误派内部 `/stop`；普通输入通过门禁后还会在首次 `await` 前保留 Hermes session admission reservation，防止相邻 job 同时穿过尚未建立的 `_active_sessions` 窗口。没有新增 `notStarted`、connector v2 或 JobStore schema 迁移。daemon 为 Relay cancel 生成的内部 `/stop` 由 `_handle_cancel()` 直接派发，不经过远程文本门禁；它仍保持既有 `CancelUnknown` 与 session quarantine 语义。
+
+daemon 0.1.1 内建 bridge 0.1.1 安全下限。配置中的 `hermes.bridgeMinimumVersion` 可以进一步提高，但不能低于 0.1.1；存量 0.1.0 配置会在打开数据库、连接 Relay 或接受 connector 前失败，操作者必须在停服窗口同步升级 daemon、bridge 与配置。仅覆盖 plugin 文件而不更新并读回配置不构成升级完成。
 
 ## 本地权限
 

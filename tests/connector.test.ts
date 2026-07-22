@@ -71,8 +71,16 @@ describe("Hermes connector Unix WebSocket", () => {
         events.push({ type: "result", jobId: message.jobId });
       },
       onFailed: async (message) => {
-        store.finishFailure(message.jobId, message.leaseId, JSON.stringify({ text: "failed" }), message.error);
+        const failed = store.finishFailure(
+          message.jobId,
+          message.leaseId,
+          JSON.stringify({ text: "failed" }),
+          message.error,
+        );
         events.push({ type: "failed", jobId: message.jobId });
+        if (failed.outbox) {
+          server.acknowledgeResult(message.jobId, message.leaseId);
+        }
       },
       onCancelled: async (message) => {
         store.markCancelUnknown(message.jobId, message.leaseId, "connector reported cancellation");
@@ -94,7 +102,7 @@ describe("Hermes connector Unix WebSocket", () => {
       hermesMinimumVersion: "0.15.1",
       hermesMaximumExclusiveVersion: "0.15.2",
       bridgeImplementation: "livis-hermes-bridge",
-      bridgeMinimumVersion: "0.1.0",
+      bridgeMinimumVersion: "0.1.1",
       bridgeMaximumExclusiveVersion: "0.2.0",
     }, handlers, new Logger("test.connector", "error"));
     server.start();
@@ -126,7 +134,7 @@ describe("Hermes connector Unix WebSocket", () => {
       protocolVersion: 1,
       connectorId: "hermes-test",
       backend: "hermes",
-      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.15.1" },
+      implementation: { name: "livis-hermes-bridge", version: "0.1.1", runtimeVersion: "0.15.1" },
       capabilities: { cancel: true, finalResult: true },
     }));
     const helloAck = await read();
@@ -152,6 +160,40 @@ describe("Hermes connector Unix WebSocket", () => {
     server.acknowledgeResult("job-1", "lease-1");
     expect(await read()).toEqual({ type: "result_stored", jobId: "job-1", leaseId: "lease-1" });
 
+    store.ingest(incomingJob("job-rejected"), "session-rejected");
+    store.markAcked("job-rejected");
+    const rejected = store.claimForDispatch(
+      "job-rejected",
+      "hermes-test",
+      "lease-rejected",
+    )!;
+    expect(rejected.status).toBe("Dispatching");
+    expect(server.sendJob(rejected)).toBeTrue();
+    const rejectedOffer = await read();
+    expect(rejectedOffer.type).toBe("job");
+
+    client.send(JSON.stringify({
+      type: "failed",
+      jobId: "job-rejected",
+      leaseId: "lease-rejected",
+      error: "remote input rejected",
+      retryable: false,
+    }));
+    await waitFor(
+      () => store.require("job-rejected").status === "Failed",
+      "未 accepted job 直接进入 Failed",
+    );
+    const failed = store.require("job-rejected");
+    expect(failed.leaseId).toBe("lease-rejected");
+    expect(failed.outbox?.status).toBe("Pending");
+    expect(events.filter((event) => event.jobId === "job-rejected"))
+      .toEqual([{ type: "failed", jobId: "job-rejected" }]);
+    expect(await read()).toEqual({
+      type: "result_stored",
+      jobId: "job-rejected",
+      leaseId: "lease-rejected",
+    });
+
     client.close();
     await new Promise((resolve) => client.once("close", resolve));
     await waitFor(
@@ -173,7 +215,7 @@ describe("Hermes connector Unix WebSocket", () => {
       protocolVersion: 99,
       connectorId: "bad",
       backend: "hermes",
-      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.15.1" },
+      implementation: { name: "livis-hermes-bridge", version: "0.1.1", runtimeVersion: "0.15.1" },
       capabilities: { cancel: true, finalResult: true },
     }));
     const error = await read();
@@ -195,7 +237,7 @@ describe("Hermes connector Unix WebSocket", () => {
       protocolVersion: 1,
       connectorId: "hermes-reused",
       backend: "hermes",
-      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.15.1" },
+      implementation: { name: "livis-hermes-bridge", version: "0.1.1", runtimeVersion: "0.15.1" },
       capabilities: { cancel: true, finalResult: true },
     }));
     expect((await readOld()).type).toBe("hello_ack");
@@ -228,7 +270,7 @@ describe("Hermes connector Unix WebSocket", () => {
       protocolVersion: 1,
       connectorId: "hermes-reused",
       backend: "hermes",
-      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.15.1" },
+      implementation: { name: "livis-hermes-bridge", version: "0.1.1", runtimeVersion: "0.15.1" },
       capabilities: { cancel: true, finalResult: true },
     }));
     expect((await readNew()).type).toBe("hello_ack");
@@ -280,7 +322,7 @@ describe("Hermes connector Unix WebSocket", () => {
       protocolVersion: 1,
       connectorId: "old-hermes",
       backend: "hermes",
-      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.14.9" },
+      implementation: { name: "livis-hermes-bridge", version: "0.1.1", runtimeVersion: "0.14.9" },
       capabilities: { cancel: true, finalResult: true },
     }));
     expect((await readOld()).code).toBe("hermes_version_unsupported");
@@ -298,7 +340,7 @@ describe("Hermes connector Unix WebSocket", () => {
       protocolVersion: 1,
       connectorId: "future-hermes",
       backend: "hermes",
-      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.15.2" },
+      implementation: { name: "livis-hermes-bridge", version: "0.1.1", runtimeVersion: "0.15.2" },
       capabilities: { cancel: true, finalResult: true },
     }));
     expect((await readFuture()).code).toBe("hermes_version_unsupported");
@@ -316,11 +358,29 @@ describe("Hermes connector Unix WebSocket", () => {
       protocolVersion: 1,
       connectorId: "foreign-bridge",
       backend: "hermes",
-      implementation: { name: "another-bridge", version: "0.1.0", runtimeVersion: "0.15.1" },
+      implementation: { name: "another-bridge", version: "0.1.1", runtimeVersion: "0.15.1" },
       capabilities: { cancel: true, finalResult: true },
     }));
     expect((await readForeign()).code).toBe("bridge_implementation_unsupported");
     await new Promise((resolve) => foreignBridge.once("close", resolve));
+
+    const legacyBridge = openWebSocket(server.socketPath, token);
+    const readLegacyBridge = messageReader(legacyBridge);
+    await new Promise<void>((resolve, reject) => {
+      legacyBridge.once("open", resolve);
+      legacyBridge.once("error", reject);
+    });
+    await readLegacyBridge();
+    legacyBridge.send(JSON.stringify({
+      type: "hello",
+      protocolVersion: 1,
+      connectorId: "legacy-bridge",
+      backend: "hermes",
+      implementation: { name: "livis-hermes-bridge", version: "0.1.0", runtimeVersion: "0.15.1" },
+      capabilities: { cancel: true, finalResult: true },
+    }));
+    expect((await readLegacyBridge()).code).toBe("bridge_version_unsupported");
+    await new Promise((resolve) => legacyBridge.once("close", resolve));
 
     const newClient = openWebSocket(server.socketPath, token);
     const readNew = messageReader(newClient);

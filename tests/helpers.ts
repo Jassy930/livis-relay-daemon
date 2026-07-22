@@ -53,7 +53,7 @@ export function testConfig(stateDir: string): RelayConfig {
       minimumVersion: "0.15.1",
       maximumExclusiveVersion: "0.15.2",
       bridgeImplementation: "livis-hermes-bridge",
-      bridgeMinimumVersion: "0.1.0",
+      bridgeMinimumVersion: "0.1.1",
       bridgeMaximumExclusiveVersion: "0.2.0",
     },
   };

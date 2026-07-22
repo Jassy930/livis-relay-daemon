@@ -115,7 +115,7 @@ test("Python websockets 与 Bun ConnectorServer 完成真实 UDS job/result 往�
       hermesMinimumVersion: "0.15.1",
       hermesMaximumExclusiveVersion: "0.15.2",
       bridgeImplementation: "livis-hermes-bridge",
-      bridgeMinimumVersion: "0.1.0",
+      bridgeMinimumVersion: "0.1.1",
       bridgeMaximumExclusiveVersion: "0.2.0",
     }, handlers, new Logger("test.python-connector", "error"));
     server = activeServer;
@@ -168,7 +168,7 @@ test("Python websockets 与 Bun ConnectorServer 完成真实 UDS job/result 往�
     expect(hello.connectorId).toBe(connectorId);
     expect(hello.implementation).toEqual({
       name: "livis-hermes-bridge",
-      version: "0.1.0",
+      version: "0.1.1",
       runtimeVersion: "0.15.1",
     });
 
