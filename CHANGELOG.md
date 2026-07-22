@@ -18,6 +18,9 @@
 - Device Flow 依据 OAuth error 处理 `authorization_pending` / `slow_down`，兼容 LiViS IDaaS 对 pending 返回 HTTP 428 的实际行为。
 - relay 心跳判活改为任何可解析的服务端消息都刷新，不再仅依赖 WS 协议层 pong。
 - `parseSemverTriplet` 拒绝预发布版本（如 `0.15.1-beta`），预发布 Hermes/bridge 不再落入已审核区间。
+- Relay WebSocket 新增兼容旧配置的整体帧上限，并在落盘前限制外部 type、job/message/node 等标识；超长错误不再原样进入日志。
+- 提前到达的 cancel intent 会在匹配 job 首次、重复入库或启动恢复时先按状态应用、再同事务消费；未知 intent 采用 24 小时 TTL 和全库 4096 条硬上限，旧 schema v2 数据库会幂等补充 GC 索引并修复历史残留。
+- 未在 job 入库事务中消费的历史 cancel intent 只由 daemon 重启恢复事务批量处理；`doctor`、`session release` 等维护命令打开数据库时不再静默改变 active job。
 
 ### 变更
 

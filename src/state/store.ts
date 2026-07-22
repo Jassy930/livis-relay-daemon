@@ -4,6 +4,16 @@ import { dirname } from "node:path";
 import type { IncomingRelayJob, JobStatus, OutboxStatus, StoredJob, StoredOutbox } from "../types.ts";
 import { sha256 } from "../util.ts";
 
+export const PENDING_CANCEL_TTL_MS = 24 * 60 * 60 * 1_000;
+export const PENDING_CANCEL_MAX_ROWS = 4_096;
+
+export class PendingCancelCapacityError extends Error {
+  constructor() {
+    super(`pending cancel intent 已达到总量上限：${PENDING_CANCEL_MAX_ROWS}`);
+    this.name = "PendingCancelCapacityError";
+  }
+}
+
 interface JobViewRow {
   scope_key: string;
   job_id: string;
@@ -132,6 +142,11 @@ export class JobStore {
   recoverAfterRestart(): { interrupted: number; cancelUnknown: number; outboxPending: number } {
     const now = Date.now();
     const transaction = this.database.transaction(() => {
+      // 只有 daemon 启动恢复路径可以消费历史 intent 并改变 active job。
+      // doctor/session release 等维护命令只构造 JobStore，不得产生运行时状态迁移。
+      this.pruneExpiredPendingCancelsLocked(now);
+      this.consumeAllMatchedPendingCancelsLocked(now);
+      this.trimLegacyPendingCancelOverflowLocked();
       this.database.query(`
         INSERT OR IGNORE INTO session_quarantine(scope_key,session_key,reason,created_at)
         SELECT scope_key,session_key,'daemon restarted during active execution',?
@@ -153,9 +168,10 @@ export class JobStore {
   }
 
   ingest(input: IncomingRelayJob, sessionKey: string): { inserted: boolean; job: StoredJob } {
-    const now = Date.now();
     const payloadHash = businessPayloadHash(input);
     const transaction = this.database.transaction(() => {
+      const now = Date.now();
+      this.pruneExpiredPendingCancelsLocked(now);
       const result = this.database
         .query(`INSERT OR IGNORE INTO jobs (
           scope_key, job_id, msg_id, payload_hash, from_node_id, from_node_type, input_text, raw_payload,
@@ -175,18 +191,7 @@ export class JobStore {
           now,
           input.timestamp,
         );
-      if (result.changes === 1) {
-        const pendingCancel = this.database
-          .query<{ present: number }, [string, string]>(
-            "SELECT 1 AS present FROM pending_cancels WHERE scope_key=? AND job_id=?",
-          )
-          .get(this.scopeKey, input.jobId);
-        if (pendingCancel) {
-          this.database
-            .query("UPDATE jobs SET status='Cancelled', cancel_requested=1, completed_at=?, updated_at=? WHERE scope_key=? AND job_id=?")
-            .run(now, now, this.scopeKey, input.jobId);
-        }
-      }
+      this.consumeMatchedPendingCancelLocked(this.scopeKey, input.jobId, now);
       return result.changes === 1;
     });
     const inserted = transaction.immediate();
@@ -331,21 +336,11 @@ export class JobStore {
   }
 
   requestCancel(jobId: string): StoredJob | null {
-    const now = Date.now();
     const transaction = this.database.transaction(() => {
-      // cancel 可能先于 job 到达；与状态转移共用 IMMEDIATE 事务，避免另一
-      // 实例在“查无 job”和写入 intent 之间插入并开始派发。
-      this.database
-        .query(`INSERT OR IGNORE INTO pending_cancels(scope_key,job_id,created_at)
-                SELECT ?,?,?
-                WHERE NOT EXISTS (
-                  SELECT 1 FROM jobs WHERE scope_key=? AND job_id=?
-                )`)
-        .run(this.scopeKey, jobId, now, this.scopeKey, jobId);
-
-      // 只允许尚未派发的 job 直接结束，或活跃执行进入 Cancelling。
-      // Cancelling、Interrupted 和所有终态都不匹配 WHERE，重复 cancel
-      // 因而幂等，迟到 cancel 也不能让已完成状态发生回退。
+      const now = Date.now();
+      this.pruneExpiredPendingCancelsLocked(now);
+      // cancel 可能先于 job 到达；条件更新、容量判断和 intent 写入共享
+      // IMMEDIATE 事务，避免在“查无 job”和保存 intent 之间漏掉并发入库。
       this.database
         .query(`UPDATE jobs
                 SET cancel_requested=1,
@@ -361,6 +356,35 @@ export class JobStore {
                 WHERE scope_key=? AND job_id=?
                   AND status IN ('Received','Acked','Dispatching','Running')`)
         .run(now, now, this.scopeKey, jobId);
+
+      // #19 的边界保持不变：Cancelling、Interrupted 和所有终态都不会
+      // 回退；只要 job 已存在，就不能为迟到 cancel 新建未来 intent。
+      const existingJob = this.database
+        .query<{ present: number }, [string, string]>(
+          "SELECT 1 AS present FROM jobs WHERE scope_key=? AND job_id=?",
+        )
+        .get(this.scopeKey, jobId);
+      if (existingJob) {
+        this.database
+          .query("DELETE FROM pending_cancels WHERE scope_key=? AND job_id=?")
+          .run(this.scopeKey, jobId);
+        return;
+      }
+
+      const refreshed = this.database
+        .query("UPDATE pending_cancels SET created_at=? WHERE scope_key=? AND job_id=?")
+        .run(now, this.scopeKey, jobId);
+      if (refreshed.changes === 1) return;
+
+      const count = this.database
+        .query<{ count: number }, []>("SELECT COUNT(*) AS count FROM pending_cancels")
+        .get()?.count ?? 0;
+      if (count >= PENDING_CANCEL_MAX_ROWS) {
+        throw new PendingCancelCapacityError();
+      }
+      this.database
+        .query("INSERT INTO pending_cancels(scope_key,job_id,created_at) VALUES(?,?,?)")
+        .run(this.scopeKey, jobId, now);
     });
     transaction.immediate();
     return this.get(jobId);
@@ -503,14 +527,86 @@ export class JobStore {
       .run(to, error, Date.now(), this.scopeKey, jobId, ...from);
   }
 
+  private pruneExpiredPendingCancelsLocked(now: number): void {
+    this.database
+      .query("DELETE FROM pending_cancels WHERE created_at < ?")
+      .run(now - PENDING_CANCEL_TTL_MS);
+  }
+
+  private consumeMatchedPendingCancelLocked(scopeKey: string, jobId: string, now: number): void {
+    this.database.query(`
+      UPDATE jobs
+      SET cancel_requested=1,
+          status=CASE
+            WHEN status IN ('Dispatching','Running') THEN 'Cancelling'
+            ELSE 'Cancelled'
+          END,
+          completed_at=CASE
+            WHEN status IN ('Received','Acked') THEN ?
+            ELSE completed_at
+          END,
+          updated_at=?
+      WHERE scope_key=? AND job_id=?
+        AND status IN ('Received','Acked','Dispatching','Running')
+        AND EXISTS (
+          SELECT 1 FROM pending_cancels
+          WHERE pending_cancels.scope_key=jobs.scope_key
+            AND pending_cancels.job_id=jobs.job_id
+        )
+    `).run(now, now, scopeKey, jobId);
+    this.database
+      .query("DELETE FROM pending_cancels WHERE scope_key=? AND job_id=?")
+      .run(scopeKey, jobId);
+  }
+
+  private consumeAllMatchedPendingCancelsLocked(now: number): void {
+    this.database.query(`
+      UPDATE jobs
+      SET cancel_requested=1,
+          status=CASE
+            WHEN status IN ('Dispatching','Running') THEN 'Cancelling'
+            ELSE 'Cancelled'
+          END,
+          completed_at=CASE
+            WHEN status IN ('Received','Acked') THEN ?
+            ELSE completed_at
+          END,
+          updated_at=?
+      WHERE scope_key=?
+        AND status IN ('Received','Acked','Dispatching','Running')
+        AND EXISTS (
+          SELECT 1 FROM pending_cancels
+          WHERE pending_cancels.scope_key=jobs.scope_key
+            AND pending_cancels.job_id=jobs.job_id
+        )
+    `).run(now, now, this.scopeKey);
+    this.database.query(`
+      DELETE FROM pending_cancels
+      WHERE scope_key=?
+        AND EXISTS (
+          SELECT 1 FROM jobs
+          WHERE jobs.scope_key=pending_cancels.scope_key
+            AND jobs.job_id=pending_cancels.job_id
+        )
+    `).run(this.scopeKey);
+  }
+
+  private trimLegacyPendingCancelOverflowLocked(): void {
+    this.database.query(`
+      DELETE FROM pending_cancels
+      WHERE rowid IN (
+        SELECT rowid FROM pending_cancels
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT -1 OFFSET ?
+      )
+    `).run(PENDING_CANCEL_MAX_ROWS);
+  }
+
   private migrate(): void {
     const row = this.database.query<{ user_version: number }, []>("PRAGMA user_version").get();
     const version = row?.user_version ?? 0;
     if (version !== 0 && version !== 1 && version !== 2) {
       throw new Error(`不支持的数据库 schema 版本：${version}`);
-    }
-    if (version === 2) {
-      return;
     }
     if (version === 1) {
       this.database.exec(`
@@ -526,6 +622,12 @@ export class JobStore {
           SELECT scope_key,last_message_id,job_id,updated_at FROM outbox WHERE last_message_id IS NOT NULL;
         CREATE INDEX idx_outbox_attempt_job ON outbox_delivery_attempts(scope_key,job_id);
         PRAGMA user_version=2;
+      `);
+    }
+    if (version === 1 || version === 2) {
+      this.database.exec(`
+        CREATE INDEX IF NOT EXISTS idx_pending_cancels_gc
+          ON pending_cancels(created_at,scope_key,job_id);
       `);
       return;
     }
@@ -595,6 +697,7 @@ export class JobStore {
       CREATE INDEX idx_jobs_connector ON jobs(scope_key,connector_id,status);
       CREATE INDEX idx_outbox_delivery ON outbox(scope_key,status,updated_at);
       CREATE INDEX idx_outbox_attempt_job ON outbox_delivery_attempts(scope_key,job_id);
+      CREATE INDEX idx_pending_cancels_gc ON pending_cancels(created_at,scope_key,job_id);
       PRAGMA user_version=2;
     `);
   }

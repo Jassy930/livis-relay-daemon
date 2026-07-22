@@ -59,11 +59,22 @@
 
 Hermes `/stop` 不能证明不合作的工具线程已退出。因此 connector 返回 `cancelled` 后，daemon 仍记录 `CancelUnknown` 并隔离 session。只有在重启专用 Hermes Gateway、确认旧工具进程已结束后，才允许人工执行 `session release`。
 
+未知 job 的 `cancel_chat` 可以先于对应消息到达，但 intent 只保留 24 小时，全库最多保留 4096 条。重复 cancel 会刷新同一 intent 的有效期；满额后新的未知 job ID 会被拒绝且不发送成功 ACK，不会静默挤掉 TTL 内已有 intent。job 到达时会在同一 SQLite 事务中应用并删除匹配 intent。旧数据库启动时会删除过期 intent；当前 scope 已有匹配 job 的残留会先按当前状态应用取消，再删除 intent，其中未执行 job 进入 `Cancelled`，active job 进入 `Cancelling` 并在重启恢复中隔离为 `CancelUnknown`。若旧数据已超过上限，只确定性保留最新 4096 条。因此 cancel-before-message 只在 24 小时乱序窗口和容量未耗尽时保证。
+
+## Relay 输入资源边界
+
+- `config.relay.maxFrameBytes` 默认 1 MiB，最大允许 16 MiB；旧 schema v1 配置缺少该字段时使用默认值。
+- `ws` 在组装完整消息、解压、转成字符串和 JSON 解析前执行整体 payload 上限；回调中再次按 UTF-8 字节数检查。
+- envelope 与业务 `type` 最多 64 UTF-8 字节；job/message/ACK/node/agent/device ID 最多 256 字节；node type 最多 64 字节。超限值不会进入 handler、SQLite 或普通日志。
+- 日志中的非秘密字符串超过 1024 UTF-8 字节时整段替换为长度摘要；token、authorization、secret、password 和 cookie 字段仍整段脱敏。
+
+这些限制约束单帧和单条标识，不构成完整流量整形。当前消息处理 Promise 队列没有独立深度/累计字节上限，大量合法小帧仍可能形成短时积压；应在受控 Relay、网络层限速和进程监控下运行。
+
 ## 数据落盘与保留
 
 SQLite 默认明文保存 `from_node_id`、输入文本、原始 payload、job/lease 状态和最终结果。数据库依赖 state directory 的 `0700` 与数据库/WAL/SHM 的 `0600` 权限保护，不提供静态加密。
 
-一期没有自动保留期或后台 purge，记录会持续保留，直到操作者主动清理。需要彻底清除历史时：
+除上述临时 `pending_cancels` 外，一期仍没有 jobs、outbox 或投递尝试的自动保留期和后台 purge；这些记录会持续保留，直到操作者主动清理。合法但未授权 node 的请求仍保持原有回复语义：先持久化为 `Rejected` 并通过 outbox 返回配置的未授权提示，本次资源边界不改变这一行为。需要彻底清除历史时：
 
 1. 停止 daemon 和专用 Hermes Gateway；
 2. 按组织要求备份或销毁 `relay.db`、`relay.db-wal`、`relay.db-shm`；

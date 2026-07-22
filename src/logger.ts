@@ -1,10 +1,19 @@
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 const SECRET_KEY_PATTERN = /token|authorization|secret|password|cookie/i;
+export const LOG_STRING_MAX_BYTES = 1_024;
+
+function boundedLogString(value: string): string {
+  const bytes = Buffer.byteLength(value, "utf8");
+  return bytes <= LOG_STRING_MAX_BYTES ? value : `[TRUNCATED bytes=${bytes}]`;
+}
 
 function sanitize(value: unknown, key = "", seen = new WeakSet<object>()): unknown {
   if (SECRET_KEY_PATTERN.test(key)) {
     return "[REDACTED]";
+  }
+  if (typeof value === "string") {
+    return boundedLogString(value);
   }
   if (value === null || typeof value !== "object") {
     return value;
@@ -60,7 +69,7 @@ export class Logger {
       timestamp: new Date().toISOString(),
       level,
       component: this.component,
-      message,
+      message: boundedLogString(message),
       ...sanitizedFields,
     });
     if (level === "error" || level === "warn") {
@@ -72,5 +81,6 @@ export class Logger {
 }
 
 export function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  const message = error instanceof Error ? error.message : String(error);
+  return boundedLogString(message);
 }
