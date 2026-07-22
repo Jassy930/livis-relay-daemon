@@ -7,6 +7,7 @@ import {
   durableAtomicWritePrivate,
   durableMkdirPrivate,
   durableRename,
+  durableUnlink,
   parseSemverTriplet,
   versionAtLeast,
   versionLessThan,
@@ -92,6 +93,43 @@ describe("durable 文件提交", () => {
         },
       })).rejects.toBeInstanceOf(DurableCommitUncertainError);
       expect(await readFile(path, "utf8")).toBe("committed-but-not-confirmed\n");
+    } finally {
+      await directory.cleanup();
+    }
+  });
+
+  test("私有目录 fsync 失败保持 0700 且下次可安全重试", async () => {
+    const directory = await temporaryDirectory("livis-durable-mkdir-retry-");
+    try {
+      const path = join(directory.path, "upstream");
+      const synced: string[] = [];
+      await expect(durableMkdirPrivate(path, {
+        syncDirectory: async (candidate) => {
+          synced.push(candidate);
+          if (candidate === path) throw new Error("injected created directory fsync failure");
+        },
+      })).rejects.toThrow("injected created directory fsync failure");
+      expect(synced).toEqual([directory.path, path]);
+      expect((await stat(path)).mode & 0o777).toBe(0o700);
+      expect(await durableMkdirPrivate(path)).toBeFalse();
+      expect((await stat(path)).mode & 0o777).toBe(0o700);
+    } finally {
+      await directory.cleanup();
+    }
+  });
+
+  test("补偿 unlink 后父目录 fsync 失败报告 durability 未确认", async () => {
+    const directory = await temporaryDirectory("livis-durable-unlink-");
+    try {
+      const path = join(directory.path, "proof.json");
+      await atomicWritePrivate(path, "proof evidence\n");
+      await expect(durableUnlink(path, {
+        syncParentDirectory: async (parent) => {
+          expect(parent).toBe(directory.path);
+          throw new Error("injected unlink parent fsync failure");
+        },
+      })).rejects.toBeInstanceOf(DurableCommitUncertainError);
+      expect(await Bun.file(path).exists()).toBeFalse();
     } finally {
       await directory.cleanup();
     }

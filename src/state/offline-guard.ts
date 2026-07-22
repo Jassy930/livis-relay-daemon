@@ -20,7 +20,7 @@ function isWithin(parent: string, child: string): boolean {
   return value === "" || (!value.startsWith(`..${sep}`) && value !== ".." && !isAbsolute(value));
 }
 
-async function requirePrivateDirectory(path: string, label: string): Promise<string> {
+export async function requirePrivateDirectory(path: string, label: string): Promise<string> {
   const absolute = resolve(path);
   const info = await lstat(absolute);
   if (info.isSymbolicLink() || !info.isDirectory()) {
@@ -301,6 +301,107 @@ export type ProfileOperation =
   | "upstream-activate"
   | "upstream-rollback";
 
+export class ProfileOperationGuardBusyError extends Error {
+  constructor(readonly path: string) {
+    super(`profile operation guard 已存在：${path}；确认没有管理命令运行后再处理遗留 guard`);
+    this.name = "ProfileOperationGuardBusyError";
+  }
+}
+
+export class ProfileOperationGuardFinalizationError extends AggregateError {
+  readonly guardPath: string;
+  readonly primaryError: unknown;
+  readonly releaseError: unknown;
+
+  constructor(operation: string, guardPath: string, primaryError: unknown, releaseError: unknown) {
+    const primaryMessage = primaryError instanceof Error ? primaryError.message : String(primaryError);
+    const releaseMessage = releaseError instanceof Error ? releaseError.message : String(releaseError);
+    super(
+      [primaryError, releaseError],
+      `${operation} 失败后无法释放 profile operation guard：${guardPath}；主错误：${primaryMessage}；释放错误：${releaseMessage}`,
+      { cause: primaryError },
+    );
+    this.name = "ProfileOperationGuardFinalizationError";
+    this.guardPath = guardPath;
+    this.primaryError = primaryError;
+    this.releaseError = releaseError;
+  }
+}
+
+export class ProfileOperationCleanupError extends AggregateError {
+  readonly primaryError: unknown;
+  readonly cleanupFailures: ReadonlyArray<{ label: string; error: unknown }>;
+
+  constructor(
+    operation: string,
+    primaryError: unknown,
+    cleanupFailures: ReadonlyArray<{ label: string; error: unknown }>,
+  ) {
+    const primaryMessage = primaryError instanceof Error ? primaryError.message : String(primaryError);
+    const cleanupMessage = cleanupFailures
+      .map(({ label, error }) => `${label}：${error instanceof Error ? error.message : String(error)}`)
+      .join("；");
+    super(
+      [primaryError, ...cleanupFailures.map(({ error }) => error)],
+      `${operation} 失败，且清理未全部完成；主错误：${primaryMessage}；清理错误：${cleanupMessage}`,
+      { cause: primaryError },
+    );
+    this.name = "ProfileOperationCleanupError";
+    this.primaryError = primaryError;
+    this.cleanupFailures = cleanupFailures;
+  }
+}
+
+export async function rethrowAfterProfileOperationGuardRelease(
+  guard: ProfileOperationGuard,
+  operation: string,
+  primaryError: unknown,
+): Promise<never> {
+  try {
+    await guard.release();
+  } catch (releaseError) {
+    throw new ProfileOperationGuardFinalizationError(
+      operation,
+      guard.path,
+      primaryError,
+      releaseError,
+    );
+  }
+  throw primaryError;
+}
+
+export async function withProfileOperationGuardRelease<T>(
+  guard: ProfileOperationGuard,
+  operation: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  let result: T;
+  try {
+    result = await work();
+  } catch (primaryError) {
+    return rethrowAfterProfileOperationGuardRelease(guard, operation, primaryError);
+  }
+  await guard.release();
+  return result;
+}
+
+export async function rethrowAfterProfileOperationCleanup(
+  operation: string,
+  primaryError: unknown,
+  cleanups: ReadonlyArray<{ label: string; run: () => void | Promise<void> }>,
+): Promise<never> {
+  const cleanupFailures: Array<{ label: string; error: unknown }> = [];
+  for (const cleanup of cleanups) {
+    try {
+      await cleanup.run();
+    } catch (error) {
+      cleanupFailures.push({ label: cleanup.label, error });
+    }
+  }
+  if (cleanupFailures.length === 0) throw primaryError;
+  throw new ProfileOperationCleanupError(operation, primaryError, cleanupFailures);
+}
+
 interface ProfileOperationGuardDocument {
   schemaVersion: 1;
   kind: "livis-relay-profile-operation-guard";
@@ -358,11 +459,16 @@ export class ProfileOperationGuard {
       acquiredAt: new Date().toISOString(),
       nonce: randomUUID(),
     };
-    const lease = await createGuardFile(
-      path,
-      `${JSON.stringify(document, null, 2)}\n`,
-      `profile operation guard 已存在：${path}；确认没有管理命令运行后再处理遗留 guard`,
-    );
+    const existsMessage = `profile operation guard 已存在：${path}；确认没有管理命令运行后再处理遗留 guard`;
+    let lease: GuardFileLease;
+    try {
+      lease = await createGuardFile(path, `${JSON.stringify(document, null, 2)}\n`, existsMessage);
+    } catch (error) {
+      if (error instanceof Error && error.message === existsMessage) {
+        throw new ProfileOperationGuardBusyError(path);
+      }
+      throw error;
+    }
     return new ProfileOperationGuard(path, document, lease);
   }
 
@@ -373,6 +479,14 @@ export class ProfileOperationGuard {
     );
     if (current.nonce !== this.document.nonce) {
       throw new Error("profile operation guard 所有权已变化");
+    }
+  }
+
+  async assertHeldForStateDir(stateDir: string): Promise<void> {
+    await this.assertHeld();
+    const canonicalStateDir = await requirePrivateDirectory(stateDir, "profile operation stateDir");
+    if (dirname(this.path) !== canonicalStateDir) {
+      throw new Error("profile operation guard 不属于当前 stateDir");
     }
   }
 

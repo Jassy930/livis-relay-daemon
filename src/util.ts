@@ -106,7 +106,10 @@ async function syncDirectory(path: string): Promise<void> {
 }
 
 /** 创建单层 0700 目录并同步父目录中的新目录项；父目录必须已存在。 */
-export async function durableMkdirPrivate(path: string): Promise<boolean> {
+export async function durableMkdirPrivate(
+  path: string,
+  options: { syncDirectory?: (path: string) => Promise<void> } = {},
+): Promise<boolean> {
   let created = false;
   try {
     await mkdir(path, { mode: 0o700 });
@@ -137,8 +140,9 @@ export async function durableMkdirPrivate(path: string): Promise<boolean> {
   ) {
     throw new Error(`durable private directory 权限未固定为 0700 或路径已变化：${path}`);
   }
-  await syncDirectory(dirname(path));
-  await syncDirectory(path);
+  const sync = options.syncDirectory ?? syncDirectory;
+  await sync(dirname(path));
+  await sync(path);
   return created;
 }
 
@@ -179,6 +183,23 @@ export async function durableRename(
     }
   } catch (error) {
     throw new DurableCommitUncertainError(destination, error);
+  }
+}
+
+/** 删除文件并同步父目录，使补偿删除也具有明确的持久化结果。 */
+export async function durableUnlink(
+  path: string,
+  options: { syncParentDirectory?: (path: string) => Promise<void> } = {},
+): Promise<void> {
+  await unlink(path);
+  try {
+    if (options.syncParentDirectory) {
+      await options.syncParentDirectory(dirname(path));
+    } else {
+      await syncDirectory(dirname(path));
+    }
+  } catch (error) {
+    throw new DurableCommitUncertainError(path, error);
   }
 }
 
