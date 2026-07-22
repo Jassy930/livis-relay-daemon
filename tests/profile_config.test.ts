@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { join, resolve } from "node:path";
 import { initializeConfig, loadRelayConfig, parseRelayConfig } from "../src/config.ts";
-import { loadProtocolProfile, parseProtocolProfile, runtimeContractSha256 } from "../src/protocol/profile.ts";
+import {
+  loadProtocolProfile,
+  parseProtocolProfile,
+  parseProtocolProfileCatalogEntry,
+  runtimeContractSha256,
+} from "../src/protocol/profile.ts";
 import {
   CURRENT_CREDENTIAL_MODE,
   CURRENT_WIRE_CONTRACT_REVISION,
@@ -79,6 +84,23 @@ describe("配置与协议 profile", () => {
       credentialMode: current.credentialMode,
       wireProtocolVersion: current.wireProtocolVersion,
     })).toEqual(current);
+  });
+
+  test("catalog 只跳过明确 schema v1，损坏 JSON 与未知 schema 继续失败关闭", async () => {
+    const profile = await testProfile();
+    expect(parseProtocolProfileCatalogEntry(JSON.stringify({
+      ...profile,
+      schemaVersion: 1,
+      wireContractRevision: undefined,
+      credentialMode: undefined,
+    }))).toBeNull();
+    expect(() => parseProtocolProfileCatalogEntry("not-json", "broken-profile.json")).toThrow(
+      "不是有效 JSON",
+    );
+    expect(() => parseProtocolProfileCatalogEntry(JSON.stringify({
+      ...profile,
+      schemaVersion: 3,
+    }), "future-profile.json")).toThrow("未知 protocol profile schemaVersion");
   });
 
   test("拒绝非 TLS 的官方端点", async () => {

@@ -23,4 +23,4 @@ bun run src/index.ts init \
 
 profile 不是 secret，但可能包含受服务条款约束的客户端身份和内部端点，因此不要未经授权公开。仓库内的 `*.local.json` 和 `local/` 会被 Git 忽略。
 
-当前 profile schema 为 v2。schema v1 不会自动推断凭据模式；现有部署必须在停服务和备份后人工迁移、重新锁定 SHA 并重新生成 supported proof。详见[本地协议探针](../docs/PROTOCOL-PROBES.md)。
+当前 profile schema 为 v2。schema v1 不会自动推断凭据模式；现有部署只可在停服务、禁用自动拉起和人工审阅固定 r1 contract 后，使用显式 `profile migrate-v2` 迁移。命令不覆盖 v1 文件，以 config durable rename 提交，隔离旧/新 proof，并提供 receipt 驱动的回滚。完整步骤见[官方版本升级与回滚](../docs/UPSTREAM-UPGRADE.md#现有部署的-protocol-profile-schema-v1v2-迁移)。

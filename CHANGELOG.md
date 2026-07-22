@@ -6,6 +6,8 @@
 
 ### 修复
 
+- protocol profile schema v1→v2 回滚不再把 live target v2 文件健康度当作恢复授权；只要 receipt/source backups 能重建完整 target 关系且当前 config SHA 精确命中，target 缺失、损坏或路径异常时仍可恢复 v1，且不读取、重建或覆盖故障 target。
+- schema v1→v2 迁移的 durable 文件、两类 guard 和私有目录现在会在创建句柄或目录上显式固定并读回 `0600` / `0700`，避免极端 `umask` 产生不可读配置、无法释放的 guard 或不可访问目录。
 - `logout` 现在只在 IDaaS revoke 返回 2xx 后清除本地 refresh token；远端非 2xx 或网络失败会令命令失败并保留本地可恢复凭据，不再虚假报告撤销成功。
 - 重复 `cancel_chat` 现在保持 `Cancelling`，不会误降为 `Cancelled` 并绕过 `CancelUnknown` 与 session 隔离；取消状态转移改为 SQLite 原子条件更新，迟到 cancel 不再回退 `Interrupted` 或其他终态。
 - 结果重试不再覆盖旧的投递 ID；首次投递的延迟 ACK 在重试开始后仍能关联原 job。
@@ -21,6 +23,7 @@
 
 - 新增完全离线的 IDaaS / Relay S2 protocol probe、机器可读 wire contract registry、append-only 历史门禁、精确 artifact 发布白名单与严格 fake Relay 场景；当前风险以“观察”记录，不升级为服务端事实。
 - protocol profile 升级为 schema v2，强制绑定 `wireContractRevision + credentialMode`；runtime digest、supported proof 与 status 同步绑定，旧 profile/proof 失败关闭。
+- 新增 protocol profile schema v1→v2 的 dry-run/apply/rollback 闭环：固定 r1 contract 映射、guard 内重复 config/profile SHA 校验、source→target receipt 重建校验、私有目录与长持有创建 fd 锚定的 guard、私有 PREPARED/备份、durable config/fallback 提交点及 old/new/alias proof quarantine；所有 CLI proof writer 与 serve 启动在持锁后加载 context，已回滚 v1 丢失或损坏时可从已验证备份自愈，全流程不触碰 SQLite。
 - 新增 LiViS IDaaS / Relay 服务端协议证据账本，分开真实 canary、官方客户端静态观察、fake Relay、工程推断与未知项，并为 wire 变化建立 Draft、脱敏 canary 和精确 head 门禁。
 - 一期受支持拓扑明确为一个 daemon、config、state directory 和专用 Hermes profile 只绑定一个 LiViS `node_id`（暂按设备来源标识理解）；多设备、跨设备会话和原地换设备不在当前范围内。
 - Hermes plugin 的开发测试依赖约束升级至 `pytest>=9.0.3,<10` 与 `pytest-asyncio>=1.3,<2`（当前锁定 9.1.1 / 1.4.0），修复旧版 pytest 的安全告警；运行时依赖保持不变。
