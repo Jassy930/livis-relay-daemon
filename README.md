@@ -48,21 +48,30 @@ flowchart LR
 - uv 0.11+ 与 Python 3.11–3.13。
 - 本地 Hermes 版本须位于配置中的已审核范围。
 
-### 获取与验证
+### 开发环境快速准备
+
+Bun 是本项目使用的 JavaScript/TypeScript 运行时和包管理器，uv 用来管理 Hermes plugin 的 Python 环境。请先从 [Git](https://git-scm.com/downloads)、[Bun](https://bun.sh/docs/installation) 和 [uv](https://docs.astral.sh/uv/getting-started/installation/) 官方安装说明准备这三个工具；项目不提供下载后立即执行的远程安装脚本。
+
+以下命令仅适用于已经安装 Homebrew 的 macOS；没有 Homebrew 或使用 Linux 时，请按上述官方说明分别安装 Git、Bun 和 uv：
 
 ```bash
-git clone https://github.com/Jassy930/livis-relay-daemon.git
-cd livis-relay-daemon
-bun install --frozen-lockfile
-bun run check
+brew install git oven-sh/bun/bun uv
 ```
+
+确认 `git --version`、`bun --version` 和 `uv --version` 均能正常输出后，复制下面整行即可克隆仓库、按锁文件安装依赖并运行完整自检：
+
+```bash
+git clone https://github.com/Jassy930/livis-relay-daemon.git && cd livis-relay-daemon && bun install --frozen-lockfile && (cd hermes-plugin && uv sync --frozen) && bun run check
+```
+
+这条命令只准备开发环境，不会安装常驻服务，也不会生成连接生产服务所需的 live profile。后续配置步骤见[运行手册](docs/OPERATIONS.md)。
 
 `bun run check` 会依次检查版本、文档链接、Git tracked files、wire contract append-only 历史与本地 S2 protocol probe artifact，再执行 TypeScript 类型检查、全部 Bun 测试、`uv lock --check` 和 Hermes plugin pytest。其中公开发布与 append-only 门禁审核 Git index；probe generator、类型检查和测试读取当前工作区。运行前应先用 `git add` 精确暂存候选文件，并保持 staged/worktree 一致。
 
-截至 2026-07-18 的本地验收：
+截至 2026-07-18 的本地验收记录（测试数量随主线变化，以 `bun run check` 当前输出为准）：
 
-- 57 项 Bun 测试通过（含 fake LiViS 端到端、SQLite、UDS connector、Python 跨语言往返、Device Flow 428、更新/回滚、proof 与公开发布门禁）。
-- 22 项 Hermes plugin pytest 通过，真实 Hermes 0.15.1 package import/runtimeVersion smoke 通过。
+- Bun 测试全部通过（含 fake LiViS 端到端、SQLite、UDS connector、Python 跨语言往返、Device Flow 428、更新/回滚、proof 与公开发布门禁）。
+- Hermes plugin pytest 全部通过，真实 Hermes 0.15.1 package import/runtimeVersion smoke 通过。
 - 使用本地未纳入版本控制的研究 profile，临时目录 `init → upstream check → doctor` 已通过；该 profile 不随公开仓库分发。
 - 状态文件、SQLite、WAL 和 SHM 权限均读回为 `0600`。
 - 已使用隔离的 Hermes 0.15.1 profile 完成真实 Device Flow 登录、Agent ID 绑定和 LiViS v2.0.0 消息 canary：入站任务进入 Hermes、模型生成纯文本结果、durable outbox 收到 `ack_send_result` 并进入 `Delivered`。
