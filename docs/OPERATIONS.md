@@ -161,8 +161,22 @@ test -f "$HERMES_CONFIG" && ! test -L "$HERMES_CONFIG" || {
   echo "livis-test config.yaml 缺失、不是普通文件或为 symlink" >&2
   exit 1
 }
-test "$(stat -f '%l' "$HERMES_CONFIG")" = 1 && \
-  test "$(stat -f '%Lp' "$HERMES_CONFIG")" = 600 || {
+case "$(uname -s)" in
+  Darwin)
+    HERMES_CONFIG_LINKS="$(stat -f '%l' "$HERMES_CONFIG")"
+    HERMES_CONFIG_MODE="$(stat -f '%Lp' "$HERMES_CONFIG")"
+    ;;
+  Linux)
+    HERMES_CONFIG_LINKS="$(stat -c '%h' "$HERMES_CONFIG")"
+    HERMES_CONFIG_MODE="$(stat -c '%a' "$HERMES_CONFIG")"
+    ;;
+  *)
+    echo "不支持的主机系统，无法核验 livis-test config.yaml: $(uname -s)" >&2
+    exit 1
+    ;;
+esac
+test "$HERMES_CONFIG_LINKS" = 1 && \
+  test "$HERMES_CONFIG_MODE" = 600 || {
     echo "livis-test config.yaml 必须是单链接且权限为 0600" >&2
     exit 1
   }
@@ -656,11 +670,27 @@ cleanup_failed_start() {
 hermes_preflight
 trap cleanup_failed_start EXIT
 if launchctl print "$RELAY_TARGET" >/dev/null 2>&1; then
-  launchctl kickstart -k "$RELAY_TARGET"
-else
-  launchctl bootstrap "gui/$(id -u)" \
-    "$HOME/Library/LaunchAgents/com.local.livis-relayd.plist"
+  # kickstart 不会重新读取磁盘上的 plist；先精确卸载旧定义并确认其 PID 退出。
+  PREVIOUS_RELAY_JOB="$(launchctl print "$RELAY_TARGET")"
+  PREVIOUS_RELAY_PID="$(printf '%s\n' "$PREVIOUS_RELAY_JOB" | awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }')"
+  launchctl bootout "$RELAY_TARGET"
+  RELAY_BOOTOUT_DONE=false
+  RELAY_BOOTOUT_DEADLINE=$((SECONDS + 30))
+  while test "$SECONDS" -lt "$RELAY_BOOTOUT_DEADLINE"; do
+    if ! launchctl print "$RELAY_TARGET" >/dev/null 2>&1 && \
+        { test -z "$PREVIOUS_RELAY_PID" || ! ps -p "$PREVIOUS_RELAY_PID" -o pid= >/dev/null 2>&1; }; then
+      RELAY_BOOTOUT_DONE=true
+      break
+    fi
+    sleep 0.5
+  done
+  test "$RELAY_BOOTOUT_DONE" = true || {
+    echo "旧 Relay LaunchAgent 的精确 label 或 PID 未在 30 秒内退出，拒绝载入新定义" >&2
+    exit 1
+  }
 fi
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.local.livis-relayd.plist"
 RELAY_READY=false
 RELAY_JOB=""
 RELAY_PID=""
