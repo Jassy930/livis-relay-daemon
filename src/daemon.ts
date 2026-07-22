@@ -154,6 +154,7 @@ export class RelayDaemon {
         jobId: job.jobId,
         status: job.status,
         outboxStatus: job.outbox?.status ?? null,
+        outboxNextAttemptAt: job.outbox?.nextAttemptAt ?? null,
         runGeneration: job.runGeneration,
         updatedAt: job.updatedAt,
       })),

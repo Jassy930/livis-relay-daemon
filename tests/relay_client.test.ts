@@ -493,6 +493,255 @@ describe("RelayClient fake LiViS end-to-end", () => {
     );
   });
 
+  test("send 同步失败后撤销幽灵 attempt，且不接受尚未发出的 ACK", async () => {
+    createPendingResult(store, "sync-send-failure");
+    const relayClient = createClient(durableHandlers());
+    let closed = false;
+    const internals = relayClient as unknown as {
+      handshakeComplete: boolean;
+      socket: { readyState: number; close: () => void };
+      send: (envelope: RelayEnvelope) => void;
+      deliverResult: (jobId: string, retry: boolean) => Promise<void>;
+    };
+    internals.handshakeComplete = true;
+    internals.socket = { readyState: 1, close: () => { closed = true; } };
+    internals.send = () => {
+      throw new Error("synthetic send failure");
+    };
+
+    await expect(internals.deliverResult("sync-send-failure", false)).rejects.toThrow(
+      "synthetic send failure",
+    );
+    const outbox = store.require("sync-send-failure").outbox!;
+    expect(outbox.status).toBe("Pending");
+    expect(outbox.lastMessageId).toBeNull();
+    expect(outbox.deliveredAt).toBeNull();
+    expect(store.markOutboxDelivered("sync-send-failure")).toBeNull();
+    expect(closed).toBeTrue();
+  });
+
+  test("没有真实投递 attempt 的 job_id ACK 不清理当前 ACK timer", async () => {
+    createPendingResult(store, "never-delivered");
+    const relayClient = createClient(durableHandlers());
+    const internals = relayClient as unknown as {
+      handshakeComplete: boolean;
+      resultAckTimers: Map<string, ReturnType<typeof setTimeout>>;
+      handleEnvelope: (envelope: RelayEnvelope) => Promise<void>;
+    };
+    internals.handshakeComplete = true;
+    const timer = setTimeout(() => undefined, 10_000);
+    internals.resultAckTimers.set("never-delivered", timer);
+    try {
+      await internals.handleEnvelope({
+        type: "ack_send_result",
+        metadata: { job_id: "never-delivered" },
+        payload: {},
+      });
+      expect(store.require("never-delivered").outbox?.status).toBe("Pending");
+      expect(internals.resultAckTimers.get("never-delivered")).toBe(timer);
+    } finally {
+      clearTimeout(timer);
+      internals.resultAckTimers.delete("never-delivered");
+    }
+  });
+
+  test("一次 replay 会继续排空超过单批上限的 Pending outbox", async () => {
+    profile = {
+      ...profile,
+      timing: { ...profile.timing, resultAckTimeoutMs: 10_000 },
+    };
+    for (let index = 0; index < 101; index += 1) {
+      createPendingResult(store, `batch-${index}`);
+    }
+    const relayClient = createClient(durableHandlers());
+    const sent: RelayEnvelope[] = [];
+    const internals = relayClient as unknown as {
+      handshakeComplete: boolean;
+      socket: { readyState: number; close: () => void };
+      send: (envelope: RelayEnvelope) => void;
+      replayOutbox: () => Promise<void>;
+      clearResultTimers: (resetPending: boolean) => void;
+    };
+    internals.handshakeComplete = true;
+    internals.socket = { readyState: 1, close: () => undefined };
+    internals.send = (envelope) => sent.push(envelope);
+
+    try {
+      await internals.replayOutbox();
+      expect(sent).toHaveLength(101);
+      expect(store.listPendingOutbox()).toHaveLength(0);
+      expect(store.require("batch-100").outbox?.status).toBe("Delivering");
+    } finally {
+      internals.clearResultTimers(true);
+    }
+  });
+
+  test("重试耗尽后迟到 ACK 可从持久化退避态完成投递", async () => {
+    profile = {
+      ...profile,
+      timing: { ...profile.timing, resultMaxRetries: 1 },
+    };
+    createPendingResult(store, "late-after-failure");
+    const relayClient = createClient(durableHandlers());
+    relayClient.start();
+    const socket = await fakeRelay.handshake(relayClient);
+
+    const first = await fakeRelay.next("send_result");
+    await fakeRelay.next("send_result");
+    await waitFor(
+      () => store.require("late-after-failure").outbox?.status === "AckFailed",
+      1_000,
+      "outbox persistent backoff",
+    );
+    const nextAttemptAt = store.require("late-after-failure").outbox?.nextAttemptAt;
+    expect(nextAttemptAt).toBeNumber();
+    expect(nextAttemptAt!).toBeGreaterThan(Date.now());
+
+    fakeRelay.send(socket, {
+      type: "ack_send_result",
+      metadata: {},
+      payload: { ref_msg_id: first.envelope.metadata?.msg_id },
+    });
+    await waitFor(
+      () => store.require("late-after-failure").outbox?.status === "Delivered",
+      1_000,
+      "late ACK after retry exhaustion",
+    );
+    await Bun.sleep(Math.max(0, nextAttemptAt! - Date.now() + 20));
+    expect(fakeRelay.count("send_result")).toBe(2);
+  });
+
+  test("AckFailed 退避到期后在当前连接自动开启新的重试周期", async () => {
+    profile = {
+      ...profile,
+      timing: { ...profile.timing, resultMaxRetries: 1 },
+    };
+    createPendingResult(store, "online-recovery");
+    const relayClient = createClient(durableHandlers());
+    relayClient.start();
+    const socket = await fakeRelay.handshake(relayClient);
+
+    const first = await fakeRelay.next("send_result");
+    await fakeRelay.next("send_result");
+    await waitFor(
+      () => store.require("online-recovery").outbox?.status === "AckFailed",
+      1_000,
+      "online outbox backoff",
+    );
+    const recovered = await fakeRelay.next("send_result");
+    expect(recovered.envelope.metadata?.job_id).toBe("online-recovery");
+    expect(recovered.envelope.payload?.data).toBe(first.envelope.payload?.data);
+    expect(recovered.envelope.metadata?.msg_id).not.toBe(first.envelope.metadata?.msg_id);
+    expect(store.require("online-recovery").outbox?.retryCount).toBe(0);
+
+    fakeRelay.send(socket, {
+      type: "ack_send_result",
+      metadata: { job_id: "online-recovery" },
+      payload: {},
+    });
+    await waitFor(
+      () => store.require("online-recovery").outbox?.status === "Delivered",
+      1_000,
+      "online recovered result ACK",
+    );
+  });
+
+  test("断线跨过退避期后，重连会恢复 AckFailed 结果", async () => {
+    profile = {
+      ...profile,
+      timing: { ...profile.timing, resultMaxRetries: 1 },
+    };
+    createPendingResult(store, "reconnect-failed");
+    const relayClient = createClient(durableHandlers());
+    relayClient.start();
+    const firstSocket = await fakeRelay.handshake(relayClient);
+
+    const first = await fakeRelay.next("send_result");
+    await fakeRelay.next("send_result");
+    await waitFor(
+      () => store.require("reconnect-failed").outbox?.status === "AckFailed",
+      1_000,
+      "reconnect outbox backoff",
+    );
+    await fakeRelay.disconnect(firstSocket);
+
+    const secondSocket = await fakeRelay.handshake(relayClient, 3_000);
+    const replayed = await fakeRelay.next("send_result");
+    expect(replayed.envelope.metadata?.job_id).toBe("reconnect-failed");
+    expect(replayed.envelope.payload?.data).toBe(first.envelope.payload?.data);
+    expect(replayed.envelope.metadata?.msg_id).not.toBe(first.envelope.metadata?.msg_id);
+
+    fakeRelay.send(secondSocket, {
+      type: "ack_send_result",
+      metadata: { job_id: "reconnect-failed" },
+      payload: {},
+    });
+    await waitFor(
+      () => store.require("reconnect-failed").outbox?.status === "Delivered",
+      1_000,
+      "reconnected failed result ACK",
+    );
+  });
+
+  test("退避恢复发送失败会关闭旧连接，并在重连后继续", async () => {
+    profile = {
+      ...profile,
+      timing: { ...profile.timing, resultMaxRetries: 0 },
+    };
+    createPendingResult(store, "recovery-send-failure");
+    const relayClient = createClient(durableHandlers());
+    const internals = relayClient as unknown as {
+      send: (envelope: RelayEnvelope) => void;
+    };
+    const originalSend = internals.send.bind(relayClient);
+    let failRecoveryOnce = false;
+    let ghostMessageId: string | null = null;
+    internals.send = (envelope) => {
+      if (failRecoveryOnce && envelope.type === "send_result") {
+        failRecoveryOnce = false;
+        ghostMessageId = envelope.metadata?.msg_id ?? null;
+        throw new Error("synthetic recovery send failure");
+      }
+      originalSend(envelope);
+    };
+
+    relayClient.start();
+    await fakeRelay.handshake(relayClient);
+    const first = await fakeRelay.next("send_result");
+    await waitFor(
+      () => store.require("recovery-send-failure").outbox?.status === "AckFailed",
+      1_000,
+      "recovery failure backoff",
+    );
+    const failed = store.require("recovery-send-failure").outbox!;
+    failRecoveryOnce = true;
+
+    await waitFor(
+      () => ghostMessageId !== null && !relayClient.connected,
+      1_000,
+      "recovery send compensation",
+    );
+    const compensated = store.require("recovery-send-failure").outbox!;
+    expect(compensated.status).toBe("Pending");
+    expect(compensated.lastMessageId).toBe(first.envelope.metadata?.msg_id ?? null);
+    expect(compensated.deliveredAt).toBe(failed.deliveredAt);
+    expect(store.findJobIdByOutboxMessageId(ghostMessageId!)).toBeNull();
+
+    const secondSocket = await fakeRelay.handshake(relayClient, 3_000);
+    const replayed = await fakeRelay.next("send_result", 3_000);
+    expect(replayed.envelope.metadata?.job_id).toBe("recovery-send-failure");
+    fakeRelay.send(secondSocket, {
+      type: "ack_send_result",
+      metadata: { job_id: "recovery-send-failure" },
+      payload: {},
+    });
+    await waitFor(
+      () => store.require("recovery-send-failure").outbox?.status === "Delivered",
+      1_000,
+      "recovery after reconnect",
+    );
+  });
+
   test("cancel-before-message 先持久化意图，后到消息不执行并分别 ACK", async () => {
     let executionCount = 0;
     const relayClient = createClient(durableHandlers((_jobId, inserted) => {
