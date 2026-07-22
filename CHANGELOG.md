@@ -11,6 +11,7 @@
 - CLI、`serve` 启动与 daemon 周期 supported-proof writer 统一使用可验证的 `ProfileOperationGuard` lease；proof 目录逐层固定为 `0700` 并持久化，keyed/alias 半写会按精确内容逆序补偿，绝对到期边界改为 `expiresAt <= now`。
 - supported proof 到期由 one-shot timer、Relay admission 与 dispatch 同步失败关闭；claim 后跨期会撤销未发送 lease。Relay 停止失败会保留 blocker 并由后续入口重试，`connected` 回调不会反向等待自身 run loop；daemon 停止会等待在途复核/关门，`serve` 启动失败按主错误、daemon stop、guard release 的固定顺序聚合清理错误。
 - AckFailed 迟到 ACK 回归不再用 CI runner 的当前墙钟裁决已持久化的退避状态；测试隔离在线 recovery timer，并改为验证 `nextAttemptAt` 相对 outbox 状态更新时间的因果关系，不改变生产退避语义。
+- 普通 profile 激活/回滚改为 guard 内完整 config 文本 CAS、config-last durable rename 与私有 retained-fd readback；禁止 `LIVIS_RELAY_STATE_DIR` 和隐式 stateDir 迁移，拒绝 symlink/hardlink/权限漂移，失败只补偿仍精确命中的本次目标。回滚只恢复 profile 两字段，不再覆盖当前 relay/security/Hermes 等配置。
 - protocol profile schema v1→v2 回滚不再把 live target v2 文件健康度当作恢复授权；只要 receipt/source backups 能重建完整 target 关系且当前 config SHA 精确命中，target 缺失、损坏或路径异常时仍可恢复 v1，且不读取、重建或覆盖故障 target。
 - schema v1→v2 迁移的 durable 文件、两类 guard 和私有目录现在会在创建句柄或目录上显式固定并读回 `0600` / `0700`，避免极端 `umask` 产生不可读配置、无法释放的 guard 或不可访问目录。
 - `logout` 现在只在 IDaaS revoke 返回 2xx 后清除本地 refresh token；远端非 2xx 或网络失败会令命令失败并保留本地可恢复凭据，不再虚假报告撤销成功。

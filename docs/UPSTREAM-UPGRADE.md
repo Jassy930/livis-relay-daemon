@@ -195,13 +195,15 @@ bun run src/index.ts upstream activate \
 
 激活会再次在线下载并要求候选自身达到 `supported`，然后：
 
-1. 复制 profile 到 state directory；
-2. 写配置备份；
-3. 原子切换 profile 路径与 SHA pin；
-4. 写审批回执；
-5. 写新 profile 的 supported proof。
+1. 在同一 operation guard 内核对磁盘 config、当前 profile 和 canonical
+   state directory；
+2. 先持久化候选 profile、原始 config 备份、supported proof 和审批回执；
+3. 最后以 config 同目录 staging 的 durable rename 提交完整文本 CAS；
+4. 读回 config/profile 的完整内容、私有文件身份和 stateDir 归属。
 
-输出中的 `backupConfigPath` 和 `receiptPath` 必须保留。重启 daemon 后执行：
+`LIVIS_RELAY_STATE_DIR` 在普通激活与回滚期间禁用。详细提交点、补偿条件、
+回执判定和人工恢复路径见[普通 profile 激活与回滚](PROFILE-ACTIVATION.md)。
+输出中的 `backupConfigPath` 和 `receiptPath` 必须保留。重启 daemon 前执行：
 
 ```bash
 bun run src/index.ts doctor --online
@@ -220,7 +222,11 @@ bun run src/index.ts upstream rollback \
   --acknowledge-rollback
 ```
 
-回滚会验证备份属于当前 state directory、旧 profile SHA 仍匹配，并再保存一份回滚前配置。随后重新执行 `upstream check` / `doctor --online`；若旧 profile 已不再匹配当前官方 artifact，服务仍会 fail closed。
+回滚会验证备份属于当前 canonical state directory、旧 profile SHA 与私有文件
+身份仍匹配，并再保存一份回滚前配置。它只恢复 `profile` 和
+`profileSha256`，保留当前其他配置字段；随后重新执行 `upstream check` /
+`doctor --online`。若旧 profile 已不再匹配当前官方 artifact，服务仍会
+fail closed。
 
 ## Hermes 官方更新流程
 

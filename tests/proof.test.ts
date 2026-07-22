@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { stat } from "node:fs/promises";
+import { lstat, mkdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { ProtocolProfile } from "../src/protocol/profile.ts";
 import { ProfileOperationGuard } from "../src/state/offline-guard.ts";
@@ -38,6 +38,20 @@ async function saveProof(options: Parameters<typeof saveSupportedProof>[0]) {
     return await saveSupportedProof(options, guard);
   } finally {
     await guard.release();
+  }
+}
+
+async function createFifo(path: string): Promise<void> {
+  const subprocess = Bun.spawn(["mkfifo", path], {
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const [exitCode, stderr] = await Promise.all([
+    subprocess.exited,
+    new Response(subprocess.stderr).text(),
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(`mkfifo 失败（exit ${exitCode}）：${stderr.trim()}`);
   }
 }
 
@@ -181,4 +195,27 @@ describe("近期 upstream supported proof", () => {
       await directory.cleanup();
     }
   });
+
+  test("既有 keyed proof 为 FIFO 时 saveSupportedProof 有界失败且保留 FIFO", async () => {
+    const directory = await temporaryDirectory();
+    try {
+      const profile = await testProfile();
+      const profileSha256 = sha256(`${JSON.stringify(profile, null, 2)}\n`);
+      const keyedPath = supportedProofPath(directory.path, profileSha256);
+      await mkdir(join(directory.path, "upstream", "proofs"), {
+        recursive: true,
+        mode: 0o700,
+      });
+      await createFifo(keyedPath);
+      await expect(saveProof({
+        stateDir: directory.path,
+        profile,
+        profileSha256,
+        snapshot: snapshotFor(profile),
+      })).rejects.toThrow("upstream supported proof 必须是 0600、单 link 的普通文件");
+      expect((await lstat(keyedPath)).isFIFO()).toBeTrue();
+    } finally {
+      await directory.cleanup();
+    }
+  }, 2_000);
 });

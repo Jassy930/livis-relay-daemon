@@ -24,7 +24,11 @@ import {
 } from "./state/offline-guard.ts";
 import { JobStore } from "./state/store.ts";
 import { UpstreamChecker, buildCandidateProfile } from "./upstream/checker.ts";
-import { activateReviewedProfile, rollbackProfileConfig } from "./upstream/activation.ts";
+import {
+  activateReviewedProfile,
+  assertProfileStateDirOverrideAbsent,
+  rollbackProfileConfig,
+} from "./upstream/activation.ts";
 import {
   requireFreshSupportedProof,
   saveSupportedProof,
@@ -324,6 +328,7 @@ async function commandUpstreamCheck(args: string[]): Promise<void> {
 }
 
 async function commandUpstreamActivate(args: string[]): Promise<void> {
+  assertProfileStateDirOverrideAbsent();
   if (!hasFlag(args, "--acknowledge-reviewed-profile")) {
     throw new Error("激活前必须人工审阅 profile，并显式传入 --acknowledge-reviewed-profile");
   }
@@ -331,53 +336,60 @@ async function commandUpstreamActivate(args: string[]): Promise<void> {
   if (!candidatePathRaw) throw new Error("用法：upstream activate --profile PATH --acknowledge-reviewed-profile");
   const candidatePath = expandHome(candidatePathRaw);
   const { context, guard } = await loadProfileOperationContext(args, "upstream-activate");
-  await withProfileOperationGuardRelease(guard, "upstream activate", async () => {
-    const candidateProfile = parseProtocolProfile(await Bun.file(candidatePath).text(), candidatePath);
-    const liveSnapshot = await new UpstreamChecker().check(candidateProfile, [candidateProfile]);
-    const activated = await activateReviewedProfile({
-      configPath: context.path,
-      config: context.config,
-      activeProfile: context.profile,
-      candidateProfile,
-      candidateSourcePath: candidatePath,
-      identity: context.identity,
-      liveSnapshot,
-    });
-    const supportedProof = await saveSupportedProof({
-      stateDir: context.config.stateDir,
-      profile: candidateProfile,
-      profileSha256: activated.receipt.activated.profileSha256,
-      snapshot: liveSnapshot,
-    }, guard);
-    process.stdout.write(`${JSON.stringify({
-      ok: true,
-      activatedProfile: activated.receipt.activated,
-      previousProfile: activated.receipt.previous,
-      backupConfigPath: activated.receipt.backupConfigPath,
-      receiptPath: activated.receiptPath,
-      supportedProofPath: supportedProof.path,
-      restartRequired: true,
-    }, null, 2)}\n`);
-  });
+  const activated = await withProfileOperationGuardRelease(
+    guard,
+    "upstream activate",
+    async () => {
+      const candidateProfile = parseProtocolProfile(
+        await Bun.file(candidatePath).text(),
+        candidatePath,
+      );
+      const liveSnapshot = await new UpstreamChecker().check(candidateProfile, [candidateProfile]);
+      return activateReviewedProfile({
+        configPath: context.path,
+        expectedConfigText: context.text,
+        config: context.config,
+        activeProfile: context.profile,
+        candidateProfile,
+        candidateSourcePath: candidatePath,
+        identity: context.identity,
+        liveSnapshot,
+        guard,
+      });
+    },
+  );
+  process.stdout.write(`${JSON.stringify({
+    ok: true,
+    activatedProfile: activated.receipt.activated,
+    previousProfile: activated.receipt.previous,
+    backupConfigPath: activated.receipt.backupConfigPath,
+    receiptPath: activated.receiptPath,
+    supportedProofPath: activated.supportedProofPath,
+    restartRequired: true,
+  }, null, 2)}\n`);
 }
 
 async function commandUpstreamRollback(args: string[]): Promise<void> {
+  assertProfileStateDirOverrideAbsent();
   if (!hasFlag(args, "--acknowledge-rollback")) {
     throw new Error("回滚前必须确认服务将恢复旧 profile，并显式传入 --acknowledge-rollback");
   }
   const backupPath = optionValue(args, "--backup");
   if (!backupPath) throw new Error("用法：upstream rollback --backup PATH --acknowledge-rollback");
   const { context, guard } = await loadProfileOperationContext(args, "upstream-rollback");
-  try {
-    const result = await rollbackProfileConfig({
+  const result = await withProfileOperationGuardRelease(
+    guard,
+    "upstream rollback",
+    () => rollbackProfileConfig({
       configPath: context.path,
+      expectedConfigText: context.text,
       currentConfig: context.config,
+      currentProfile: context.profile,
       backupConfigPath: expandHome(backupPath),
-    });
-    process.stdout.write(`${JSON.stringify({ ok: true, ...result }, null, 2)}\n`);
-  } finally {
-    await guard.release();
-  }
+      guard,
+    }),
+  );
+  process.stdout.write(`${JSON.stringify({ ok: true, ...result }, null, 2)}\n`);
 }
 
 async function commandProfileMigrateV2(args: string[]): Promise<void> {
