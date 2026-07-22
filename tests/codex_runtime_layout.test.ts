@@ -1,14 +1,29 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, lstat, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  link,
+  lstat,
+  mkdir,
+  realpath,
+  rename,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { join, relative } from "node:path";
 import {
+  assertPinnedCodexCommand,
   assertCodexRuntimeLayout,
   buildCodexEnvironment,
   codexRemoteConfig,
+  codexSecurityBindingSha256,
   codexSessionHash,
   ensureCodexRuntimeLayout,
+  pinCodexCommand,
   resolveCodexCommand,
 } from "../src/backends/codex/runtime-layout.ts";
+import { sha256 } from "../src/util.ts";
 import { temporaryDirectory } from "./helpers.ts";
 
 describe("Codex daemon 托管目录", () => {
@@ -148,6 +163,74 @@ describe("Codex daemon 托管目录", () => {
       const outsideLinkToWorkspace = join(binaries.path, "workspace-codex");
       await symlink(workspaceCommand, outsideLinkToWorkspace);
       await expect(resolveCodexCommand(layout, outsideLinkToWorkspace)).rejects.toThrow("realpath");
+    } finally {
+      await Promise.all([state.cleanup(), binaries.cleanup()]);
+    }
+  });
+
+  test("Codex command 绑定单 link、完整内容摘要与持久安全摘要", async () => {
+    const state = await temporaryDirectory("livis-codex-command-pin-state-");
+    const binaries = await temporaryDirectory("livis-codex-command-pin-bin-");
+    try {
+      await chmod(state.path, 0o700);
+      const layout = await ensureCodexRuntimeLayout({
+        stateDir: state.path,
+        scopeKey: "scope",
+        sessionKey: "session",
+        remoteNodeId: "node-a",
+      });
+      const bytes = "#!/bin/sh\nprintf 'codex-cli 0.145.0\\n'\n";
+      const executable = join(binaries.path, "codex-real");
+      const commandLink = join(binaries.path, "codex");
+      await writeFile(executable, bytes, { mode: 0o700 });
+      await symlink(executable, commandLink);
+
+      const pin = await pinCodexCommand(layout, commandLink);
+      expect(pin.path).toBe(await realpath(executable));
+      expect(pin.nlink).toBe(1);
+      expect(pin.contentSha256).toBe(sha256(bytes));
+      expect(pin.identitySha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(codexSecurityBindingSha256(layout, pin)).toMatch(/^[0-9a-f]{64}$/);
+      expect(codexSecurityBindingSha256(layout, pin))
+        .not.toBe(sha256(codexRemoteConfig(layout.workspace)));
+      await assertPinnedCodexCommand(pin);
+
+      const hardlink = join(binaries.path, "codex-hardlink");
+      await link(executable, hardlink);
+      await expect(pinCodexCommand(layout, commandLink)).rejects.toThrow("单 link");
+      await unlink(hardlink);
+      await expect(assertPinnedCodexCommand(pin)).rejects.toThrow("漂移");
+    } finally {
+      await Promise.all([state.cleanup(), binaries.cleanup()]);
+    }
+  });
+
+  test("Codex command 拒绝原地内容修改、目录项换 inode 与宽松写权限", async () => {
+    const state = await temporaryDirectory("livis-codex-command-drift-state-");
+    const binaries = await temporaryDirectory("livis-codex-command-drift-bin-");
+    try {
+      await chmod(state.path, 0o700);
+      const layout = await ensureCodexRuntimeLayout({
+        stateDir: state.path,
+        scopeKey: "scope",
+        sessionKey: "session",
+        remoteNodeId: "node-a",
+      });
+      const executable = join(binaries.path, "codex-real");
+      await writeFile(executable, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+      const pin = await pinCodexCommand(layout, executable);
+
+      await writeFile(executable, "#!/bin/sh\nexit 1\n", { mode: 0o700 });
+      await expect(assertPinnedCodexCommand(pin)).rejects.toThrow("漂移");
+
+      const repinned = await pinCodexCommand(layout, executable);
+      const replacement = join(binaries.path, "replacement");
+      await writeFile(replacement, "#!/bin/sh\nexit 1\n", { mode: 0o700 });
+      await rename(replacement, executable);
+      await expect(assertPinnedCodexCommand(repinned)).rejects.toThrow("漂移");
+
+      await chmod(executable, 0o722);
+      await expect(pinCodexCommand(layout, executable)).rejects.toThrow("group/other");
     } finally {
       await Promise.all([state.cleanup(), binaries.cleanup()]);
     }

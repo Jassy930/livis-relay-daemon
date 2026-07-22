@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdir, realpath, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, link, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import {
   CODEX_IDLE_RECOVERY_DELAYS_MS,
   CodexExecutionBackend,
+  type CodexCommandPinAsserter,
+  type CodexCommandPinResolver,
   type CodexCommandRunner,
   type CodexExecutionBackendDependencies,
   validateDisabledCodexFeatures,
@@ -21,8 +23,9 @@ import {
   type CodexAppServerSpawnOptions,
 } from "../src/backends/codex/app-server-client.ts";
 import {
-  codexRemoteConfig,
+  codexSecurityBindingSha256,
   ensureCodexRuntimeLayout,
+  type PinnedCodexCommand,
 } from "../src/backends/codex/runtime-layout.ts";
 import { runCodexAppServerLocalSmoke } from "../src/backends/codex/local-smoke.ts";
 import { serializeResult } from "../src/protocol/livis.ts";
@@ -105,6 +108,13 @@ class FakeCodexAppServer {
   ) => FakeCodexFeature[] = (features) => features;
   threadReadbackOverride: Record<string, unknown> = {};
   materializationMode: "valid" | "missing" | "wrong-id" = "valid";
+  commandExecHandler: (
+    params: Record<string, unknown>,
+  ) => Promise<Record<string, unknown>> | Record<string, unknown> = () => ({
+    exitCode: 0,
+    stdout: "",
+    stderr: "",
+  });
   materializationReadMisses = 0;
   rolloutPath: string | null = null;
   failWriteMethod: string | null = null;
@@ -214,6 +224,11 @@ class FakeCodexAppServer {
         data: this.featureListTransform(features),
         nextCursor: null,
       });
+      return;
+    }
+    if (message.method === "command/exec") {
+      const params = isRecord(message.params) ? message.params : {};
+      await this.respond(message.id, await this.commandExecHandler(params));
       return;
     }
     if (message.method === "thread/start" || message.method === "thread/resume") {
@@ -472,6 +487,28 @@ const successfulVersion: CodexCommandRunner = async () => ({
   stderr: "",
 });
 
+function fakeCommandPin(path = "/test/bin/codex"): PinnedCodexCommand {
+  const contentSha256 = sha256("fake-codex-command");
+  return {
+    path,
+    dev: 1,
+    ino: 2,
+    mode: 0o100700,
+    nlink: 1,
+    uid: 501,
+    gid: 20,
+    size: 18,
+    mtimeMs: 1,
+    ctimeMs: 1,
+    contentSha256,
+    identitySha256: sha256(JSON.stringify(["fake-codex-command-v1", path, contentSha256])),
+  };
+}
+
+const fakeCommandPinResolver: CodexCommandPinResolver = async (_layout, command) =>
+  fakeCommandPin(command);
+const fakeCommandPinAsserter: CodexCommandPinAsserter = async () => undefined;
+
 function requireCodexAttempt(event: ExecutionJobEvent & { turnId?: string | null }): {
   runGeneration: number;
   turnId: string;
@@ -487,6 +524,8 @@ async function createHarness(options: {
   interruptGraceMs?: number;
   configureFake?: (fake: FakeCodexAppServer) => void;
   commandRunner?: CodexCommandRunner;
+  commandPinResolver?: CodexCommandPinResolver;
+  commandPinAsserter?: CodexCommandPinAsserter;
   existingThreadId?: string;
   existingRollout?: "valid" | "missing";
   maxOutputChars?: number;
@@ -524,7 +563,7 @@ async function createHarness(options: {
       requestedModel: null,
       effectiveModel: "gpt-5.6-sol",
       modelProvider: "openai",
-      securityConfigSha256: sha256(codexRemoteConfig(layout.workspace)),
+      securityConfigSha256: codexSecurityBindingSha256(layout, fakeCommandPin()),
       featureSnapshotSha256: validateDisabledCodexFeatures({
         data: codex0145FeatureSnapshot(),
         nextCursor: null,
@@ -649,6 +688,8 @@ async function createHarness(options: {
     handlers,
     appServerSpawn: options.appServerSpawn ?? fake.spawn,
     commandRunner: options.commandRunner ?? successfulVersion,
+    commandPinResolver: options.commandPinResolver ?? fakeCommandPinResolver,
+    commandPinAsserter: options.commandPinAsserter ?? fakeCommandPinAsserter,
     ...(options.recoveryDelaysMs === undefined
       ? {}
       : { recoveryDelaysMs: options.recoveryDelaysMs }),
@@ -687,6 +728,162 @@ function claimJob(harness: Harness, jobId: string, text = "请处理"): StoredJo
   const claimed = harness.store.claimForBackendDispatch(jobId, "codex", executionId, `lease-${jobId}`);
   if (!claimed) throw new Error("test job claim 失败");
   return claimed;
+}
+
+type ReadIsolationScenario = {
+  externalHardlink:
+    | "denied"
+    | "created"
+    | "wrong-target"
+    | "create-fails"
+    | "denied-command-drift";
+  network: "eperm" | "eacces" | "connected" | "other-errno" | "timeout" | "perl-unavailable";
+};
+
+async function createReadIsolationSmokeHarness(scenario: ReadIsolationScenario): Promise<{
+  run: () => ReturnType<typeof runCodexAppServerLocalSmoke>;
+  stateDir: string;
+  networkPort: () => number | null;
+  loopbackStopped: () => boolean;
+  cleanup: () => Promise<void>;
+}> {
+  const commandDirectory = await temporaryDirectory("livis-codex-smoke-command-");
+  const stateParent = await temporaryDirectory("livis-codex-smoke-state-");
+  const stateDir = join(await realpath(stateParent.path), "state");
+  const command = join(commandDirectory.path, "codex");
+  await writeFile(command, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  const freshFake = new FakeCodexAppServer();
+  const resumedFake = new FakeCodexAppServer();
+  freshFake.account = null;
+  resumedFake.account = null;
+  let observedNetworkPort: number | null = null;
+  let loopbackAccepts = 0;
+  let loopbackStopped = false;
+  freshFake.commandExecHandler = async (params) => {
+    const argv = Array.isArray(params.command) && params.command.every((item) => typeof item === "string")
+      ? params.command as string[]
+      : [];
+    const executable = argv[0];
+    if (executable === "/bin/cat") {
+      const path = argv[1] ?? "";
+      if (path.startsWith(`${freshFake.workspace}/`)) {
+        return { exitCode: 0, stdout: await readFile(path, "utf8"), stderr: "" };
+      }
+      return { exitCode: 1, stdout: "", stderr: "Operation not permitted" };
+    }
+    if (executable === "/usr/bin/touch") {
+      const path = argv[1] ?? "";
+      if (path.startsWith(`${freshFake.workspace}/`)) {
+        await writeFile(path, "");
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return { exitCode: 1, stdout: "", stderr: "Operation not permitted" };
+    }
+    if (executable === "/usr/bin/env") {
+      if (scenario.externalHardlink === "create-fails") {
+        const hostHome = join(dirname(freshFake.workspace), "host-home");
+        await rm(hostHome, { recursive: true, force: true });
+        await writeFile(hostHome, "blocks external canary creation\n", { mode: 0o600 });
+      }
+      return {
+        exitCode: 0,
+        stdout: `HOME=${join(freshFake.workspace, ".agent-home")}\n` +
+          `TMPDIR=${join(freshFake.workspace, ".agent-tmp")}\n`,
+        stderr: "",
+      };
+    }
+    if (executable === "/bin/ln") {
+      const source = argv[1] ?? "";
+      const target = argv[2] ?? "";
+      if (source.includes(".livis-hardlink-control-source-")) {
+        await link(source, target);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (scenario.externalHardlink === "created") {
+        await link(source, target);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (scenario.externalHardlink === "wrong-target") {
+        await writeFile(target, "do-not-delete-replacement\n", { mode: 0o600 });
+        return { exitCode: 1, stdout: "", stderr: "Operation not permitted" };
+      }
+      if (scenario.externalHardlink === "denied-command-drift") {
+        await writeFile(command, "#!/bin/sh\necho drift\n", { mode: 0o700 });
+      }
+      return { exitCode: 1, stdout: "", stderr: "Operation not permitted" };
+    }
+    if (executable === "/usr/bin/perl") {
+      const program = argv[3] ?? "";
+      if (program.includes("PERL_SOCKET_OK")) {
+        if (scenario.network === "perl-unavailable") {
+          return { exitCode: 127, stdout: "", stderr: "Can't locate Socket.pm" };
+        }
+        return { exitCode: 0, stdout: "PERL_SOCKET_OK\n", stderr: "" };
+      }
+      observedNetworkPort = Number(argv.at(-1));
+      if (scenario.network === "connected") {
+        loopbackAccepts += 1;
+        return { exitCode: 0, stdout: "CONNECTED=1\n", stderr: "" };
+      }
+      if (scenario.network === "timeout") {
+        return { exitCode: 124, stdout: "", stderr: "synthetic timeout" };
+      }
+      const errno = scenario.network === "eperm" ? 1 : scenario.network === "eacces" ? 13 : 60;
+      return {
+        exitCode: 77,
+        stdout: `CONNECTED=0\nERRNO=${errno}\n`,
+        stderr: "",
+      };
+    }
+    throw new Error(`fake app-server 收到未覆盖的 command/exec：${JSON.stringify(argv)}`);
+  };
+  let spawnCount = 0;
+  const smokeSpawn: CodexAppServerSpawn = (argv, options) => {
+    const fake = spawnCount++ === 0 ? freshFake : resumedFake;
+    if (fake === resumedFake) {
+      resumedFake.threadId = freshFake.threadId;
+      resumedFake.rolloutPath = freshFake.rolloutPath;
+    }
+    return fake.spawn(argv, options);
+  };
+  return {
+    run: () => runCodexAppServerLocalSmoke({
+      command,
+      createStateDir: stateDir,
+      verifyReadIsolation: true,
+      requestTimeoutMs: 1_000,
+      shutdownTimeoutMs: 1_000,
+    }, {
+      appServerSpawn: smokeSpawn,
+      commandRunner: successfulVersion,
+      readIsolationStateDirAsserter: async () => undefined,
+      loopbackProbeFactory: () => ({
+        port: 43_123,
+        acceptCount: () => loopbackAccepts,
+        connectControl: async () => {
+          loopbackAccepts += 1;
+        },
+        waitForAcceptCount: async (expected) => loopbackAccepts >= expected,
+        stop: () => {
+          loopbackStopped = true;
+        },
+      }),
+    }),
+    stateDir,
+    networkPort: () => observedNetworkPort,
+    loopbackStopped: () => loopbackStopped,
+    cleanup: async () => {
+      await Promise.all([freshFake.stop(0), resumedFake.stop(0)]);
+      await Promise.all([commandDirectory.cleanup(), stateParent.cleanup()]);
+    },
+  };
+}
+
+async function listHardlinkCanaryFiles(stateDir: string): Promise<string[]> {
+  const entries = await readdir(stateDir, { recursive: true });
+  return entries
+    .map(String)
+    .filter((entry) => entry.includes(".livis-hardlink-"));
 }
 
 describe("CodexExecutionBackend", () => {
@@ -756,6 +953,156 @@ describe("CodexExecutionBackend", () => {
         await rm(smokeStateDir, { recursive: true, force: true });
       }
       await commandDirectory.cleanup();
+    }
+  });
+
+  for (const network of ["eperm", "eacces"] as const) {
+    test(`读取隔离 smoke 接受 ${network.toUpperCase()} 并清理全部 hardlink 牺牲文件`, async () => {
+      const harness = await createReadIsolationSmokeHarness({
+        externalHardlink: "denied",
+        network,
+      });
+      try {
+        const report = await harness.run();
+        expect(report.readIsolationCanary).toEqual({
+          stateDirOutsideTemporaryRoots: true,
+          workspaceRead: true,
+          workspaceWrite: true,
+          agentHomeWrite: true,
+          agentTmpWrite: true,
+          agentEnvironmentPinned: true,
+          codexHomeReadDenied: true,
+          codexHomeWriteDenied: true,
+          hostHomeReadDenied: true,
+          hostHomeWriteDenied: true,
+          hostTmpReadDenied: true,
+          hostTmpWriteDenied: true,
+          sensitiveEnvironmentHidden: true,
+          workspaceHardlinkControlPassed: true,
+          externalFileHardlinkDenied: true,
+          externalFileIdentityStable: true,
+          commandIdentityStable: true,
+          loopbackEndpointReachable: true,
+          perlSocketProbeAvailable: true,
+          toolNetworkPermissionDenied: true,
+        });
+        expect(await listHardlinkCanaryFiles(harness.stateDir)).toEqual([]);
+      } finally {
+        await harness.cleanup();
+      }
+    });
+  }
+
+  test("读取隔离 smoke 拒绝已实际创建的外部 hardlink 并完整清理", async () => {
+    const harness = await createReadIsolationSmokeHarness({
+      externalHardlink: "created",
+      network: "eperm",
+    });
+    try {
+      await expect(harness.run()).rejects.toThrow("允许把 workspace 外文件 hardlink");
+      expect(await listHardlinkCanaryFiles(harness.stateDir)).toEqual([]);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("第二个牺牲文件创建失败时仍清理第一个 workspace source", async () => {
+    const harness = await createReadIsolationSmokeHarness({
+      externalHardlink: "create-fails",
+      network: "eperm",
+    });
+    try {
+      await expect(harness.run()).rejects.toThrow();
+      expect(await listHardlinkCanaryFiles(harness.stateDir)).toEqual([]);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("hardlink 探针期间 command identity 漂移会拒绝且仍完整清理", async () => {
+    const harness = await createReadIsolationSmokeHarness({
+      externalHardlink: "denied-command-drift",
+      network: "eperm",
+    });
+    try {
+      await expect(harness.run()).rejects.toThrow("文件身份或内容摘要已漂移");
+      expect(await listHardlinkCanaryFiles(harness.stateDir)).toEqual([]);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("读取隔离 smoke 在 target 身份漂移时不误删并上抛 cleanup 失败", async () => {
+    const harness = await createReadIsolationSmokeHarness({
+      externalHardlink: "wrong-target",
+      network: "eperm",
+    });
+    try {
+      await expect(harness.run()).rejects.toThrow("牺牲文件未完整清理");
+      const residual = await listHardlinkCanaryFiles(harness.stateDir);
+      expect(residual).toHaveLength(1);
+      expect(residual[0]).toContain(".livis-hardlink-external-target-");
+      expect(await readFile(join(harness.stateDir, residual[0]!), "utf8"))
+        .toBe("do-not-delete-replacement\n");
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("读取隔离 smoke 拒绝 TCP 命中与普通网络 errno", async () => {
+    for (const network of ["connected", "other-errno", "timeout"] as const) {
+      const harness = await createReadIsolationSmokeHarness({
+        externalHardlink: "denied",
+        network,
+      });
+      try {
+        await expect(harness.run()).rejects.toThrow("未得到明确 EPERM/EACCES");
+        expect(harness.networkPort()).not.toBeNull();
+        expect(harness.loopbackStopped()).toBeTrue();
+        expect(await listHardlinkCanaryFiles(harness.stateDir)).toEqual([]);
+      } finally {
+        await harness.cleanup();
+      }
+    }
+  });
+
+  test("读取隔离 smoke 在 Perl/Socket 不可用时拒绝裁决", async () => {
+    const harness = await createReadIsolationSmokeHarness({
+      externalHardlink: "denied",
+      network: "perl-unavailable",
+    });
+    try {
+      await expect(harness.run()).rejects.toThrow("Perl/Socket 正向 control 失败");
+      expect(harness.loopbackStopped()).toBeTrue();
+      expect(await listHardlinkCanaryFiles(harness.stateDir)).toEqual([]);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("版本探针后 command identity 漂移时不启动 app-server", async () => {
+    let versionProbeCompleted = false;
+    let identityChecks = 0;
+    const fake = new FakeCodexAppServer();
+    const harness = await createHarness({
+      start: false,
+      fake,
+      commandRunner: async () => {
+        versionProbeCompleted = true;
+        return { exitCode: 0, stdout: "codex-cli 0.145.0\n", stderr: "" };
+      },
+      commandPinAsserter: async () => {
+        identityChecks += 1;
+        if (versionProbeCompleted) throw new Error("synthetic command identity drift");
+      },
+    });
+    try {
+      await expect(harness.backend.start()).rejects.toThrow("command identity drift");
+      expect(identityChecks).toBe(1);
+      expect(fake.messages).toEqual([]);
+      expect(harness.backend.ready).toBeFalse();
+    } finally {
+      await harness.cleanup();
     }
   });
 
@@ -951,6 +1298,8 @@ describe("CodexExecutionBackend", () => {
         handlers: harness.handlers,
         appServerSpawn: resumedFake.spawn,
         commandRunner: successfulVersion,
+        commandPinResolver: fakeCommandPinResolver,
+        commandPinAsserter: fakeCommandPinAsserter,
       });
       await restarted.start();
 
@@ -967,6 +1316,56 @@ describe("CodexExecutionBackend", () => {
       expect(harness.events).toEqual(["ready", "ready"]);
     } finally {
       await restarted?.stop().catch(() => undefined);
+      await harness.cleanup();
+    }
+  });
+
+  test("daemon 重启时 command 持久安全绑定漂移会在版本探针前 quarantine", async () => {
+    const harness = await createHarness();
+    const resumedFake = new FakeCodexAppServer();
+    let restarted: CodexExecutionBackend | null = null;
+    let versionProbeCount = 0;
+    try {
+      await harness.backend.stop();
+      const driftedPin = {
+        ...fakeCommandPin(),
+        contentSha256: sha256("drifted-fake-codex-command"),
+        identitySha256: sha256("drifted-fake-codex-command-identity"),
+      };
+      restarted = new CodexExecutionBackend({
+        stateDir: harness.directory.path,
+        scopeKey: "scope-test",
+        sessionKey: "livis:agent-test",
+        remoteNodeId: "node-1",
+        command: "/test/bin/codex",
+        model: null,
+        maxOutputChars: 1_048_576,
+        requestTimeoutMs: 100,
+        turnTimeoutMs: 5_000,
+        interruptGraceMs: 25,
+        shutdownTimeoutMs: 100,
+      }, {
+        store: harness.store,
+        handlers: harness.handlers,
+        appServerSpawn: resumedFake.spawn,
+        commandRunner: async () => {
+          versionProbeCount += 1;
+          return successfulVersion([], { cwd: "", env: {}, timeoutMs: 1 });
+        },
+        commandPinResolver: async () => driftedPin,
+        commandPinAsserter: fakeCommandPinAsserter,
+      });
+
+      await expect(restarted.start()).rejects.toThrow("release session");
+      expect(versionProbeCount).toBe(0);
+      expect(resumedFake.messages).toEqual([]);
+      expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
+        .toContain("command 文件身份");
+      expect(harness.store.releaseSessionRecovery("livis:agent-test")).toBeTrue();
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")).toBeNull();
+    } finally {
+      await restarted?.stop().catch(() => undefined);
+      await resumedFake.stop(0);
       await harness.cleanup();
     }
   });
@@ -2277,6 +2676,46 @@ describe("CodexExecutionBackend", () => {
       }
     });
   }
+
+  test("idle recovery 发现 command 持久安全绑定漂移会在 spawn 前 quarantine", async () => {
+    const initial = new FakeCodexAppServer();
+    const sequence = new FakeCodexAppServerSequence([
+      initial,
+      new FakeCodexAppServer(),
+    ]);
+    let pinResolutionCount = 0;
+    const harness = await createHarness({
+      fake: initial,
+      appServerSpawn: sequence.spawn,
+      recoveryDelaysMs: [0, 0, 0],
+      commandPinResolver: async () => {
+        pinResolutionCount += 1;
+        if (pinResolutionCount === 1) return fakeCommandPin();
+        return {
+          ...fakeCommandPin(),
+          contentSha256: sha256("idle-recovery-command-drift"),
+          identitySha256: sha256("idle-recovery-command-identity-drift"),
+        };
+      },
+    });
+    try {
+      await initial.stop(35);
+      await waitFor(() => harness.disconnects.length === 1, "command drift disconnect");
+      await Bun.sleep(10);
+
+      expect(pinResolutionCount).toBe(2);
+      expect(sequence.spawnCount).toBe(1);
+      expect(harness.backend.status()).toMatchObject({
+        state: "failed",
+        ready: false,
+        recovery: { inProgress: false, attempts: 1, maxAttempts: 3 },
+      });
+      expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
+        .toContain("command 文件身份");
+    } finally {
+      await harness.cleanup();
+    }
+  });
 
   test("stop 会取消尚在退避的 idle recovery 并等待其收口", async () => {
     const initial = new FakeCodexAppServer();

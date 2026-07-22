@@ -81,7 +81,14 @@ git clone https://github.com/Jassy930/livis-relay-daemon.git && cd livis-relay-d
 
 2026-07-18 曾在旧代码基线上留下 Hermes 0.15.1 前台纯文本闭环的高层人工摘要；同期 LaunchAgent 记录也只证明服务存活、online doctor、Relay handshake 与 connector ready。它们都早于后续 protocol profile v2、单设备边界、Relay 资源门禁和 JobStore v3，更早于当前 JobStore v7，且没有绑定当前最终提交的完整 receipt，因此只作历史参考，不能证明当前版本或 launchd 常驻消息闭环已经通过。证据边界和当前验收步骤见 [`docs/HERMES-CANARY.md`](docs/HERMES-CANARY.md)。
 
-Codex 的真实 `thread/start` 安全回读已经命中 workspace-only、无工具网络和审批关闭边界；但由于验证环境的外层 sandbox 无法可靠嵌套 Seatbelt，恶意凭据读取负向 canary 尚未完成。因此 Codex 仍是 Draft/受控开发功能，不应宣称生产上线，完整门禁见 [`docs/CODEX-APPSERVER.md`](docs/CODEX-APPSERVER.md)。
+Codex 0.145.0 的真实 `thread/start` 安全回读曾在 macOS 命中 workspace-only、
+凭据/宿主 HOME 读写拒绝和审批关闭边界。当前又实现了 workspace 外同卷牺牲文件
+hardlink、command identity 与工具 loopback 原始 `connect` errno 的组合 canary；但本机
+真实非临时回归仍因 sandbox 阻断 Perl/Socket 运行时而失败关闭，尚不能把新增组合门禁写成
+已通过。daemon 会流式绑定 command 内容摘要与文件身份，并在启动、恢复和持久 session 间
+失败关闭。真实账号 turn、Linux/cgroup、资源配额与 LiViS App 回显也仍未验收，因此 Codex
+仍是 Draft/受控开发功能，不应宣称生产上线，完整门禁见
+[`docs/CODEX-APPSERVER.md`](docs/CODEX-APPSERVER.md)。
 
 仓库提供 Relay LaunchAgent 模板、Hermes 双服务运行手册和 Codex 单服务边界，但安装、加载、启停与真实消息 canary 都是操作者在获授权环境中的显式步骤；合并文档或 `plutil -lint` 通过不代表用户服务已被修改，也不代表 LiViS 消息已完成 `Succeeded → Delivered → App 回显` 闭环。
 

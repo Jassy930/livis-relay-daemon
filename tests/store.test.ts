@@ -1172,13 +1172,46 @@ describe("backend session durability", () => {
     expect(interrupted.activeTurnId).toBe("turn-1");
     expect(store.listQuarantinedSessions().map((entry) => entry.sessionKey)).toContain(sessionKey);
 
-    expect(store.releaseSessionRecovery(sessionKey)).toBeTrue();
+    expect(store.releaseSessionRecoveryWithReceipt(sessionKey)).toEqual({
+      released: true,
+      retiredBackendSessions: [backend],
+      releasedQuarantineWithoutBackendSession: false,
+    });
     expect(store.getBackendSession(backend, sessionKey)).toBeNull();
     expect(store.listQuarantinedSessions()).toHaveLength(0);
     expect(store.listExecutionAttemptEvents(claimed.jobId).map((event) => event.eventType))
       .toEqual(["reserved", "accepted", "interrupted"]);
     expect(store.latestExecutionAttemptEvent(claimed.jobId)?.providerOperationId).toBe("turn-1");
     expect(store.releaseSessionRecovery(sessionKey)).toBeFalse();
+  });
+
+  test("显式 release 会退役无 active/recovery 的 quarantined idle session", () => {
+    ensureSession();
+    store.bindBackendThread(backend, sessionKey, "thread-idle-drift");
+    store.quarantineSession(sessionKey, "command security binding drift");
+
+    expect(store.getBackendSession(backend, sessionKey)?.recoveryRequired).toBeFalse();
+    expect(store.getBackendSession(backend, sessionKey)?.activeJobId).toBeNull();
+    expect(store.releaseSessionRecoveryWithReceipt(sessionKey)).toEqual({
+      released: true,
+      retiredBackendSessions: [backend],
+      releasedQuarantineWithoutBackendSession: false,
+    });
+    expect(store.getBackendSession(backend, sessionKey)).toBeNull();
+    expect(store.getSessionQuarantine(sessionKey)).toBeNull();
+    expect(store.releaseSessionRecovery(sessionKey)).toBeFalse();
+  });
+
+  test("显式 release 原子回报仅有 quarantine、尚无 backend session 的场景", () => {
+    const unboundSessionKey = "livis:thread-start-ambiguous";
+    store.quarantineSession(unboundSessionKey, "thread/start response 丢失");
+
+    expect(store.releaseSessionRecoveryWithReceipt(unboundSessionKey)).toEqual({
+      released: true,
+      retiredBackendSessions: [],
+      releasedQuarantineWithoutBackendSession: true,
+    });
+    expect(store.getSessionQuarantine(unboundSessionKey)).toBeNull();
   });
 
   test("ambiguous 与 cancel unknown 原子进入 recovery，且保留精确 attempt", () => {

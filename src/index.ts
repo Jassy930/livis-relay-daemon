@@ -13,10 +13,11 @@ import { RelayDaemon, DAEMON_VERSION } from "./daemon.ts";
 import { runCodexCommand } from "./backends/codex/codex-execution-backend.ts";
 import { runCodexAppServerLocalSmoke } from "./backends/codex/local-smoke.ts";
 import {
+  assertPinnedCodexCommand,
   assertCodexRuntimeLayout,
   buildCodexEnvironment,
   ensureCodexRuntimeLayout,
-  resolveCodexCommand,
+  pinCodexCommand,
 } from "./backends/codex/runtime-layout.ts";
 import { IdaasClient } from "./auth/idaas.ts";
 import { IdentityStore } from "./identity.ts";
@@ -31,13 +32,14 @@ import {
 import { SecretStore } from "./secrets.ts";
 import { fetchDaemonStatus } from "./status-client.ts";
 import {
+  DaemonOfflineGuard,
   ProfileOperationGuard,
   rethrowAfterProfileOperationCleanup,
   rethrowAfterProfileOperationGuardRelease,
   withProfileOperationGuardRelease,
   type ProfileOperation,
 } from "./state/offline-guard.ts";
-import { JobStore } from "./state/store.ts";
+import { JobStore, type SessionReleaseReceipt } from "./state/store.ts";
 import { UpstreamChecker, buildCandidateProfile } from "./upstream/checker.ts";
 import {
   activateReviewedProfile,
@@ -517,12 +519,13 @@ async function commandDoctor(args: string[]): Promise<void> {
         remoteNodeId: context.config.security.allowedNodeIds[0]!,
       });
       await assertCodexRuntimeLayout(layout);
-      const command = await resolveCodexCommand(layout, context.config.codex.command);
-      const result = await runCodexCommand([command, "--version"], {
+      const command = await pinCodexCommand(layout, context.config.codex.command);
+      const result = await runCodexCommand([command.path, "--version"], {
         cwd: layout.workspace,
         env: await buildCodexEnvironment(layout),
         timeoutMs: context.config.codex.requestTimeoutMs,
       });
+      await assertPinnedCodexCommand(command);
       backendStdout = result.stdout;
       backendStderr = result.stderr;
       backendExit = result.exitCode;
@@ -628,22 +631,46 @@ async function commandReleaseSession(args: string[]): Promise<void> {
       "用法：session release <sessionKey>；执行前必须停止 daemon、备份状态，并确认旧执行进程与工具副作用均已退出；Codex recovery 会退役旧 thread 绑定",
     );
   }
-  const context = await loadContext(optionValue(args, "--config"));
-  const store = new JobStore(
-    join(context.config.stateDir, "relay.db"),
-    IdentityStore.scopeKey(context.identity),
-    { legacyV4JobBackend: context.config.execution.legacyV4JobBackend ?? undefined },
+  const initial = await loadRelayConfig(optionValue(args, "--config"));
+  const offlineGuard = await DaemonOfflineGuard.acquire(
+    initial.config.connector.socketPath,
+    initial.config.stateDir,
+    "session-release",
   );
-  const codexResetRequired = store.getBackendSession("codex", sessionKey)?.recoveryRequired === true;
-  const released = store.releaseSessionRecovery(sessionKey);
-  store.close();
+  let receipt: SessionReleaseReceipt;
+  try {
+    const context = await loadContext(initial.path);
+    if (
+      await realpath(context.config.stateDir) !== await realpath(initial.config.stateDir) ||
+      resolve(context.config.connector.socketPath) !== offlineGuard.path
+    ) {
+      throw new Error("config stateDir 或 connector.socketPath 在 session release 门禁期间发生变化");
+    }
+    await offlineGuard.assertHeld();
+    const store = new JobStore(
+      join(context.config.stateDir, "relay.db"),
+      IdentityStore.scopeKey(context.identity),
+      { legacyV4JobBackend: context.config.execution.legacyV4JobBackend ?? undefined },
+    );
+    try {
+      receipt = store.releaseSessionRecoveryWithReceipt(sessionKey);
+    } finally {
+      store.close();
+    }
+    await offlineGuard.assertHeld();
+    await offlineGuard.release();
+  } catch (error) {
+    return rethrowAfterProfileOperationCleanup("session release", error, [{
+      label: "daemon offline guard",
+      run: () => offlineGuard.release(),
+    }]);
+  }
   process.stdout.write(`${JSON.stringify({
-    released,
+    ...receipt,
     sessionKey,
-    retiredBackendSessions: released && codexResetRequired ? ["codex"] : [],
-    nextStartCreatesNewThread: released && codexResetRequired,
+    codexBackendSessionRetired: receipt.retiredBackendSessions.includes("codex"),
   })}\n`);
-  if (!released) process.exitCode = 1;
+  if (!receipt.released) process.exitCode = 1;
 }
 
 async function commandCodexSmokeAppServer(args: string[]): Promise<void> {

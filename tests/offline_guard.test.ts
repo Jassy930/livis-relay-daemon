@@ -105,6 +105,22 @@ describe("离线与 profile 操作 guard", () => {
     await guard.release();
   });
 
+  test("session release 使用 connector 路径 offline guard 并拒绝并发 daemon", async () => {
+    const socketPath = join(directory.path, "session-release.sock");
+    const guard = await DaemonOfflineGuard.acquire(
+      socketPath,
+      directory.path,
+      "session-release",
+    );
+    expect(guard.document.operation).toBe("session-release");
+    expect((await stat(guard.path)).mode & 0o777).toBe(0o600);
+
+    const server = connectorServer(socketPath);
+    expect(() => server.start()).toThrow("socket 路径已存在且不是 socket");
+    await guard.release();
+    expect(await Bun.file(socketPath).exists()).toBeFalse();
+  });
+
   test("极端 umask 下两种 guard 仍固定 0600 并可正常校验释放", async () => {
     const guardUrl = new URL("../src/state/offline-guard.ts", import.meta.url).href;
     await runBunEval(`

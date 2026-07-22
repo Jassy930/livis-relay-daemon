@@ -21,6 +21,12 @@ import { sha256 } from "../util.ts";
 export const PENDING_CANCEL_TTL_MS = 24 * 60 * 60 * 1_000;
 export const PENDING_CANCEL_MAX_ROWS = 4_096;
 
+export interface SessionReleaseReceipt {
+  released: boolean;
+  retiredBackendSessions: string[];
+  releasedQuarantineWithoutBackendSession: boolean;
+}
+
 export class PendingCancelCapacityError extends Error {
   constructor() {
     super(`pending cancel intent 已达到总量上限：${PENDING_CANCEL_MAX_ROWS}`);
@@ -1416,9 +1422,18 @@ export class JobStore {
    * recovery 表示旧 provider execution 的最终尾部可能已经变化；仅清 active 字段
    * 再 resume 原 thread 会把未知尾部伪装成安全连续性。因此人工确认后退役整条
    * backend session，保留 jobs/outbox 与上游 rollout，但下次启动必须创建新 thread。
+   * 没有 recovery 的 idle quarantine（例如 command/security binding 漂移）同样必须
+   * 退役旧 session；只删除 quarantine 会让下一次启动再次命中旧 immutable metadata。
    */
-  releaseSessionRecovery(sessionKey: string): boolean {
+  releaseSessionRecoveryWithReceipt(sessionKey: string): SessionReleaseReceipt {
     const transaction = this.database.transaction(() => {
+      const existingBackends = this.database
+        .query<{ backend: string }, [string, string]>(
+          `SELECT backend FROM backend_sessions
+           WHERE scope_key=? AND session_key=? ORDER BY backend`,
+        )
+        .all(this.scopeKey, sessionKey)
+        .map((row) => row.backend);
       const recovery = this.database
         .query<{ total: number; releasable: number }, [string, string]>(
           `SELECT COUNT(*) AS total,
@@ -1436,11 +1451,67 @@ export class JobStore {
         .get(this.scopeKey, sessionKey) ?? { total: 0, releasable: 0 };
 
       if (recovery.total === 0) {
-        return this.database
+        const quarantine = this.database
+          .query<{ present: number }, [string, string]>(
+            `SELECT EXISTS(
+               SELECT 1 FROM session_quarantine WHERE scope_key=? AND session_key=?
+             ) AS present`,
+          )
+          .get(this.scopeKey, sessionKey)?.present ?? 0;
+        if (quarantine !== 1) {
+          return {
+            released: false,
+            retiredBackendSessions: [],
+            releasedQuarantineWithoutBackendSession: false,
+          };
+        }
+        const unsafeSessions = this.database
+          .query<{ count: number }, [string, string]>(
+            `SELECT COUNT(*) AS count FROM backend_sessions
+             WHERE scope_key=? AND session_key=?
+               AND (active_job_id IS NOT NULL OR recovery_required<>0)`,
+          )
+          .get(this.scopeKey, sessionKey)?.count ?? 0;
+        if (unsafeSessions !== 0) {
+          return {
+            released: false,
+            retiredBackendSessions: [],
+            releasedQuarantineWithoutBackendSession: false,
+          };
+        }
+        const retired = this.database
+          .query(`DELETE FROM backend_sessions
+                  WHERE scope_key=? AND session_key=?
+                    AND active_job_id IS NULL AND recovery_required=0`)
+          .run(this.scopeKey, sessionKey).changes;
+        if (retired !== existingBackends.length) {
+          throw new Error("idle quarantine 退役数量与事务内快照不一致");
+        }
+        const released = this.database
           .query("DELETE FROM session_quarantine WHERE scope_key=? AND session_key=?")
           .run(this.scopeKey, sessionKey).changes === 1;
+        return {
+          released,
+          retiredBackendSessions: released ? existingBackends : [],
+          releasedQuarantineWithoutBackendSession: released && existingBackends.length === 0,
+        };
       }
-      if (recovery.releasable !== recovery.total) return false;
+      if (recovery.releasable !== recovery.total) {
+        return {
+          released: false,
+          retiredBackendSessions: [],
+          releasedQuarantineWithoutBackendSession: false,
+        };
+      }
+
+      const recoveryBackends = this.database
+        .query<{ backend: string }, [string, string]>(
+          `SELECT backend FROM backend_sessions
+           WHERE scope_key=? AND session_key=? AND recovery_required=1
+           ORDER BY backend`,
+        )
+        .all(this.scopeKey, sessionKey)
+        .map((row) => row.backend);
 
       const released = this.database
         .query(`DELETE FROM backend_sessions
@@ -1452,9 +1523,17 @@ export class JobStore {
       this.database
         .query("DELETE FROM session_quarantine WHERE scope_key=? AND session_key=?")
         .run(this.scopeKey, sessionKey);
-      return true;
+      return {
+        released: true,
+        retiredBackendSessions: recoveryBackends,
+        releasedQuarantineWithoutBackendSession: false,
+      };
     });
     return transaction.immediate();
+  }
+
+  releaseSessionRecovery(sessionKey: string): boolean {
+    return this.releaseSessionRecoveryWithReceipt(sessionKey).released;
   }
 
   markAcked(jobId: string): StoredJob {

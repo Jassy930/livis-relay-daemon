@@ -301,8 +301,10 @@ quarantine 边界后才可把 acknowledgement 设为 `true`。Codex 模式代码
 为 true、Codex 版本命中窗口、SQLite integrity 正常且无 quarantine。它不检查专用
 账号是否真的可创建 thread；最终还要由 `serve` 的 `account/read`、permission profile
 高风险 feature、thread sandbox 与 rollout 持久化回读共同放行。macOS/Codex 0.145.0
-的非临时读取负向 canary 与零 turn 重启恢复已经通过；完整 turn deadline 与同一 POSIX
-进程组的 TERM/KILL 收口已有代码和 fake 回归，但真实账号 turn、Linux/cgroup、资源配额、
+的旧候选非临时基础读取负向 canary 与零 turn 重启恢复曾经通过；新增的 hardlink、command
+identity 与原始 TCP errno 组合 canary 仍因 sandbox 内 Perl/Socket 系统运行时不可读而
+失败关闭，尚未取得完整真实回执。完整 turn deadline 与同一 POSIX 进程组的 TERM/KILL
+收口已有代码和 fake 回归，但真实账号 turn、Linux/cgroup、资源配额、
 逃逸进程组后代和 LiViS App 回显仍未验收，因此本模式当前只用于受控开发，不得宣称
 生产上线。
 
@@ -330,9 +332,15 @@ bun run smoke:codex:app-server -- \
 
 只有同时读回 `workspaceRead=true`、`workspaceWrite=true`、
 `codexHomeReadDenied=true`、`codexHomeWriteDenied=true`、
-`sensitiveEnvironmentHidden=true`、`highRiskFeaturesDisabled=true` 和
-`bundledSkillsDisabled=true` 才表示本机安全 probe 通过。该命令不登录、不发送模型
-turn，也不等于真实 LiViS 功能闭环；用完后确认输出路径再删除。
+`sensitiveEnvironmentHidden=true`、`workspaceHardlinkControlPassed=true`、
+`externalFileHardlinkDenied=true`、`externalFileIdentityStable=true`、
+`commandIdentityStable=true`、`loopbackEndpointReachable=true`、
+`perlSocketProbeAvailable=true`、`toolNetworkPermissionDenied=true`、
+`highRiskFeaturesDisabled=true` 和 `bundledSkillsDisabled=true` 才表示本机安全 probe 通过。
+hardlink 探针使用 workspace 外同卷牺牲文件，不触碰真实 Codex executable；网络探针要求
+Perl/Socket 原始 `connect` 精确返回 `EPERM/EACCES`，普通超时、其他 errno、TCP 命中或
+`/bin/ln`、Perl/Socket 缺失都按无法裁决失败。该命令不登录、不发送模型 turn，也不等于
+真实 LiViS 功能闭环；用完后确认输出路径再删除。
 
 ## 7. 启动顺序
 
@@ -1301,12 +1309,17 @@ JobStore v7 与 protocol profile schema v1→v2 是两条独立迁移：profile 
 bun run src/index.ts session release '<sessionKey>'
 ```
 
-`session release` 不会回滚文件或外部系统副作用。对于存在 recovery 的 Codex backend，
-它会退役并删除数据库中的旧 session/thread 绑定，而不是只清 active 后恢复一个尾部可能
-漂移的旧 thread；旧 rollout、workspace、job/outbox 不会删除。下次启动会按当时账号、
-模型和安全配置创建新 thread，所以这是显式 session reset。不得只为清除状态而跳过前四
-步；release 后必须再运行 `doctor --online`，确认无 quarantine，再启动 daemon 并从
-`status` 读回新 thread。
+`session release` 会先在 connector socket 路径取得 daemon offline guard；运行中 daemon、
+遗留 socket/guard 或并发启动存在时拒绝继续。它不会回滚文件或外部系统副作用。对于存在
+recovery 的 Codex backend，或没有 active/recovery 但因 command/security 等漂移进入
+quarantine 的 idle session，它会退役数据库中的旧 session/thread 绑定，而不是只清 active
+后恢复一个尾部可能漂移的旧 thread；仍有不可释放证据时失败关闭。旧 rollout、workspace、
+job/outbox 不会删除。JSON 的 `retiredBackendSessions` 与
+`releasedQuarantineWithoutBackendSession` 由同一个 SQLite 事务生成；只有
+`codexBackendSessionRetired=true` 能精确表示旧 Codex row 已删除。不得把仅 quarantine
+释放解读成 ambiguous `thread/start` 外部副作用已撤销，也不得只为清状态跳过前四步。
+release 后必须再运行 `doctor --online`，确认无 quarantine，再启动 daemon 并从 `status`
+读回实际新建或恢复的 thread。
 
 ## 10. Relay 资源边界告警
 

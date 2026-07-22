@@ -1,4 +1,5 @@
-import { chmod, lstat, mkdir, mkdtemp, realpath } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdir, mkdtemp, open, realpath, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
@@ -20,11 +21,13 @@ import {
   type CodexCommandRunner,
 } from "./codex-execution-backend.ts";
 import {
+  assertPinnedCodexCommand,
   assertCodexRuntimeLayout,
   buildCodexEnvironment,
   CODEX_REMOTE_PERMISSION_PROFILE,
   ensureCodexRuntimeLayout,
-  resolveCodexCommand,
+  pinCodexCommand,
+  type PinnedCodexCommand,
 } from "./runtime-layout.ts";
 import {
   durableAtomicWritePrivate,
@@ -47,6 +50,18 @@ export interface CodexAppServerLocalSmokeOptions {
 export interface CodexAppServerLocalSmokeDependencies {
   appServerSpawn?: CodexAppServerSpawn;
   commandRunner?: CodexCommandRunner;
+  /** 仅供 deterministic 测试替换非临时目录门禁；生产调用不得传入。 */
+  readIsolationStateDirAsserter?: (stateDir: string) => Promise<void>;
+  /** 仅供 deterministic 测试替换宿主 loopback socket；生产调用不得传入。 */
+  loopbackProbeFactory?: () => CodexLocalSmokeLoopbackProbe;
+}
+
+export interface CodexLocalSmokeLoopbackProbe {
+  port: number;
+  acceptCount(): number;
+  connectControl(): Promise<void>;
+  waitForAcceptCount(expected: number, waitMs: number): Promise<boolean>;
+  stop(): void;
 }
 
 export interface CodexAppServerLocalSmokeReport {
@@ -56,6 +71,8 @@ export interface CodexAppServerLocalSmokeReport {
   stateDir: string;
   workspace: string;
   codexCommand: string;
+  codexCommandContentSha256: string;
+  codexCommandIdentitySha256: string;
   cliVersion: string;
   account: {
     authenticated: boolean;
@@ -91,6 +108,13 @@ export interface CodexAppServerLocalSmokeReport {
     hostTmpReadDenied: true;
     hostTmpWriteDenied: true;
     sensitiveEnvironmentHidden: true;
+    workspaceHardlinkControlPassed: true;
+    externalFileHardlinkDenied: true;
+    externalFileIdentityStable: true;
+    commandIdentityStable: true;
+    loopbackEndpointReachable: true;
+    perlSocketProbeAvailable: true;
+    toolNetworkPermissionDenied: true;
   };
   appServerStderrObserved: boolean;
   appServerStderrTruncated: boolean;
@@ -204,12 +228,164 @@ function inspectCommandExec(value: unknown, label: string): CommandExecInspectio
   };
 }
 
+interface CanaryFileIdentity {
+  dev: number;
+  ino: number;
+}
+
+async function createExclusiveCanaryFile(
+  path: string,
+  content: string,
+): Promise<CanaryFileIdentity> {
+  const handle = await open(
+    path,
+    constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+    0o700,
+  );
+  let identity: CanaryFileIdentity | null = null;
+  let createError: unknown = null;
+  try {
+    const openedInfo = await handle.stat();
+    identity = { dev: openedInfo.dev, ino: openedInfo.ino };
+    if (!openedInfo.isFile() || openedInfo.nlink !== 1 || (openedInfo.mode & 0o777) !== 0o700) {
+      throw new Error(`Codex canary 文件身份不安全：${path}`);
+    }
+    await handle.writeFile(content);
+    await handle.sync();
+    const finalInfo = await handle.stat();
+    if (
+      !finalInfo.isFile() ||
+      finalInfo.dev !== identity.dev ||
+      finalInfo.ino !== identity.ino ||
+      finalInfo.nlink !== 1 ||
+      (finalInfo.mode & 0o777) !== 0o700
+    ) {
+      throw new Error(`Codex canary 文件身份在创建期间发生变化：${path}`);
+    }
+  } catch (error) {
+    createError = error;
+  }
+  let closeError: unknown = null;
+  try {
+    await handle.close();
+  } catch (error) {
+    closeError = error;
+  }
+  if (createError !== null || closeError !== null) {
+    let cleanupError: unknown = null;
+    try {
+      if (identity === null) {
+        throw new Error(`Codex canary 创建失败且无法取得安全清理身份：${path}`);
+      }
+      await removeOwnedCanaryPath(path, identity);
+    } catch (error) {
+      cleanupError = error;
+    }
+    const errors = [createError, closeError, cleanupError].filter(
+      (error): error is NonNullable<typeof error> => error !== null,
+    );
+    if (errors.length === 1) throw errors[0];
+    throw new AggregateError(errors, `Codex canary 文件创建失败且未能完整清理：${path}`);
+  }
+  if (identity === null) throw new Error(`Codex canary 文件创建后缺少身份：${path}`);
+  return identity;
+}
+
+async function removeOwnedCanaryPath(
+  path: string,
+  expected: CanaryFileIdentity,
+): Promise<void> {
+  let info;
+  try {
+    info = await lstat(path);
+  } catch (error) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      (error as { code?: unknown }).code === "ENOENT"
+    ) {
+      return;
+    }
+    throw error;
+  }
+  if (!info.isFile() || info.dev !== expected.dev || info.ino !== expected.ino) {
+    throw new Error(`Codex canary cleanup 拒绝删除身份漂移的路径：${path}`);
+  }
+  await unlink(path);
+}
+
+async function cleanupCanaryPaths(
+  paths: ReadonlyArray<{ path: string; identity: CanaryFileIdentity }>,
+): Promise<void> {
+  const errors: unknown[] = [];
+  for (const item of paths) {
+    try {
+      await removeOwnedCanaryPath(item.path, item.identity);
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "Codex canary 路径未能按文件身份完整清理");
+  }
+}
+
+function createLoopbackProbe(): CodexLocalSmokeLoopbackProbe {
+  let loopbackAccepts = 0;
+  const acceptWaiters = new Set<() => void>();
+  const listener = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      open(socket) {
+        loopbackAccepts += 1;
+        for (const resolveWaiter of [...acceptWaiters]) resolveWaiter();
+        socket.end();
+      },
+      data() {},
+      error() {},
+    },
+  });
+  return {
+    port: listener.port,
+    acceptCount: () => loopbackAccepts,
+    connectControl: async () => {
+      const socket = await Bun.connect({
+        hostname: "127.0.0.1",
+        port: listener.port,
+        socket: { data() {}, open() {}, error() {} },
+      });
+      socket.end();
+    },
+    waitForAcceptCount: async (expected, waitMs) => {
+      if (loopbackAccepts >= expected) return true;
+      return new Promise<boolean>((resolvePromise) => {
+        const done = () => {
+          clearTimeout(timer);
+          acceptWaiters.delete(done);
+          resolvePromise(true);
+        };
+        const timer = setTimeout(() => {
+          acceptWaiters.delete(done);
+          resolvePromise(loopbackAccepts >= expected);
+        }, waitMs);
+        acceptWaiters.add(done);
+      });
+    },
+    stop: () => listener.stop(true),
+  };
+}
+
 async function runReadIsolationCanary(
   client: CodexAppServerClient,
   layout: Awaited<ReturnType<typeof ensureCodexRuntimeLayout>>,
+  commandPin: PinnedCodexCommand,
   timeoutMs: number,
+  stateDirAsserter: (stateDir: string) => Promise<void>,
+  loopbackProbeFactory: () => CodexLocalSmokeLoopbackProbe,
 ): Promise<NonNullable<CodexAppServerLocalSmokeReport["readIsolationCanary"]>> {
-  await requireStateOutsideTemporaryRoots(layout.stateDir);
+  await stateDirAsserter(layout.stateDir);
   const workspaceMarker = "livis-workspace-read-canary-v1\n";
   const codexHomeMarker = "livis-codex-home-deny-read-canary-v1\n";
   const hostHomeMarker = "livis-host-home-deny-read-canary-v1\n";
@@ -384,6 +560,176 @@ async function runReadIsolationCanary(
   ) {
     throw new Error("Codex sandbox 子进程仍继承了敏感宿主环境变量");
   }
+
+  const nonce = crypto.randomUUID();
+  const workspaceInfo = await lstat(layout.workspace);
+  const hardlinkControlSource = join(layout.workspace, `.livis-hardlink-control-source-${nonce}`);
+  const hardlinkControlTarget = join(layout.workspace, `.livis-hardlink-control-target-${nonce}`);
+  const externalSource = join(layout.hostHome, `.livis-hardlink-external-source-${nonce}`);
+  const externalTarget = join(layout.workspace, `.livis-hardlink-external-target-${nonce}`);
+  const ownedCanaryPaths: Array<{ path: string; identity: CanaryFileIdentity }> = [];
+  let hardlinkError: unknown = null;
+  try {
+    const controlIdentity = await createExclusiveCanaryFile(
+      hardlinkControlSource,
+      "livis-hardlink-control-v2\n",
+    );
+    ownedCanaryPaths.push({ path: hardlinkControlSource, identity: controlIdentity });
+    ownedCanaryPaths.unshift({ path: hardlinkControlTarget, identity: controlIdentity });
+    const externalIdentity = await createExclusiveCanaryFile(
+      externalSource,
+      "livis-hardlink-external-v2\n",
+    );
+    ownedCanaryPaths.push({ path: externalSource, identity: externalIdentity });
+    ownedCanaryPaths.unshift({ path: externalTarget, identity: externalIdentity });
+    if (
+      workspaceInfo.dev !== controlIdentity.dev ||
+      workspaceInfo.dev !== externalIdentity.dev
+    ) {
+      throw new Error("Codex hardlink canary 的 workspace 与外部牺牲文件不在同一文件系统");
+    }
+    const hardlinkControl = inspectCommandExec(
+      await client.request("command/exec", {
+        ...common,
+        command: ["/bin/ln", hardlinkControlSource, hardlinkControlTarget],
+      }),
+      "Codex workspace hardlink 正向 control",
+    );
+    if (hardlinkControl.exitCode !== 0) {
+      throw new Error(
+        `Codex workspace hardlink 正向 control 失败：${JSON.stringify(hardlinkControl.stderr.slice(0, 512))}`,
+      );
+    }
+    const controlTargetInfo = await lstat(hardlinkControlTarget);
+    if (
+      !controlTargetInfo.isFile() ||
+      controlTargetInfo.dev !== controlIdentity.dev ||
+      controlTargetInfo.ino !== controlIdentity.ino ||
+      controlTargetInfo.nlink !== 2
+    ) {
+      throw new Error("Codex workspace hardlink 正向 control 未形成预期的双 link inode");
+    }
+
+    const externalHardlink = inspectCommandExec(
+      await client.request("command/exec", {
+        ...common,
+        command: ["/bin/ln", externalSource, externalTarget],
+      }),
+      "Codex workspace 外文件 hardlink 负向 canary",
+    );
+    let externalLinkCreated = false;
+    try {
+      const targetInfo = await lstat(externalTarget);
+      externalLinkCreated = true;
+      if (
+        !targetInfo.isFile() ||
+        targetInfo.dev !== externalIdentity.dev ||
+        targetInfo.ino !== externalIdentity.ino
+      ) {
+        throw new Error("Codex 外部文件 hardlink canary 产生了非预期目录项");
+      }
+    } catch (error) {
+      if (
+        typeof error !== "object" ||
+        error === null ||
+        !("code" in error) ||
+        (error as { code?: unknown }).code !== "ENOENT"
+      ) {
+        throw error;
+      }
+    }
+    if (externalHardlink.exitCode === 0 || externalLinkCreated) {
+      throw new Error("Codex sandbox 允许把 workspace 外文件 hardlink 进 workspace");
+    }
+    const externalAfter = await lstat(externalSource);
+    if (
+      externalAfter.dev !== externalIdentity.dev ||
+      externalAfter.ino !== externalIdentity.ino ||
+      externalAfter.nlink !== 1
+    ) {
+      throw new Error("Codex hardlink 负向 canary 后外部牺牲文件身份已变化");
+    }
+    await assertPinnedCodexCommand(commandPin);
+  } catch (error) {
+    hardlinkError = error;
+  }
+  let hardlinkCleanupError: unknown = null;
+  try {
+    await cleanupCanaryPaths(ownedCanaryPaths);
+  } catch (error) {
+    hardlinkCleanupError = error;
+  }
+  if (hardlinkError !== null && hardlinkCleanupError !== null) {
+    throw new AggregateError(
+      [hardlinkError, hardlinkCleanupError],
+      "Codex hardlink canary 失败且牺牲文件未完整清理",
+    );
+  }
+  if (hardlinkCleanupError !== null) throw hardlinkCleanupError;
+  if (hardlinkError !== null) throw hardlinkError;
+
+  const loopback = loopbackProbeFactory();
+  try {
+    await loopback.connectControl();
+    if (
+      !await loopback.waitForAcceptCount(1, Math.min(timeoutMs, 1_000)) ||
+      loopback.acceptCount() !== 1
+    ) {
+      throw new Error("Codex 工具网络 canary 的 host TCP 正向 control 失败");
+    }
+    const perlControl = inspectCommandExec(
+      await client.request("command/exec", {
+        ...common,
+        command: ["/usr/bin/perl", "-MSocket", "-e", "print qq(PERL_SOCKET_OK\\n)"],
+      }),
+      "Codex sandbox Perl/Socket 正向 control",
+    );
+    if (perlControl.exitCode !== 0 || perlControl.stdout !== "PERL_SOCKET_OK\n") {
+      throw new Error(
+        "Codex sandbox Perl/Socket 正向 control 失败，网络 canary 无法裁决：" +
+          `exit=${perlControl.exitCode} stdout=${JSON.stringify(perlControl.stdout.slice(0, 512))} ` +
+          `stderr=${JSON.stringify(perlControl.stderr.slice(0, 512))}`,
+      );
+    }
+    const perlSocketProbe = [
+      "use strict; use warnings; use Socket qw(PF_INET SOCK_STREAM inet_aton sockaddr_in);",
+      "socket(my $socket, PF_INET, SOCK_STREAM, getprotobyname('tcp')) or do { print 'SOCKET_ERRNO='.(0+$!).qq(\\n); exit 78; };",
+      "my $address = sockaddr_in($ARGV[1], inet_aton($ARGV[0]));",
+      "if (connect($socket, $address)) { print qq(CONNECTED=1\\n); exit 0; }",
+      "print 'CONNECTED=0'.qq(\\n).'ERRNO='.(0+$!).qq(\\n); exit 77;",
+    ].join(" ");
+    const networkProbe = inspectCommandExec(
+      await client.request("command/exec", {
+        ...common,
+        command: [
+          "/usr/bin/perl",
+          "-MSocket",
+          "-e",
+          perlSocketProbe,
+          "127.0.0.1",
+          String(loopback.port),
+        ],
+      }),
+      "Codex 工具网络权限负向 canary",
+    );
+    await Promise.resolve();
+    const errnoMatch = /^ERRNO=(\d+)$/m.exec(networkProbe.stdout);
+    const errno = errnoMatch ? Number(errnoMatch[1]) : null;
+    if (
+      networkProbe.exitCode !== 77 ||
+      !networkProbe.stdout.includes("CONNECTED=0\n") ||
+      (errno !== 1 && errno !== 13) ||
+      loopback.acceptCount() !== 1
+    ) {
+      throw new Error(
+        `Codex 工具网络 canary 未得到明确 EPERM/EACCES：exit=${networkProbe.exitCode} ` +
+          `accepts=${loopback.acceptCount()} stdout=${JSON.stringify(networkProbe.stdout.slice(0, 512))} ` +
+          `stderr=${JSON.stringify(networkProbe.stderr.slice(0, 512))}`,
+      );
+    }
+  } finally {
+    loopback.stop();
+  }
   return {
     stateDirOutsideTemporaryRoots: true,
     workspaceRead: true,
@@ -398,6 +744,13 @@ async function runReadIsolationCanary(
     hostTmpReadDenied: true,
     hostTmpWriteDenied: true,
     sensitiveEnvironmentHidden: true,
+    workspaceHardlinkControlPassed: true,
+    externalFileHardlinkDenied: true,
+    externalFileIdentityStable: true,
+    commandIdentityStable: true,
+    loopbackEndpointReachable: true,
+    perlSocketProbeAvailable: true,
+    toolNetworkPermissionDenied: true,
   };
 }
 
@@ -459,13 +812,15 @@ export async function runCodexAppServerLocalSmoke(
     remoteNodeId: "local-smoke-node",
   });
   await assertCodexRuntimeLayout(layout);
-  const command = await resolveCodexCommand(layout, options.command);
+  const commandPin = await pinCodexCommand(layout, options.command);
+  const command = commandPin.path;
   const environment = await buildCodexEnvironment(layout);
   const versionResult = await (dependencies.commandRunner ?? runCodexCommand)(
     [command, "--version"],
     { cwd: layout.workspace, env: environment, timeoutMs: requestTimeoutMs },
   );
   const cliVersion = validateCodexVersion(versionResult);
+  await assertPinnedCodexCommand(commandPin);
   let approvalRequestCount = 0;
   const startClient = () => CodexAppServerClient.start({
       command: buildAppServerCommand(command),
@@ -499,7 +854,14 @@ export async function runCodexAppServerLocalSmoke(
       cliVersion,
     );
     readIsolationCanary = options.verifyReadIsolation === true
-      ? await runReadIsolationCanary(client, layout, requestTimeoutMs)
+      ? await runReadIsolationCanary(
+          client,
+          layout,
+          commandPin,
+          requestTimeoutMs,
+          dependencies.readIsolationStateDirAsserter ?? requireStateOutsideTemporaryRoots,
+          dependencies.loopbackProbeFactory ?? createLoopbackProbe,
+        )
       : null;
     const threadResponse = await client.threadStart({
       cwd: layout.workspace,
@@ -514,6 +876,7 @@ export async function runCodexAppServerLocalSmoke(
     validateFreshSmokeThread(threadResponse, cliVersion);
     await materializeFreshCodexThread(client, layout, threadId, requestTimeoutMs);
     await assertCodexRuntimeLayout(layout);
+    await assertPinnedCodexCommand(commandPin);
     if (approvalRequestCount !== 0) {
       throw new Error("Codex smoke 在未发送 turn 时收到意外 approval request");
     }
@@ -556,6 +919,7 @@ export async function runCodexAppServerLocalSmoke(
     validateThreadResponse(resumed, layout, threadId);
     await validatePersistedCodexThread(resumed, layout, threadId);
     await assertCodexRuntimeLayout(layout);
+    await assertPinnedCodexCommand(commandPin);
     if (approvalRequestCount !== 0) {
       throw new Error("Codex smoke 在零 turn 恢复时收到意外 approval request");
     }
@@ -569,6 +933,8 @@ export async function runCodexAppServerLocalSmoke(
     stateDir,
     workspace: layout.workspace,
     codexCommand: command,
+    codexCommandContentSha256: commandPin.contentSha256,
+    codexCommandIdentitySha256: commandPin.identitySha256,
     cliVersion,
     account: {
       authenticated: account.accountType !== null,

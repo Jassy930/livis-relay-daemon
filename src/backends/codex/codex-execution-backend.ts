@@ -36,13 +36,15 @@ import {
   type CodexAppServerSpawn,
 } from "./app-server-client.ts";
 import {
+  assertPinnedCodexCommand,
   assertCodexRuntimeLayout,
   buildCodexEnvironment,
-  codexRemoteConfig,
+  codexSecurityBindingSha256,
   CODEX_REMOTE_PERMISSION_PROFILE,
   ensureCodexRuntimeLayout,
-  resolveCodexCommand,
+  pinCodexCommand,
   type CodexRuntimeLayout,
+  type PinnedCodexCommand,
 } from "./runtime-layout.ts";
 
 const CODEX_BACKEND_KIND = "codex" as const;
@@ -110,6 +112,13 @@ export type CodexCommandRunner = (
   },
 ) => Promise<CodexCommandResult>;
 
+export type CodexCommandPinResolver = (
+  layout: CodexRuntimeLayout,
+  command: string,
+) => Promise<PinnedCodexCommand>;
+
+export type CodexCommandPinAsserter = (command: PinnedCodexCommand) => Promise<void>;
+
 export interface CodexExecutionBackendDependencies {
   store: JobStore;
   handlers: ExecutionBackendHandlers;
@@ -118,6 +127,10 @@ export interface CodexExecutionBackendDependencies {
   appServerSpawn?: CodexAppServerSpawn;
   /** 仅供测试注入版本探针；生产使用无 shell 的 argv spawn。 */
   commandRunner?: CodexCommandRunner;
+  /** 仅供测试构造可验证的 fake executable identity；生产始终使用真实 fd/hash pin。 */
+  commandPinResolver?: CodexCommandPinResolver;
+  /** 仅供测试注入 command 漂移；生产始终重新读取并核对真实 fd/hash pin。 */
+  commandPinAsserter?: CodexCommandPinAsserter;
   /** 仅供测试缩短退避；生产固定使用 CODEX_IDLE_RECOVERY_DELAYS_MS。 */
   recoveryDelaysMs?: readonly number[];
 }
@@ -843,6 +856,8 @@ export class CodexExecutionBackend implements ExecutionBackend {
   private readonly logger?: Logger;
   private readonly appServerSpawn?: CodexAppServerSpawn;
   private readonly commandRunner: CodexCommandRunner;
+  private readonly commandPinResolver: CodexCommandPinResolver;
+  private readonly commandPinAsserter: CodexCommandPinAsserter;
   private state: BackendState = "idle";
   private layout: CodexRuntimeLayout | null = null;
   private client: CodexAppServerClient | null = null;
@@ -893,6 +908,8 @@ export class CodexExecutionBackend implements ExecutionBackend {
     this.logger = dependencies.logger;
     this.appServerSpawn = dependencies.appServerSpawn;
     this.commandRunner = dependencies.commandRunner ?? runCodexCommand;
+    this.commandPinResolver = dependencies.commandPinResolver ?? pinCodexCommand;
+    this.commandPinAsserter = dependencies.commandPinAsserter ?? assertPinnedCodexCommand;
     this.recoveryDelaysMs = Object.freeze([
       ...(dependencies.recoveryDelaysMs ?? CODEX_IDLE_RECOVERY_DELAYS_MS),
     ]);
@@ -932,16 +949,28 @@ export class CodexExecutionBackend implements ExecutionBackend {
       });
       await assertCodexRuntimeLayout(layout);
       const environment = await buildCodexEnvironment(layout);
-      const command = this.appServerSpawn === undefined && this.commandRunner === runCodexCommand
-        ? await resolveCodexCommand(layout, this.options.command)
-        : this.options.command;
+      const commandPin = await this.commandPinResolver(layout, this.options.command);
+      const command = commandPin.path;
+      const securityConfigSha256 = codexSecurityBindingSha256(layout, commandPin);
+      const storedSession = this.store.getBackendSession(this.kind, this.options.sessionKey);
+      if (
+        storedSession?.securityConfigSha256 !== null &&
+        storedSession?.securityConfigSha256 !== undefined &&
+        storedSession.securityConfigSha256 !== securityConfigSha256
+      ) {
+        this.store.quarantineSession(
+          this.options.sessionKey,
+          "Codex 安全配置或 command 文件身份与持久 session 不一致",
+        );
+        throw new Error("Codex 安全配置或 command 文件身份已漂移；必须人工 release session");
+      }
       const versionResult = await this.commandRunner([command, "--version"], {
         cwd: layout.workspace,
         env: environment,
         timeoutMs: this.options.requestTimeoutMs,
       });
+      await this.commandPinAsserter(commandPin);
       const cliVersion = validateCodexVersion(versionResult);
-      const storedSession = this.store.getBackendSession(this.kind, this.options.sessionKey);
       if (
         storedSession &&
         (storedSession.sessionHash !== layout.sessionHash ||
@@ -959,6 +988,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
       }
 
       const clientEpoch = ++this.clientEpoch;
+      await this.commandPinAsserter(commandPin);
       client = await CodexAppServerClient.start({
         command: buildAppServerCommand(command),
         cwd: layout.workspace,
@@ -991,7 +1021,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
         cliVersion,
       );
       await assertCodexRuntimeLayout(layout);
-      const securityConfigSha256 = sha256(codexRemoteConfig(layout.workspace));
+      await this.commandPinAsserter(commandPin);
       if (storedSession?.accountType !== null && storedSession?.accountType !== undefined) {
         const immutablePreThreadMatches =
           storedSession.accountType === account.accountType &&
@@ -1119,6 +1149,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
         throw error;
       }
       await assertCodexRuntimeLayout(layout);
+      await this.commandPinAsserter(commandPin);
 
       this.layout = layout;
       this.cliVersion = cliVersion;
@@ -1477,18 +1508,31 @@ export class CodexExecutionBackend implements ExecutionBackend {
         { cause: error },
       );
     });
-    const command = this.appServerSpawn === undefined && this.commandRunner === runCodexCommand
-      ? await resolveCodexCommand(layout, this.options.command).catch((error) => {
+    const commandPin = await this.commandPinResolver(layout, this.options.command)
+      .catch((error) => {
           throw new CodexIdleRecoveryDriftError(
             `Codex recovery command 已漂移：${errorMessage(error)}`,
             { cause: error },
           );
-        })
-      : this.options.command;
+        });
+    const command = commandPin.path;
+    const securityConfigSha256 = codexSecurityBindingSha256(layout, commandPin);
+    const storedBeforeCommand = this.requireRecoveryStoreFence();
+    if (storedBeforeCommand.securityConfigSha256 !== securityConfigSha256) {
+      throw new CodexIdleRecoveryDriftError(
+        "Codex recovery 安全配置或 command 文件身份与持久 session 不一致",
+      );
+    }
     const versionResult = await this.commandRunner([command, "--version"], {
       cwd: layout.workspace,
       env: environment,
       timeoutMs: this.options.requestTimeoutMs,
+    });
+    await this.commandPinAsserter(commandPin).catch((error) => {
+      throw new CodexIdleRecoveryDriftError(
+        `Codex recovery command 在版本探针后已漂移：${errorMessage(error)}`,
+        { cause: error },
+      );
     });
     const cliVersion = this.recoveryDrift(
       "Codex recovery CLI 版本无效",
@@ -1505,6 +1549,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
     const clientEpoch = ++this.clientEpoch;
     let client: CodexAppServerClient;
     try {
+      await this.commandPinAsserter(commandPin);
       client = await CodexAppServerClient.start({
         command: buildAppServerCommand(command),
         cwd: layout.workspace,
@@ -1568,13 +1613,13 @@ export class CodexExecutionBackend implements ExecutionBackend {
     );
     try {
       await assertCodexRuntimeLayout(layout);
+      await this.commandPinAsserter(commandPin);
     } catch (error) {
       throw new CodexIdleRecoveryDriftError(
         `Codex recovery 安全回读后 runtime layout 已漂移：${errorMessage(error)}`,
         { cause: error },
       );
     }
-    const securityConfigSha256 = sha256(codexRemoteConfig(layout.workspace));
     const storedBeforeResume = this.requireRecoveryStoreFence();
     if (
       storedBeforeResume.accountType !== account.accountType ||

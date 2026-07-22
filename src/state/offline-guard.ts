@@ -211,7 +211,10 @@ async function readOwnedGuard(path: string, lease: GuardFileLease): Promise<stri
 interface OfflineGuardDocument {
   schemaVersion: 1;
   kind: "livis-relay-offline-guard";
-  operation: "protocol-profile-migration" | "protocol-profile-migration-rollback";
+  operation:
+    | "protocol-profile-migration"
+    | "protocol-profile-migration-rollback"
+    | "session-release";
   pid: number;
   acquiredAt: string;
   nonce: string;
@@ -223,7 +226,11 @@ function parseOfflineGuard(text: string, path: string): OfflineGuardDocument {
   if (
     root.schemaVersion !== 1 ||
     root.kind !== "livis-relay-offline-guard" ||
-    !["protocol-profile-migration", "protocol-profile-migration-rollback"].includes(operation) ||
+    ![
+      "protocol-profile-migration",
+      "protocol-profile-migration-rollback",
+      "session-release",
+    ].includes(operation) ||
     typeof root.acquiredAt !== "string"
   ) {
     throw new Error("connector socket guard 格式无效，拒绝删除非本次操作创建的文件");

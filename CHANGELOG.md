@@ -9,8 +9,10 @@
 - Codex app-server 现在以独立 POSIX 进程组运行；关闭按 `SIGTERM`、有界等待、`SIGKILL`、再次等待和进程组/stdio 收口回执执行，无法确认时向上抛错，不再把直接子进程退出等同于全部后代已结束。
 - Codex idle app-server 意外退出后新增 daemon 生命周期累计三次的有界自动恢复，固定退避为 `250/1000/5000 ms`。只有内存与 SQLite 都无 active attempt、无 recovery/quarantine 且 immutable metadata、Store anchor、rollout 与 thread-tail checkpoint 一致时，才会在确认旧进程组收口后对同一 thread 执行 `thread/resume + thread/read`；漂移立即 quarantine，候选进程组未确认关闭或预算耗尽均失败关闭，活动 turn 不进入自动恢复。`stop()` 会取消退避并等待 recovery、disconnect 与进程组关闭。
 - Codex turn 新增从 `turn/start` 前开始计算的绝对 deadline；超时后只允许一个 interrupt owner，并在固定 grace 后失败关闭。deadline 之后的 terminal、取消或迟到通知不会写入 result/outbox，`stop()` 会等待同一断连和进程组收口结果。
-- Codex `turn/interrupt` 的 RPC response 不再被误当成 terminal；取消与 `turn/start` 并发时先持久化 turn ID，等待权威 `turn/completed` 并 checkpoint 实际尾部后才进入 `CancelUnknown`。人工 `session release` 会退役不确定的 backend session/thread 绑定，下次创建新 thread，避免清除 active 后错误恢复已漂移尾部。
+- Codex `turn/interrupt` 的 RPC response 不再被误当成 terminal；取消与 `turn/start` 并发时先持久化 turn ID，等待权威 `turn/completed` 并 checkpoint 实际尾部后才进入 `CancelUnknown`。人工 `session release` 会在 daemon offline guard 下退役不确定的 backend session/thread 绑定，并由同一个 SQLite 事务回报实际退役列表；idle quarantine 也只在所有 session 都无 active/recovery 时可释放，避免运行中竞态或清除 active 后错误恢复已漂移尾部。
 - Codex app-server 的宿主 HOME/TMPDIR 已移到 workspace 外，agent shell 使用 workspace 内独立 HOME/TMPDIR；四类目录均固定为 `0700` 并校验 realpath、symlink 与 inode，避免 agent 持久修改宿主后续会读取的运行目录。
+- Codex command 现在以 `lstat/open(O_NOFOLLOW)/fstat`、流式 SHA-256 和最终 pathname 回读固定 dev/ino、权限、owner、link count、长度、时间戳与内容，并与安全配置共同绑定持久 session；版本探针、spawn、安全回读、重启与 idle recovery 都会在再次执行前复核，漂移进入 quarantine。最后一次 pathname 复核到 `exec` 的非原子窗口仍作为显式残余边界保留。
+- Codex 非临时安全 smoke 改用 workspace 外随机、独占创建的同卷牺牲文件验证 hardlink 隔离，真实 executable 只复核 identity；工具网络改用原始 TCP accept 与 Perl/Socket errno，只有 `EPERM/EACCES` 可通过，普通超时、其他 errno 或真实连接均失败关闭。所有自有 canary 路径按 dev/ino 清理，身份漂移与清理失败会向上暴露。
 - 本地 `status` 请求增加 3 秒硬超时，避免 connector socket 已接受但 daemon 不响应时让 launchd 启动验收无界卡住。
 - 结果 ACK 重试耗尽后改为持久化退避并自动恢复；在线、重连与重启都不会再遗留永久 `AckFailed`，退避期间的迟到 ACK 仍可完成投递。
 - WebSocket `send()` 同步失败会原子撤销未出进程的投递 attempt，恢复前一个真实投递 ID 与时间；没有真实 attempt 的 ACK 不再误结算或清除当前 ACK timer。
