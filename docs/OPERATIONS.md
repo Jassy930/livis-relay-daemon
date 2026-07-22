@@ -165,7 +165,36 @@ bun run src/index.ts doctor --online
 
 替换模板中的绝对路径后再加载服务；daemon 和 Hermes Gateway 必须是两个独立服务。
 
-## 8. Session 隔离恢复
+## 8. 结果 ACK 退避与 JobStore v3 升级
+
+`status` 中的 `recentJobs[].outboxStatus=AckFailed` 表示结果在当前 ACK 快速重试
+周期耗尽后进入持久化退避；`outboxNextAttemptAt` 是下一次尝试的 Unix 毫秒时间。
+退避到期、Relay 重连或 daemon 重启都会自动恢复投递，期间到达的迟到 ACK 也能
+直接收敛为 `Delivered`。
+
+本版本第一次由 `serve`、`doctor` 或 `session release` 打开旧 `relay.db` 时，会把
+JobStore schema v1/v2 自动升级为 v3。迁移在同一个 SQLite `BEGIN IMMEDIATE`
+事务中取得写锁后读取版本，并在提交前运行 integrity 与 foreign-key 检查；失败会
+保留原版本，不允许半迁移状态继续运行。部署步骤固定为：
+
+1. 停止 `livis-relayd` 与专用 Hermes Gateway，并禁用服务管理器自动拉起。
+2. 完整备份 state directory，包括 `relay.db`、`relay.db-wal` 和
+   `relay.db-shm`（若存在）；备份完成前不要运行上述任何会打开 JobStore 的命令。
+3. 使用新版本启动一次 daemon，再运行 `status` 与 `doctor --online`，确认 SQLite
+   integrity、Relay、connector 和 upstream proof 均正常。
+
+JobStore v3 与 protocol profile schema v1→v2 是两条独立迁移：profile 命令明确
+不打开 SQLite，也不会升级或回滚 `relay.db`。如果一次部署同时执行两者，应在两项
+操作之前统一停服并备份整个 state directory。旧版 daemon 不认识 JobStore v3；
+回滚程序或把 profile 回滚到 v1 时，仍必须同时恢复升级前的数据库备份，不能让旧版
+直接打开 v3 数据库。
+
+- 不要删除 `relay.db`，也不要重跑 Agent job；结果投递本来就是至少一次语义，手工
+  重跑会扩大业务副作用。
+- 如果超过 `outboxNextAttemptAt` 且 Relay 已连接后仍长时间没有新投递，保留
+  `status`、`doctor --online` 与 daemon 日志；不要直接编辑 SQLite。
+
+## 9. Session 隔离恢复
 
 看到 `CancelUnknown` 后：
 
@@ -180,7 +209,7 @@ bun run src/index.ts session release '<sessionKey>'
 
 不得只为清除状态而跳过前两步。
 
-## 9. Relay 资源边界告警
+## 10. Relay 资源边界告警
 
 日志出现 `WebSocket frame 超过配置的字节上限`、外部标识 `超过字节上限` 或 `pending cancel intent 已达到总量上限` 时，不要直接扩大限制：
 

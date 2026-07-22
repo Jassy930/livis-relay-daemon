@@ -30,7 +30,8 @@ Received → Acked → Dispatching → Running → Succeeded | Failed
 
 outbox delivery:
 Pending → Delivering → Delivered
-                    └→ AckFailed
+             └→ AckFailed（持久化退避）─到期→ Delivering
+                                      └─迟到 ACK→ Delivered
 ```
 
 `Succeeded` 只表示 Agent final 已持久化；远端完成还要求 outbox 收到 `ack_send_result`。重启时：
@@ -38,6 +39,25 @@ Pending → Delivering → Delivered
 - 未派发 job 可以继续派发。
 - `Dispatching/Running/Cancelling` 属于 ambiguous execution，不自动重跑。
 - 未 ACK 的结果只重发 outbox，每次生成新的 `msg_id`，保留原 `job_id` 和结果内容。
+
+`resultMaxRetries` 只限制一个投递周期内的快速重试。耗尽后 outbox 进入
+`AckFailed`，并在 SQLite 保存 `next_attempt_at`；退避时间按
+`resultAckTimeoutMs` 与本周期重试次数指数增长，最长 5 分钟。到期后，当前在线
+连接、重连或 daemon 重启都会开启新周期。因此 `AckFailed` 是可恢复的持久化
+退避态，不是永久死信。
+
+每次投递的 `msg_id` 都先写入 `outbox_delivery_attempts`，再交给 WebSocket。
+同步 `send()` 失败时，daemon 会在一个 SQLite 事务内删除尚未出进程的 attempt，
+恢复前一个真实 attempt 的 ID 与投递时间，并回到 `Pending`。只有至少存在一个
+真实投递 attempt，引用原 `job_id` 或任一历史 `msg_id` 的 ACK 才能让
+`Pending`、`Delivering` 或 `AckFailed` 收敛到 `Delivered`；从未投递的结果不接受
+ACK。
+
+JobStore schema v3 为 outbox 增加 `next_attempt_at`。fresh、v1 和 v2 数据库都在
+同一个 `BEGIN IMMEDIATE` 事务内完成版本读取、DDL、旧 `AckFailed` 恢复为
+`Pending`、完整性与外键检查以及最终版本提交。版本裁决发生在取得写锁之后，避免
+两个 opener 同时按旧版本迁移；任一步失败会回滚全部 DDL/DML 和
+`PRAGMA user_version`。
 
 取消意图在 SQLite `IMMEDIATE` 事务内按当前状态原子转移：`Received/Acked` 可直接进入 `Cancelled`，`Dispatching/Running` 只能进入 `Cancelling`。重复 cancel 保持 `Cancelling`，迟到 cancel 不会回退 `Interrupted` 或任何终态；connector 即使确认已发出 `/stop`，仍须由 daemon 记录 `CancelUnknown` 并隔离 session。
 

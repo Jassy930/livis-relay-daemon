@@ -38,6 +38,7 @@ interface JobViewRow {
   result_json: string | null;
   retry_count: number | null;
   last_message_id: string | null;
+  next_attempt_at: number | null;
   outbox_created_at: number | null;
   outbox_updated_at: number | null;
   delivered_at: number | null;
@@ -50,6 +51,7 @@ const JOB_VIEW = `
          o.result_json,
          o.retry_count,
          o.last_message_id,
+         o.next_attempt_at,
          o.created_at AS outbox_created_at,
          o.updated_at AS outbox_updated_at,
          o.delivered_at,
@@ -66,6 +68,7 @@ function rowToJob(row: JobViewRow): StoredJob {
         resultJson: row.result_json,
         retryCount: row.retry_count ?? 0,
         lastMessageId: row.last_message_id,
+        nextAttemptAt: row.next_attempt_at,
         createdAt: row.outbox_created_at ?? row.created_at,
         updatedAt: row.outbox_updated_at ?? row.updated_at,
         deliveredAt: row.delivered_at,
@@ -106,6 +109,11 @@ function businessPayloadHash(input: IncomingRelayJob): string {
 
 export class JobConflictError extends Error {}
 
+export interface JobStoreOptions {
+  /** 仅供确定性迁移 harness 在尝试 IMMEDIATE 写锁前建立进程间屏障。 */
+  beforeMigrationLock?: () => void;
+}
+
 export class JobStore {
   private readonly database: Database;
   private readonly path: string;
@@ -113,13 +121,19 @@ export class JobStore {
   constructor(
     path: string,
     private readonly scopeKey: string,
+    private readonly options: JobStoreOptions = {},
   ) {
     this.path = path;
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.database = new Database(path, { create: true, strict: true });
-    this.database.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;");
-    this.migrate();
-    this.enforcePrivatePermissions();
+    try {
+      this.database.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
+      this.migrate();
+      this.enforcePrivatePermissions();
+    } catch (error) {
+      this.database.close(false);
+      throw error;
+    }
   }
 
   close(): void {
@@ -281,17 +295,40 @@ export class JobStore {
 
   startResultDelivery(jobId: string, messageId: string, retry: boolean): StoredOutbox | null {
     const now = Date.now();
-    const expected: OutboxStatus = retry ? "Delivering" : "Pending";
     let changed = false;
     const transaction = this.database.transaction(() => {
       const result = this.database
-        .query(`UPDATE outbox SET status='Delivering', last_message_id=?, retry_count=retry_count+?, delivered_at=?, updated_at=?
-                WHERE scope_key=? AND job_id=? AND status=?
+        .query(`UPDATE outbox
+                SET status='Delivering',
+                    last_message_id=?,
+                    retry_count=CASE WHEN status='AckFailed' THEN 0 ELSE retry_count+? END,
+                    next_attempt_at=NULL,
+                    delivered_at=?,
+                    updated_at=?
+                WHERE scope_key=? AND job_id=?
+                  AND (
+                    (?=1 AND status='Delivering')
+                    OR
+                    (?=0 AND (
+                      status='Pending'
+                      OR (status='AckFailed' AND next_attempt_at IS NOT NULL AND next_attempt_at<=?)
+                    ))
+                  )
                   AND EXISTS (
                     SELECT 1 FROM jobs
                     WHERE jobs.scope_key=outbox.scope_key AND jobs.job_id=outbox.job_id AND cancel_requested=0
                   )`)
-        .run(messageId, retry ? 1 : 0, now, now, this.scopeKey, jobId, expected);
+        .run(
+          messageId,
+          retry ? 1 : 0,
+          now,
+          now,
+          this.scopeKey,
+          jobId,
+          retry ? 1 : 0,
+          retry ? 1 : 0,
+          now,
+        );
       changed = result.changes === 1;
       if (changed) {
         this.database
@@ -306,17 +343,63 @@ export class JobStore {
 
   resetOutboxPending(jobId: string): StoredOutbox | null {
     this.database
-      .query("UPDATE outbox SET status='Pending', updated_at=? WHERE scope_key=? AND job_id=? AND status='Delivering'")
+      .query("UPDATE outbox SET status='Pending', next_attempt_at=NULL, updated_at=? WHERE scope_key=? AND job_id=? AND status='Delivering'")
       .run(Date.now(), this.scopeKey, jobId);
+    return this.require(jobId).outbox;
+  }
+
+  resetOutboxPendingAfterSendFailure(jobId: string, messageId: string, retry: boolean): StoredOutbox | null {
+    const now = Date.now();
+    const transaction = this.database.transaction(() => {
+      const reset = this.database
+        .query(`UPDATE outbox
+                SET status='Pending',
+                    retry_count=CASE WHEN ?=1 AND retry_count>0 THEN retry_count-1 ELSE retry_count END,
+                    last_message_id=(
+                      SELECT previous.message_id
+                      FROM outbox_delivery_attempts previous
+                      WHERE previous.scope_key=outbox.scope_key
+                        AND previous.job_id=outbox.job_id
+                        AND previous.message_id<>?
+                      ORDER BY previous.created_at DESC, previous.rowid DESC
+                      LIMIT 1
+                    ),
+                    delivered_at=(
+                      SELECT previous.created_at
+                      FROM outbox_delivery_attempts previous
+                      WHERE previous.scope_key=outbox.scope_key
+                        AND previous.job_id=outbox.job_id
+                        AND previous.message_id<>?
+                      ORDER BY previous.created_at DESC, previous.rowid DESC
+                      LIMIT 1
+                    ),
+                    next_attempt_at=NULL,
+                    updated_at=?
+                WHERE scope_key=? AND job_id=?
+                  AND status='Delivering' AND last_message_id=?`)
+        .run(retry ? 1 : 0, messageId, messageId, now, this.scopeKey, jobId, messageId);
+      if (reset.changes === 1) {
+        this.database
+          .query("DELETE FROM outbox_delivery_attempts WHERE scope_key=? AND job_id=? AND message_id=?")
+          .run(this.scopeKey, jobId, messageId);
+      }
+    });
+    transaction.immediate();
     return this.require(jobId).outbox;
   }
 
   markOutboxDelivered(jobId: string): StoredOutbox | null {
     const now = Date.now();
-    this.database
-      .query("UPDATE outbox SET status='Delivered', acked_at=?, updated_at=? WHERE scope_key=? AND job_id=? AND status='Delivering'")
+    const result = this.database
+      .query(`UPDATE outbox
+              SET status='Delivered', next_attempt_at=NULL, acked_at=?, updated_at=?
+              WHERE scope_key=? AND job_id=? AND status IN ('Pending','Delivering','AckFailed')
+                AND EXISTS (
+                  SELECT 1 FROM outbox_delivery_attempts attempts
+                  WHERE attempts.scope_key=outbox.scope_key AND attempts.job_id=outbox.job_id
+                )`)
       .run(now, now, this.scopeKey, jobId);
-    return this.get(jobId)?.outbox ?? null;
+    return result.changes === 1 ? this.require(jobId).outbox : null;
   }
 
   findJobIdByOutboxMessageId(messageId: string): string | null {
@@ -328,10 +411,10 @@ export class JobStore {
     return row?.job_id ?? null;
   }
 
-  markOutboxAckFailed(jobId: string): StoredOutbox | null {
+  markOutboxAckFailed(jobId: string, nextAttemptAt: number): StoredOutbox | null {
     this.database
-      .query("UPDATE outbox SET status='AckFailed', updated_at=? WHERE scope_key=? AND job_id=? AND status='Delivering'")
-      .run(Date.now(), this.scopeKey, jobId);
+      .query("UPDATE outbox SET status='AckFailed', next_attempt_at=?, updated_at=? WHERE scope_key=? AND job_id=? AND status='Delivering'")
+      .run(nextAttemptAt, Date.now(), this.scopeKey, jobId);
     return this.require(jobId).outbox;
   }
 
@@ -447,14 +530,27 @@ export class JobStore {
       .map(rowToJob);
   }
 
-  listPendingOutbox(limit = 100): StoredOutbox[] {
+  listPendingOutbox(limit = 100, now = Date.now()): StoredOutbox[] {
     return this.database
-      .query<JobViewRow, [string, number]>(`${JOB_VIEW}
-        WHERE j.scope_key=? AND o.status='Pending' AND j.cancel_requested=0
-        ORDER BY o.updated_at ASC LIMIT ?`)
-      .all(this.scopeKey, limit)
+      .query<JobViewRow, [string, number, number]>(`${JOB_VIEW}
+        WHERE j.scope_key=? AND j.cancel_requested=0
+          AND (o.status='Pending' OR (o.status='AckFailed' AND o.next_attempt_at IS NOT NULL AND o.next_attempt_at<=?))
+        ORDER BY CASE WHEN o.status='Pending' THEN o.updated_at ELSE o.next_attempt_at END ASC LIMIT ?`)
+      .all(this.scopeKey, now, limit)
       .map(rowToJob)
       .flatMap((job) => (job.outbox ? [job.outbox] : []));
+  }
+
+  nextOutboxAttemptAt(): number | null {
+    const row = this.database
+      .query<{ next_attempt_at: number | null }, [string]>(`
+        SELECT MIN(o.next_attempt_at) AS next_attempt_at
+        FROM outbox o
+        JOIN jobs j ON j.scope_key=o.scope_key AND j.job_id=o.job_id
+        WHERE o.scope_key=? AND o.status='AckFailed' AND o.next_attempt_at IS NOT NULL AND j.cancel_requested=0
+      `)
+      .get(this.scopeKey);
+    return row?.next_attempt_at ?? null;
   }
 
   listRecent(limit = 50): StoredJob[] {
@@ -603,35 +699,44 @@ export class JobStore {
   }
 
   private migrate(): void {
-    const row = this.database.query<{ user_version: number }, []>("PRAGMA user_version").get();
-    const version = row?.user_version ?? 0;
-    if (version !== 0 && version !== 1 && version !== 2) {
-      throw new Error(`不支持的数据库 schema 版本：${version}`);
-    }
-    if (version === 1) {
+    const transaction = this.database.transaction(() => {
+      const row = this.database.query<{ user_version: number }, []>("PRAGMA user_version").get();
+      const version = row?.user_version ?? 0;
+      if (version !== 0 && version !== 1 && version !== 2 && version !== 3) {
+        throw new Error(`不支持的数据库 schema 版本：${version}`);
+      }
+      if (version === 3) {
+        return;
+      }
+      if (version === 1) {
+        this.database.exec(`
+          CREATE TABLE outbox_delivery_attempts (
+            scope_key TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(scope_key,message_id),
+            FOREIGN KEY(scope_key,job_id) REFERENCES outbox(scope_key,job_id) ON DELETE CASCADE
+          );
+          INSERT INTO outbox_delivery_attempts(scope_key,message_id,job_id,created_at)
+            SELECT scope_key,last_message_id,job_id,updated_at FROM outbox WHERE last_message_id IS NOT NULL;
+          CREATE INDEX idx_outbox_attempt_job ON outbox_delivery_attempts(scope_key,job_id);
+        `);
+      }
+      if (version === 1 || version === 2) {
+        this.database.exec(`
+          ALTER TABLE outbox ADD COLUMN next_attempt_at INTEGER;
+          UPDATE outbox SET status='Pending', retry_count=0 WHERE status='AckFailed';
+          DROP INDEX idx_outbox_delivery;
+          CREATE INDEX idx_outbox_delivery ON outbox(scope_key,status,next_attempt_at,updated_at);
+          CREATE INDEX IF NOT EXISTS idx_pending_cancels_gc
+            ON pending_cancels(created_at,scope_key,job_id);
+          PRAGMA user_version=3;
+        `);
+        this.assertMigratedSchemaV3();
+        return;
+      }
       this.database.exec(`
-        CREATE TABLE outbox_delivery_attempts (
-          scope_key TEXT NOT NULL,
-          message_id TEXT NOT NULL,
-          job_id TEXT NOT NULL,
-          created_at INTEGER NOT NULL,
-          PRIMARY KEY(scope_key,message_id),
-          FOREIGN KEY(scope_key,job_id) REFERENCES outbox(scope_key,job_id) ON DELETE CASCADE
-        );
-        INSERT INTO outbox_delivery_attempts(scope_key,message_id,job_id,created_at)
-          SELECT scope_key,last_message_id,job_id,updated_at FROM outbox WHERE last_message_id IS NOT NULL;
-        CREATE INDEX idx_outbox_attempt_job ON outbox_delivery_attempts(scope_key,job_id);
-        PRAGMA user_version=2;
-      `);
-    }
-    if (version === 1 || version === 2) {
-      this.database.exec(`
-        CREATE INDEX IF NOT EXISTS idx_pending_cancels_gc
-          ON pending_cancels(created_at,scope_key,job_id);
-      `);
-      return;
-    }
-    this.database.exec(`
       CREATE TABLE meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -665,6 +770,7 @@ export class JobStore {
         result_json TEXT NOT NULL,
         retry_count INTEGER NOT NULL DEFAULT 0,
         last_message_id TEXT,
+        next_attempt_at INTEGER,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         delivered_at INTEGER,
@@ -695,10 +801,27 @@ export class JobStore {
       );
       CREATE INDEX idx_jobs_dispatch ON jobs(scope_key,status,cancel_requested,session_key,created_at);
       CREATE INDEX idx_jobs_connector ON jobs(scope_key,connector_id,status);
-      CREATE INDEX idx_outbox_delivery ON outbox(scope_key,status,updated_at);
+      CREATE INDEX idx_outbox_delivery ON outbox(scope_key,status,next_attempt_at,updated_at);
       CREATE INDEX idx_outbox_attempt_job ON outbox_delivery_attempts(scope_key,job_id);
       CREATE INDEX idx_pending_cancels_gc ON pending_cancels(created_at,scope_key,job_id);
-      PRAGMA user_version=2;
-    `);
+      PRAGMA user_version=3;
+      `);
+      this.assertMigratedSchemaV3();
+    });
+    // 先取得 RESERVED 写锁，再读取 user_version。两个 opener 因而不会
+    // 同时基于旧版本作迁移裁决；回调抛错时 Bun 会回滚全部 DDL/DML。
+    this.options.beforeMigrationLock?.();
+    transaction.immediate();
+  }
+
+  private assertMigratedSchemaV3(): void {
+    const integrity = this.database.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get();
+    if (integrity?.integrity_check !== "ok") {
+      throw new Error(`SQLite v3 迁移完整性检查失败：${integrity?.integrity_check ?? "unknown"}`);
+    }
+    const foreignKeyViolations = this.database.query<Record<string, unknown>, []>("PRAGMA foreign_key_check").all();
+    if (foreignKeyViolations.length > 0) {
+      throw new Error(`SQLite v3 迁移外键检查失败：${JSON.stringify(foreignKeyViolations)}`);
+    }
   }
 }
