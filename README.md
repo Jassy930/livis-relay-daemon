@@ -76,6 +76,7 @@ bun run check
 - [运行手册](docs/OPERATIONS.md)
 - [Hermes 实网 canary](docs/HERMES-CANARY.md)
 - [官方升级与回滚](docs/UPSTREAM-UPGRADE.md)
+- [普通 profile 激活事务](docs/PROFILE-ACTIVATION.md)
 - [版本与发布流程](docs/RELEASING.md)
 - [架构与状态所有权](docs/ARCHITECTURE.md)
 - [安全边界](docs/SECURITY.md)

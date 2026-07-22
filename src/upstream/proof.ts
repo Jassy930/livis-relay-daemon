@@ -1,5 +1,4 @@
 import { join } from "node:path";
-import { readFile } from "node:fs/promises";
 import { runtimeContractSha256, type ProtocolProfile } from "../protocol/profile.ts";
 import type { CredentialMode, WireContractRevision } from "../protocol/contract.ts";
 import type { ProfileOperationGuard } from "../state/offline-guard.ts";
@@ -9,6 +8,7 @@ import {
   durableMkdirPrivate,
   durableUnlink,
   parseJsonObject,
+  readOptionalPrivateFileText,
 } from "../util.ts";
 import type { UpstreamSnapshot } from "./checker.ts";
 
@@ -58,12 +58,7 @@ interface ProofFileSnapshot {
 }
 
 async function readOptionalText(path: string): Promise<string | null> {
-  try {
-    return await readFile(path, "utf8");
-  } catch (error) {
-    if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return null;
-    throw error;
-  }
+  return readOptionalPrivateFileText(path, "upstream supported proof");
 }
 
 async function ensureSupportedProofDirectories(options: {

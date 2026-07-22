@@ -33,8 +33,17 @@ export async function requirePrivateDirectory(path: string, label: string): Prom
 }
 
 async function syncDirectory(path: string): Promise<void> {
-  const handle = await open(path, "r");
+  const handle = await open(
+    path,
+    constants.O_RDONLY |
+      constants.O_DIRECTORY |
+      constants.O_NOFOLLOW |
+      constants.O_NONBLOCK,
+  );
   try {
+    if (!(await handle.stat()).isDirectory()) {
+      throw new Error(`guard 待 fsync 路径不是目录：${path}`);
+    }
     await handle.sync();
   } finally {
     await handle.close();
@@ -183,7 +192,10 @@ async function createGuardFile(
 async function readOwnedGuard(path: string, lease: GuardFileLease): Promise<string> {
   await assertLeaseLinked(lease, path);
   assertOwnedGuardInfo(await lstat(path), lease.identity, path);
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const handle = await open(
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
   try {
     const info = await handle.stat();
     assertOwnedGuardInfo(info, lease.identity, path);

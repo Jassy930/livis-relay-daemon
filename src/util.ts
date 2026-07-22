@@ -1,6 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, rename, unlink, writeFile } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
+import { chmod, type FileHandle, lstat, mkdir, open, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 
@@ -12,6 +12,94 @@ export function expandHome(path: string): string {
     return resolve(homedir(), path.slice(2));
   }
   return resolve(path);
+}
+
+export interface PrivateFileIdentity {
+  dev: number;
+  ino: number;
+}
+
+export interface PrivateFileTextLease {
+  path: string;
+  text: string;
+  identity: PrivateFileIdentity;
+  handle: FileHandle;
+}
+
+function assertPrivateFileInfo(
+  info: Stats,
+  path: string,
+  label: string,
+  expectedIdentity?: PrivateFileIdentity,
+): void {
+  if (
+    info.isSymbolicLink() ||
+    !info.isFile() ||
+    info.nlink !== 1 ||
+    (info.mode & 0o777) !== 0o600 ||
+    (expectedIdentity !== undefined &&
+      (info.dev !== expectedIdentity.dev || info.ino !== expectedIdentity.ino))
+  ) {
+    throw new Error(`${label} 必须是 0600、单 link 的普通文件且 inode 不得变化：${path}`);
+  }
+}
+
+export async function acquirePrivateFileTextLease(
+  path: string,
+  label: string,
+  expectedIdentity?: PrivateFileIdentity,
+): Promise<PrivateFileTextLease> {
+  const absolutePath = resolve(path);
+  const pathInfo = await lstat(absolutePath);
+  assertPrivateFileInfo(pathInfo, absolutePath, label, expectedIdentity);
+  const handle = await open(
+    absolutePath,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const openedInfo = await handle.stat();
+    assertPrivateFileInfo(openedInfo, absolutePath, label, expectedIdentity ?? pathInfo);
+    if (openedInfo.dev !== pathInfo.dev || openedInfo.ino !== pathInfo.ino) {
+      throw new Error(`${label} 在打开期间 inode 已变化：${absolutePath}`);
+    }
+    const text = await handle.readFile("utf8");
+    assertPrivateFileInfo(await handle.stat(), absolutePath, label, openedInfo);
+    assertPrivateFileInfo(await lstat(absolutePath), absolutePath, label, openedInfo);
+    return {
+      path: absolutePath,
+      text,
+      identity: { dev: openedInfo.dev, ino: openedInfo.ino },
+      handle,
+    };
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function readPrivateFileText(
+  path: string,
+  label: string,
+  expectedIdentity?: PrivateFileIdentity,
+): Promise<string> {
+  const lease = await acquirePrivateFileTextLease(path, label, expectedIdentity);
+  try {
+    return lease.text;
+  } finally {
+    await lease.handle.close();
+  }
+}
+
+export async function readOptionalPrivateFileText(
+  path: string,
+  label: string,
+): Promise<string | null> {
+  try {
+    return await readPrivateFileText(path, label);
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return null;
+    throw error;
+  }
 }
 
 export async function atomicWritePrivate(path: string, data: string): Promise<void> {
@@ -97,8 +185,17 @@ export async function durableAtomicWritePrivate(
 }
 
 async function syncDirectory(path: string): Promise<void> {
-  const handle = await open(path, "r");
+  const handle = await open(
+    path,
+    constants.O_RDONLY |
+      constants.O_DIRECTORY |
+      constants.O_NOFOLLOW |
+      constants.O_NONBLOCK,
+  );
   try {
+    if (!(await handle.stat()).isDirectory()) {
+      throw new Error(`待 fsync 路径不是目录：${path}`);
+    }
     await handle.sync();
   } finally {
     await handle.close();
@@ -153,11 +250,38 @@ export async function durableMkdirPrivate(
 export async function durableRename(
   source: string,
   destination: string,
-  options: { syncDirectory?: (path: string) => Promise<void> } = {},
+  options: {
+    syncDirectory?: (path: string) => Promise<void>;
+    expectedSource?: { handle: FileHandle; dev: number; ino: number };
+  } = {},
 ): Promise<void> {
+  const assertExpectedSource = async (path: string): Promise<void> => {
+    if (!options.expectedSource) return;
+    const retainedInfo = await options.expectedSource.handle.stat();
+    const pathInfo = await lstat(path);
+    for (const info of [retainedInfo, pathInfo]) {
+      if (
+        !info.isFile() ||
+        info.isSymbolicLink() ||
+        info.nlink !== 1 ||
+        (info.mode & 0o777) !== 0o600 ||
+        info.dev !== options.expectedSource.dev ||
+        info.ino !== options.expectedSource.ino
+      ) {
+        throw new Error(`durable rename 源文件不再属于预期私有 staging：${path}`);
+      }
+    }
+  };
+
+  await assertExpectedSource(source);
   const sourceInfo = await lstat(source);
-  if (sourceInfo.isFile() && !sourceInfo.isSymbolicLink()) {
-    const sourceHandle = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW);
+  if (options.expectedSource) {
+    await options.expectedSource.handle.sync();
+  } else if (sourceInfo.isFile() && !sourceInfo.isSymbolicLink()) {
+    const sourceHandle = await open(
+      source,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
     try {
       const openedInfo = await sourceHandle.stat();
       if (openedInfo.dev !== sourceInfo.dev || openedInfo.ino !== sourceInfo.ino) {
@@ -172,7 +296,9 @@ export async function durableRename(
   if (beforeRename.dev !== sourceInfo.dev || beforeRename.ino !== sourceInfo.ino) {
     throw new Error(`durable rename 源路径在提交前发生变化：${source}`);
   }
+  await assertExpectedSource(source);
   await rename(source, destination);
+  await assertExpectedSource(destination);
   const sourceDirectory = dirname(source);
   const destinationDirectory = dirname(destination);
   const sync = options.syncDirectory ?? syncDirectory;

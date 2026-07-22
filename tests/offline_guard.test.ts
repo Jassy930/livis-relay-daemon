@@ -37,6 +37,20 @@ async function runBunEval(script: string, label: string): Promise<void> {
   }
 }
 
+async function createFifo(path: string): Promise<void> {
+  const subprocess = Bun.spawn(["mkfifo", path], {
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const [exitCode, stderr] = await Promise.all([
+    subprocess.exited,
+    new Response(subprocess.stderr).text(),
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(`mkfifo 失败（exit ${exitCode}）：${stderr.trim()}`);
+  }
+}
+
 function connectorServer(socketPath: string): ConnectorServer {
   const handlers: ConnectorServerHandlers = {
     onReady: async () => {},
@@ -444,4 +458,18 @@ describe("离线与 profile 操作 guard", () => {
     expect(await readFile(target, "utf8")).toBe("must survive\n");
     expect((await lstat(linked.path)).isSymbolicLink()).toBeTrue();
   });
+
+  test("profile guard 路径被换成 FIFO 时 assert/release 有界失败且不删除替代项", async () => {
+    const guard = await ProfileOperationGuard.acquire(
+      directory.path,
+      "upstream-activate",
+    );
+    await rm(guard.path);
+    await createFifo(guard.path);
+
+    await expect(guard.assertHeld()).rejects.toThrow("类型、权限或 inode 已变化");
+    await expect(guard.release()).rejects.toThrow("类型、权限或 inode 已变化");
+    expect((await lstat(guard.path)).isFIFO()).toBeTrue();
+    await rm(guard.path);
+  }, 2_000);
 });
