@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { lstat, mkdir, readFile, readdir, rm, symlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readdir, rm, symlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { loadRelayConfig } from "../src/config.ts";
 import { parseProtocolProfile } from "../src/protocol/profile.ts";
@@ -136,6 +136,35 @@ describe("protocol profile schema v1→v2 迁移", () => {
     }
   });
 
+  test("apply 会修复上次崩溃遗留的 000 managed migration 目录", async () => {
+    const deployment = await legacyDeployment();
+    let targetDirectory = "";
+    let migrationRoot = "";
+    try {
+      const plan = await planProtocolProfileV2Migration(migrationOptions(deployment.configPath));
+      targetDirectory = join(plan.targetProfilePath, "..");
+      migrationRoot = join(deployment.directory.path, "profile-migrations");
+      await mkdir(targetDirectory, { mode: 0o700 });
+      await mkdir(migrationRoot, { mode: 0o700 });
+      await chmod(targetDirectory, 0o000);
+      await chmod(migrationRoot, 0o000);
+
+      const applied = await applyProtocolProfileV2Migration(plan, {
+        acknowledgeReviewedWireContract: true,
+        acknowledgeDaemonAndHermesStopped: true,
+      });
+
+      expect((await lstat(targetDirectory)).mode & 0o777).toBe(0o700);
+      expect((await lstat(migrationRoot)).mode & 0o777).toBe(0o700);
+      expect((await lstat(plan.targetProfilePath)).mode & 0o777).toBe(0o600);
+      expect((await lstat(String(applied.receiptPath))).mode & 0o777).toBe(0o600);
+    } finally {
+      if (targetDirectory) await chmod(targetDirectory, 0o700).catch(() => undefined);
+      if (migrationRoot) await chmod(migrationRoot, 0o700).catch(() => undefined);
+      await deployment.directory.cleanup();
+    }
+  });
+
   test("apply 原子重锁 config、隔离全部 proof，并可精确回滚", async () => {
     const deployment = await legacyDeployment();
     try {
@@ -262,6 +291,85 @@ describe("protocol profile schema v1→v2 迁移", () => {
       });
       expect(repeated.changed).toBeFalse();
       expect(repeated.exactConfigBytes).toBeFalse();
+    } finally {
+      await deployment.directory.cleanup();
+    }
+  });
+
+  test("live target profile 缺失时仍可精确回滚 source config", async () => {
+    const deployment = await legacyDeployment();
+    try {
+      const plan = await planProtocolProfileV2Migration(migrationOptions(deployment.configPath));
+      const applied = await applyProtocolProfileV2Migration(plan, {
+        acknowledgeReviewedWireContract: true,
+        acknowledgeDaemonAndHermesStopped: true,
+      });
+      await rm(plan.targetProfilePath);
+
+      const rolledBack = await rollbackProtocolProfileMigration({
+        configPath: deployment.configPath,
+        receiptPath: String(applied.receiptPath),
+        acknowledgeDaemonAndHermesStopped: true,
+      });
+      expect(rolledBack.changed).toBeTrue();
+      expect(rolledBack.exactConfigBytes).toBeTrue();
+      expect(await readFile(deployment.configPath, "utf8")).toBe(deployment.configText);
+      expect(await Bun.file(plan.targetProfilePath).exists()).toBeFalse();
+    } finally {
+      await deployment.directory.cleanup();
+    }
+  });
+
+  test("live target profile 损坏时回滚不读取或覆盖坏文件", async () => {
+    const deployment = await legacyDeployment();
+    try {
+      const plan = await planProtocolProfileV2Migration(migrationOptions(deployment.configPath));
+      const applied = await applyProtocolProfileV2Migration(plan, {
+        acknowledgeReviewedWireContract: true,
+        acknowledgeDaemonAndHermesStopped: true,
+      });
+      const damagedTarget = "damaged live target must survive\n";
+      await atomicWritePrivate(plan.targetProfilePath, damagedTarget);
+
+      const rolledBack = await rollbackProtocolProfileMigration({
+        configPath: deployment.configPath,
+        receiptPath: String(applied.receiptPath),
+        acknowledgeDaemonAndHermesStopped: true,
+      });
+      expect(rolledBack.changed).toBeTrue();
+      expect(rolledBack.exactConfigBytes).toBeTrue();
+      expect(await readFile(deployment.configPath, "utf8")).toBe(deployment.configText);
+      expect(await readFile(plan.targetProfilePath, "utf8")).toBe(damagedTarget);
+    } finally {
+      await deployment.directory.cleanup();
+    }
+  });
+
+  test("source 与 live target profile 同时缺失时从已验证 backup 恢复 fallback v1", async () => {
+    const deployment = await legacyDeployment();
+    try {
+      const plan = await planProtocolProfileV2Migration(migrationOptions(deployment.configPath));
+      const applied = await applyProtocolProfileV2Migration(plan, {
+        acknowledgeReviewedWireContract: true,
+        acknowledgeDaemonAndHermesStopped: true,
+      });
+      await rm(deployment.profilePath);
+      await rm(plan.targetProfilePath);
+
+      const rolledBack = await rollbackProtocolProfileMigration({
+        configPath: deployment.configPath,
+        receiptPath: String(applied.receiptPath),
+        acknowledgeDaemonAndHermesStopped: true,
+      });
+      expect(rolledBack.changed).toBeTrue();
+      expect(rolledBack.exactConfigBytes).toBeFalse();
+      expect(rolledBack.repairedInvalidProfile).toBeTrue();
+      const restored = await loadRelayConfig(deployment.configPath);
+      expect(restored.config.profile).toContain("protocol-profiles-v1-rollback");
+      expect(sha256(await readFile(restored.config.profile, "utf8"))).toBe(
+        deployment.profileSha256,
+      );
+      expect(await Bun.file(plan.targetProfilePath).exists()).toBeFalse();
     } finally {
       await deployment.directory.cleanup();
     }
@@ -394,7 +502,7 @@ describe("protocol profile schema v1→v2 迁移", () => {
     }
   });
 
-  test("target profile 的中间目录 symlink 即使仍在 stateDir 内也失败关闭", async () => {
+  test("live target profile 目录变为 symlink 时仍可回滚且不触碰外部文件", async () => {
     const deployment = await legacyDeployment();
     try {
       const plan = await planProtocolProfileV2Migration(migrationOptions(deployment.configPath));
@@ -404,26 +512,29 @@ describe("protocol profile schema v1→v2 迁移", () => {
       });
       const targetDirectory = join(plan.targetProfilePath, "..");
       const externalDirectory = join(deployment.directory.path, "relocated-v2-profile");
+      const externalTargetPath = join(externalDirectory, `${plan.targetProfileSha256}.json`);
+      const externalTargetText = "external target must survive\n";
       await rm(targetDirectory, { recursive: true });
       await mkdir(externalDirectory, { mode: 0o700 });
-      await atomicWritePrivate(
-        join(externalDirectory, `${plan.targetProfileSha256}.json`),
-        plan.targetProfileText,
-      );
+      await atomicWritePrivate(externalTargetPath, externalTargetText);
       await symlink(externalDirectory, targetDirectory);
 
-      await expect(rollbackProtocolProfileMigration({
+      const rolledBack = await rollbackProtocolProfileMigration({
         configPath: deployment.configPath,
         receiptPath: String(applied.receiptPath),
         acknowledgeDaemonAndHermesStopped: true,
-      })).rejects.toThrow("target profile directory 必须是目录且不能是 symlink");
-      expect(sha256(await readFile(deployment.configPath, "utf8"))).toBe(plan.targetConfigSha256);
+      });
+      expect(rolledBack.changed).toBeTrue();
+      expect(rolledBack.exactConfigBytes).toBeTrue();
+      expect(await readFile(deployment.configPath, "utf8")).toBe(deployment.configText);
+      expect(await readFile(externalTargetPath, "utf8")).toBe(externalTargetText);
+      expect((await lstat(targetDirectory)).isSymbolicLink()).toBeTrue();
     } finally {
       await deployment.directory.cleanup();
     }
   });
 
-  test("receipt 与另一组 source backups 混配时无法通过 source→target 闭环", async () => {
+  test("live target 缺失时失真 receipt/source backups 仍无法通过闭环", async () => {
     const deployment = await legacyDeployment();
     try {
       const plan = await planProtocolProfileV2Migration(migrationOptions(deployment.configPath));
@@ -432,6 +543,7 @@ describe("protocol profile schema v1→v2 迁移", () => {
         acknowledgeDaemonAndHermesStopped: true,
       });
       const receiptPath = String(applied.receiptPath);
+      await rm(plan.targetProfilePath);
       const receipt = JSON.parse(await readFile(receiptPath, "utf8")) as Record<string, unknown>;
       const source = receipt.source as Record<string, unknown>;
 

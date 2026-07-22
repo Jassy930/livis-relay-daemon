@@ -125,12 +125,10 @@ async function requirePrivateDirectory(path: string, label: string): Promise<str
 }
 
 async function ensurePrivateDirectory(path: string): Promise<void> {
-  try {
-    await requirePrivateDirectory(path, path);
-    return;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
+  // 统一经过 durable helper：除创建新目录外，也会修复上次进程在
+  // mkdir 与显式 chmod 之间退出所遗留的 000/owner 权限不足目录。
+  // 直接用 requirePrivateDirectory 会把 000 误当作“0700 或更严格”，
+  // 导致后续创建文件时 EACCES，破坏崩溃后的可重试性。
   await durableMkdirPrivate(path);
   await requirePrivateDirectory(path, path);
 }
@@ -1057,22 +1055,9 @@ export async function rollbackProtocolProfileMigration(options: {
         ) {
           throw new Error("target config 的 profile path/SHA 与 receipt 不一致");
         }
-        await requirePrivateDirectory(dirname(targetProfilePath), "target profile directory");
-        const canonicalTargetProfilePath = await requirePrivateRegularFile(
-          targetProfilePath,
-          "target profile",
-        );
-        if (!isWithin(stateDir, canonicalTargetProfilePath)) {
-          throw new Error("target profile 通过 symlink 或路径逃逸 stateDir");
-        }
-        const targetProfileText = await readFile(canonicalTargetProfilePath, "utf8");
-        if (sha256(targetProfileText) !== receipt.target.profileSha256) {
-          throw new Error("target profile SHA 与 receipt 不一致");
-        }
-        const targetProfile = parseProtocolProfile(targetProfileText, targetProfilePath);
-        if (runtimeContractSha256(targetProfile) !== receipt.target.runtimeContractSha256) {
-          throw new Error("target profile runtime contract SHA 与 receipt 不一致");
-        }
+        // live target profile 可能正是回滚要恢复的故障点，不把它当作信任输入。
+        // source backups 已重建 target profile/config/runtime digest，且 live config
+        // 的完整 SHA 已精确命中该 target；回滚不读取、不修复也不覆盖坏 target。
       }
       const restored = await planRestoredConfig({
         configPath,

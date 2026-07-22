@@ -114,9 +114,11 @@ bun run src/index.ts profile rollback-migration \
 
 回滚会验证 receipt、当前 config SHA、原 config/profile 备份和路径边界，并从
 备份重新构造 v2 profile、target config 与 runtime contract digest，确认
-source→target 确实属于同一次迁移。只有当前 config 仍为 target 时才要求 target
-v2 文件存在并验证它；已经回滚后，即使该 v2 文件已清理，幂等重试也不会再依赖
-它。
+source→target 确实属于同一次迁移。当前 config 仍为 target 时，它的完整字节
+SHA 必须精确命中这个重建 target，profile 路径和 SHA pin 也必须与 receipt
+一致。live target v2 文件不参与回滚授权：它可能正是丢失、损坏或路径
+异常的故障点，回滚不读取、不重建也不覆盖它，只从已验证 source backup
+恢复 v1。坏 target 会保留供人工分析，再次迁移前需先按运维流程处理。
 
 执行顺序固定为：先写 `ROLLBACK_PREPARED-*` 与 `config.pre-rollback-*`，再隔离
 old/new/alias proof，最后准备 v1 profile 并提交 config。原 v1 文件若丢失、成为

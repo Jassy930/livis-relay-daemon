@@ -41,7 +41,7 @@ async function syncDirectory(path: string): Promise<void> {
   }
 }
 
-function assertOwnedGuardInfo(
+function assertOwnedGuardIdentity(
   info: Stats,
   identity: GuardIdentity,
   path: string,
@@ -49,7 +49,6 @@ function assertOwnedGuardInfo(
   if (
     info.isSymbolicLink() ||
     !info.isFile() ||
-    (info.mode & 0o077) !== 0 ||
     info.nlink !== 1 ||
     info.dev !== identity.dev ||
     info.ino !== identity.ino
@@ -58,7 +57,18 @@ function assertOwnedGuardInfo(
   }
 }
 
-async function assertLeaseLinked(lease: GuardFileLease, path: string): Promise<void> {
+function assertOwnedGuardInfo(info: Stats, identity: GuardIdentity, path: string): void {
+  assertOwnedGuardIdentity(info, identity, path);
+  if ((info.mode & 0o777) !== 0o600) {
+    throw new Error(`guard 文件类型、权限或 inode 已变化，拒绝操作：${path}`);
+  }
+}
+
+async function assertLeaseLinked(
+  lease: GuardFileLease,
+  path: string,
+  requireExactPermissions = true,
+): Promise<void> {
   if (lease.state !== "linked") {
     throw new Error(`guard 文件已不再链接到原路径，拒绝操作：${path}`);
   }
@@ -66,10 +76,19 @@ async function assertLeaseLinked(lease: GuardFileLease, path: string): Promise<v
   if (await requirePrivateDirectory(parent, "guard parent directory") !== parent) {
     throw new Error(`guard parent directory realpath 已变化，拒绝操作：${parent}`);
   }
-  assertOwnedGuardInfo(await lease.handle.stat(), lease.identity, path);
+  const info = await lease.handle.stat();
+  if (requireExactPermissions) {
+    assertOwnedGuardInfo(info, lease.identity, path);
+  } else {
+    assertOwnedGuardIdentity(info, lease.identity, path);
+  }
 }
 
-async function unlinkIfOwned(path: string, lease: GuardFileLease): Promise<boolean> {
+async function unlinkIfOwned(
+  path: string,
+  lease: GuardFileLease,
+  requireExactPermissions = true,
+): Promise<boolean> {
   if (lease.state !== "linked") {
     throw new Error(`guard 文件状态无效，拒绝重复 unlink：${path}`);
   }
@@ -80,8 +99,12 @@ async function unlinkIfOwned(path: string, lease: GuardFileLease): Promise<boole
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
-  await assertLeaseLinked(lease, path);
-  assertOwnedGuardInfo(info, lease.identity, path);
+  await assertLeaseLinked(lease, path, requireExactPermissions);
+  if (requireExactPermissions) {
+    assertOwnedGuardInfo(info, lease.identity, path);
+  } else {
+    assertOwnedGuardIdentity(info, lease.identity, path);
+  }
   await unlink(path);
   lease.state = "unlinked";
   return true;
@@ -103,7 +126,9 @@ async function finishGuardRelease(path: string, lease: GuardFileLease): Promise<
 
 async function discardGuardFile(path: string, lease: GuardFileLease): Promise<void> {
   try {
-    if (lease.state === "linked") await unlinkIfOwned(path, lease);
+    // 创建阶段可能尚未成功 fchmod；清理只放宽 mode 要求，仍核对父目录、
+    // retained fd/path 的类型、link count 与 dev/inode，绝不删除替代文件。
+    if (lease.state === "linked") await unlinkIfOwned(path, lease, false);
     if (lease.state === "unlinked") await syncDirectory(dirname(path));
   } finally {
     await lease.handle.close().catch(() => undefined);
@@ -130,8 +155,11 @@ async function createGuardFile(
   try {
     const info = await handle.stat();
     const identity = { dev: info.dev, ino: info.ino };
-    assertOwnedGuardInfo(info, identity, path);
     lease = { handle, identity, state: "linked" };
+    // open 的 mode 会被进程 umask 掩码；在创建 fd 上固定并精确读回 0600，
+    // 再写入和 fsync，避免产生 acquire 成功但无法 assert/release 的 000 guard。
+    await handle.chmod(0o600);
+    assertOwnedGuardInfo(await handle.stat(), identity, path);
     await handle.writeFile(text, "utf8");
     await handle.sync();
   } catch (error) {

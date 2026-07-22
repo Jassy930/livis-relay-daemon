@@ -68,6 +68,13 @@ export async function durableAtomicWritePrivate(
   try {
     const handle = await open(temporaryPath, "wx", 0o600);
     try {
+      // open 的 mode 会被进程 umask 掩码；必须在同一 fd 上固定并读回权限，
+      // 避免把 000/0200 等不可读文件 rename 成正式配置或恢复证据。
+      await handle.chmod(0o600);
+      const info = await handle.stat();
+      if (!info.isFile() || (info.mode & 0o777) !== 0o600) {
+        throw new Error(`durable 临时文件权限未固定为 0600：${temporaryPath}`);
+      }
       await handle.writeFile(data, "utf8");
       await handle.sync();
     } finally {
@@ -100,23 +107,39 @@ async function syncDirectory(path: string): Promise<void> {
 
 /** 创建单层 0700 目录并同步父目录中的新目录项；父目录必须已存在。 */
 export async function durableMkdirPrivate(path: string): Promise<boolean> {
+  let created = false;
   try {
     await mkdir(path, { mode: 0o700 });
+    created = true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      const info = await lstat(path);
-      if (info.isSymbolicLink() || !info.isDirectory() || (info.mode & 0o077) !== 0) {
-        throw new Error(`durable private directory 已存在但类型或权限不安全：${path}`);
-      }
-      await syncDirectory(dirname(path));
-      await syncDirectory(path);
-      return false;
-    }
-    throw error;
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+
+  const beforeChmod = await lstat(path);
+  if (
+    beforeChmod.isSymbolicLink() ||
+    !beforeChmod.isDirectory() ||
+    (beforeChmod.mode & 0o077) !== 0
+  ) {
+    throw new Error(`durable private directory 已存在但类型或权限不安全：${path}`);
+  }
+
+  // mkdir 的 mode 同样受 umask 影响。保留安全但 owner 权限不足的目录作为
+  // 可重试状态；下一次 EEXIST 会重新固定 0700，而不会接管曾向组/其他用户开放的目录。
+  await chmod(path, 0o700);
+  const afterChmod = await lstat(path);
+  if (
+    afterChmod.isSymbolicLink() ||
+    !afterChmod.isDirectory() ||
+    (afterChmod.mode & 0o777) !== 0o700 ||
+    afterChmod.dev !== beforeChmod.dev ||
+    afterChmod.ino !== beforeChmod.ino
+  ) {
+    throw new Error(`durable private directory 权限未固定为 0700 或路径已变化：${path}`);
   }
   await syncDirectory(dirname(path));
   await syncDirectory(path);
-  return true;
+  return created;
 }
 
 /**

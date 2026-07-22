@@ -16,6 +16,20 @@ import { Logger } from "../src/logger.ts";
 import { DaemonOfflineGuard, ProfileOperationGuard } from "../src/state/offline-guard.ts";
 import { temporaryDirectory } from "./helpers.ts";
 
+async function runBunEval(script: string, label: string): Promise<void> {
+  const subprocess = Bun.spawn([process.execPath, "-e", script], {
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  const [exitCode, stderr] = await Promise.all([
+    subprocess.exited,
+    new Response(subprocess.stderr).text(),
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(`${label} 子进程失败（exit ${exitCode}）：${stderr.trim()}`);
+  }
+}
+
 function connectorServer(socketPath: string): ConnectorServer {
   const handlers: ConnectorServerHandlers = {
     onReady: async () => {},
@@ -68,6 +82,97 @@ describe("离线与 profile 操作 guard", () => {
     await guard.release();
     expect(await Bun.file(guard.path).exists()).toBeFalse();
     await guard.release();
+  });
+
+  test("极端 umask 下两种 guard 仍固定 0600 并可正常校验释放", async () => {
+    const guardUrl = new URL("../src/state/offline-guard.ts", import.meta.url).href;
+    await runBunEval(`
+      import { chmod, open, rm, stat } from "node:fs/promises";
+      import { join } from "node:path";
+      import { DaemonOfflineGuard, ProfileOperationGuard } from ${JSON.stringify(guardUrl)};
+      const stateDir = ${JSON.stringify(directory.path)};
+      const previousUmask = process.umask(0o777);
+      let profileGuard = null;
+      let offlineGuard = null;
+      try {
+        profileGuard = await ProfileOperationGuard.acquire(
+          stateDir,
+          "protocol-profile-migration",
+        );
+        offlineGuard = await DaemonOfflineGuard.acquire(
+          join(stateDir, "umask-connector.sock"),
+          stateDir,
+          "protocol-profile-migration",
+        );
+        if (((await stat(profileGuard.path)).mode & 0o777) !== 0o600) {
+          throw new Error("profile guard 未固定为 0600");
+        }
+        if (((await stat(offlineGuard.path)).mode & 0o777) !== 0o600) {
+          throw new Error("offline guard 未固定为 0600");
+        }
+        await profileGuard.assertHeld();
+        await offlineGuard.assertHeld();
+
+        await chmod(profileGuard.path, 0o400);
+        let assertRejected = false;
+        let releaseRejected = false;
+        try {
+          await profileGuard.assertHeld();
+        } catch (error) {
+          assertRejected = String(error).includes("类型、权限或 inode 已变化");
+        }
+        try {
+          await profileGuard.release();
+        } catch (error) {
+          releaseRejected = String(error).includes("类型、权限或 inode 已变化");
+        }
+        if (!assertRejected || !releaseRejected || !await Bun.file(profileGuard.path).exists()) {
+          throw new Error("guard 权限漂移未保持 fail closed");
+        }
+        await chmod(profileGuard.path, 0o600);
+
+        await offlineGuard.release();
+        await profileGuard.release();
+        if (
+          await Bun.file(offlineGuard.path).exists() ||
+          await Bun.file(profileGuard.path).exists()
+        ) {
+          throw new Error("guard release 后仍残留文件");
+        }
+
+        const probePath = join(stateDir, "file-handle-prototype-probe");
+        const probeHandle = await open(probePath, "wx", 0o600);
+        const fileHandlePrototype = Object.getPrototypeOf(probeHandle);
+        const originalChmod = fileHandlePrototype.chmod;
+        await probeHandle.close();
+        await rm(probePath);
+        let injectedFailureObserved = false;
+        try {
+          fileHandlePrototype.chmod = async () => {
+            throw new Error("injected guard fchmod failure");
+          };
+          await ProfileOperationGuard.acquire(stateDir, "upstream-check");
+        } catch (error) {
+          injectedFailureObserved = String(error).includes("injected guard fchmod failure");
+        } finally {
+          fileHandlePrototype.chmod = originalChmod;
+        }
+        if (
+          !injectedFailureObserved ||
+          await Bun.file(join(stateDir, "profile-operation.guard")).exists()
+        ) {
+          throw new Error("guard fchmod 失败后遗留了创建中的 guard");
+        }
+      } finally {
+        process.umask(previousUmask);
+        for (const guard of [offlineGuard, profileGuard]) {
+          if (!guard) continue;
+          await chmod(guard.path, 0o600).catch(() => undefined);
+          await guard.release().catch(() => undefined);
+          await rm(guard.path, { force: true }).catch(() => undefined);
+        }
+      }
+    `, "极端 umask guard 生命周期");
   });
 
   test("login 与 serve-start 也使用同一 profile operation guard 格式", async () => {
