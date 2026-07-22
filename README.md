@@ -68,15 +68,11 @@ git clone https://github.com/Jassy930/livis-relay-daemon.git && cd livis-relay-d
 
 `bun run check` 会依次检查版本、文档链接、Git tracked files、wire contract append-only 历史与本地 S2 protocol probe artifact，再执行 TypeScript 类型检查、全部 Bun 测试、`uv lock --check` 和 Hermes plugin pytest。其中公开发布与 append-only 门禁审核 Git index；probe generator、类型检查和测试读取当前工作区。运行前应先用 `git add` 精确暂存候选文件，并保持 staged/worktree 一致。
 
-截至 2026-07-18 的本地验收记录（测试数量随主线变化，以 `bun run check` 当前输出为准）：
+验证结果必须绑定精确提交，不能沿用 README 中的固定测试数量或旧 canary 结论。当前候选应在精确 staged tree 上运行 `bun run check`；实际测试数量以该次输出为准。
 
-- Bun 测试全部通过（含 fake LiViS 端到端、SQLite、UDS connector、Python 跨语言往返、Device Flow 428、更新/回滚、proof 与公开发布门禁）。
-- Hermes plugin pytest 全部通过，真实 Hermes 0.15.1 package import/runtimeVersion smoke 通过。
-- 使用本地未纳入版本控制的研究 profile，临时目录 `init → upstream check → doctor` 已通过；该 profile 不随公开仓库分发。
-- 状态文件、SQLite、WAL 和 SHM 权限均读回为 `0600`。
-- 已使用隔离的 Hermes 0.15.1 profile 完成真实 Device Flow 登录、Agent ID 绑定和 LiViS v2.0.0 消息 canary：入站任务进入 Hermes、模型生成纯文本结果、durable outbox 收到 `ack_send_result` 并进入 `Delivered`。
-- 首次会话必须先发送 `/sethome`；Hermes 的一次性 home-channel 提示会占用一期协议允许的唯一 final。完整证据、操作顺序和限制见 [`docs/HERMES-CANARY.md`](docs/HERMES-CANARY.md)。
-- 本地 canary 当前以前台进程运行，尚未安装 launchd/systemd 常驻服务；默认 Hermes profile 未被修改。
+2026-07-18 曾在旧代码基线上留下 Hermes 0.15.1 前台纯文本闭环的高层人工摘要；同期 LaunchAgent 记录也只证明服务存活、online doctor、Relay handshake 与 connector ready。它们都早于当前 protocol profile v2、单设备边界、Relay 资源门禁和 JobStore v3，且没有绑定当前最终提交的完整 receipt，因此只作历史参考，不能证明当前版本或 launchd 常驻消息闭环已经通过。证据边界和当前验收步骤见 [`docs/HERMES-CANARY.md`](docs/HERMES-CANARY.md)。
+
+仓库提供 Relay LaunchAgent 模板和双服务运行手册，但安装、加载、启停与真实消息 canary 都是操作者在获授权环境中的显式步骤；合并文档或 `plutil -lint` 通过不代表用户服务已被修改，也不代表 LiViS 消息已完成 `Succeeded → Delivered → App 回显` 闭环。
 
 ## 使用入口
 

@@ -83,9 +83,17 @@ bun run src/index.ts logout
 hermes profile create livis-test --no-skills --no-alias \
   --description "LiViS Relay 一期隔离测试 profile"
 export LIVIS_HERMES_HOME="$HOME/.hermes/profiles/livis-test"
+test -d "$LIVIS_HERMES_HOME" && ! test -L "$LIVIS_HERMES_HOME" || {
+  echo "livis-test profile 不存在、不是目录或末级为 symlink" >&2
+  exit 1
+}
+test "$(cd "$LIVIS_HERMES_HOME" && pwd -P)" = "$LIVIS_HERMES_HOME" || {
+  echo "livis-test profile 的物理路径发生了 symlink/canonical 漂移" >&2
+  exit 1
+}
 ```
 
-不要使用 `--clone` / `--clone-all`，也不要把插件启用到正在承载其他渠道的默认 Gateway。插件目录必须同时包含三个文件：
+不要使用 `--clone` / `--clone-all`，也不要把插件启用到正在承载其他渠道的默认 Gateway。字符串路径正确不足以证明隔离；上述物理路径检查会在任何插件或 Gateway 写操作前拒绝末级及祖先的 symlink/canonical 漂移。插件目录必须同时包含三个文件：
 
 ```text
 $LIVIS_HERMES_HOME/plugins/livis-bridge/
@@ -97,30 +105,81 @@ $LIVIS_HERMES_HOME/plugins/livis-bridge/
 从仓库根目录复制：
 
 ```bash
-install -d -m 0700 "$LIVIS_HERMES_HOME/plugins/livis-bridge"
-install -m 0644 \
-  hermes-plugin/plugin.yaml \
-  hermes-plugin/__init__.py \
-  hermes-plugin/adapter.py \
-  "$LIVIS_HERMES_HOME/plugins/livis-bridge/"
-```
-
-复制后显式启用：
-
-```bash
+(
+set -euo pipefail
+: "${LIVIS_HERMES_HOME:?请先把 LIVIS_HERMES_HOME 设为隔离 livis-test profile 的绝对路径}"
+test "$LIVIS_HERMES_HOME" = "$HOME/.hermes/profiles/livis-test" || {
+  echo "拒绝操作非 livis-test Hermes profile: $LIVIS_HERMES_HOME" >&2
+  exit 1
+}
+test -d "$LIVIS_HERMES_HOME" && ! test -L "$LIVIS_HERMES_HOME" || {
+  echo "livis-test profile 不存在、不是目录或末级为 symlink" >&2
+  exit 1
+}
+test "$(cd "$LIVIS_HERMES_HOME" && pwd -P)" = "$LIVIS_HERMES_HOME" || {
+  echo "livis-test profile 物理路径不精确，拒绝安装插件" >&2
+  exit 1
+}
+PROJECT_ROOT="$(pwd -P)"
+PLUGINS_DIR="$LIVIS_HERMES_HOME/plugins"
+BRIDGE_DIR="$PLUGINS_DIR/livis-bridge"
+if test -e "$PLUGINS_DIR" || test -L "$PLUGINS_DIR"; then
+  test -d "$PLUGINS_DIR" && ! test -L "$PLUGINS_DIR" || {
+    echo "Hermes plugins 路径不是真实目录" >&2
+    exit 1
+  }
+else
+  install -d -m 0700 "$PLUGINS_DIR"
+fi
+test "$(cd "$PLUGINS_DIR" && pwd -P)" = "$PLUGINS_DIR" || {
+  echo "Hermes plugins 目录的物理路径不精确" >&2
+  exit 1
+}
+if test -e "$BRIDGE_DIR" || test -L "$BRIDGE_DIR"; then
+  test -d "$BRIDGE_DIR" && ! test -L "$BRIDGE_DIR" || {
+    echo "livis-bridge 路径不是真实目录" >&2
+    exit 1
+  }
+else
+  install -d -m 0700 "$BRIDGE_DIR"
+fi
+test "$(cd "$BRIDGE_DIR" && pwd -P)" = "$BRIDGE_DIR" || {
+  echo "livis-bridge 目录的物理路径不精确" >&2
+  exit 1
+}
+(
+  cd "$BRIDGE_DIR"
+  test "$(pwd -P)" = "$BRIDGE_DIR" || exit 1
+  install -m 0644 \
+    "$PROJECT_ROOT/hermes-plugin/plugin.yaml" \
+    "$PROJECT_ROOT/hermes-plugin/__init__.py" \
+    "$PROJECT_ROOT/hermes-plugin/adapter.py" \
+    .
+)
+HERMES_CONFIG="$LIVIS_HERMES_HOME/config.yaml"
+test -f "$HERMES_CONFIG" && ! test -L "$HERMES_CONFIG" || {
+  echo "livis-test config.yaml 缺失、不是普通文件或为 symlink" >&2
+  exit 1
+}
+test "$(stat -f '%l' "$HERMES_CONFIG")" = 1 && \
+  test "$(stat -f '%Lp' "$HERMES_CONFIG")" = 600 || {
+    echo "livis-test config.yaml 必须是单链接且权限为 0600" >&2
+    exit 1
+  }
 HERMES_HOME="$LIVIS_HERMES_HOME" hermes plugins enable livis-bridge
+)
 ```
 
 在专用 Hermes profile 的 `.env` 中以 `0600` 权限设置：
 
 ```bash
-LIVIS_RELAY_SOCKET=$HOME/.livis-relay/connector.sock
+LIVIS_RELAY_SOCKET=${HOME}/.livis-relay/connector.sock
 LIVIS_RELAY_TOKEN=<使用 connector-token 命令读取>
 LIVIS_ALLOWED_USERS=<与 security.allowedNodeIds 完全相同的唯一 node_id>
 LIVIS_PHASE1_READ_ONLY_ACK=true
 ```
 
-启动前读回 daemon 与 Hermes 两处 allowlist，确认它们完全相同且都只有一个值。`LIVIS_ALLOWED_USERS` 的逗号列表语法不代表一期允许配置多个设备。
+启动前读回 daemon 与 Hermes 两处 allowlist，确认它们完全相同且都只有一个值。`LIVIS_ALLOWED_USERS` 的逗号列表语法不代表一期允许配置多个设备。Hermes 0.15.1 的 `.env` 加载只展开 `${HOME}` 形式；裸 `$HOME` 会被当成字面路径，因此 socket 必须写成上述形式或经读回的绝对路径。
 
 读取 connector token：
 
@@ -175,6 +234,830 @@ bun run src/index.ts doctor --online
 - `packaging/systemd/livis-relayd.service.example`
 
 替换模板中的绝对路径后再加载服务；daemon 和 Hermes Gateway 必须是两个独立服务。
+
+### macOS LaunchAgent
+
+以下命令是获授权主机上的操作手册，不是本仓库验证流程的一部分。本次模板维护不会执行 `launchctl`，也不会安装、启动或停止用户服务。
+
+#### 7.1 部署边界与稳定 checkout
+
+常驻模式必须使用两个独立的用户级 LaunchAgent：
+
+- `com.local.livis-relayd` 只运行 Relay daemon；
+- 隔离 profile `livis-test` 的 Hermes Gateway 使用 runtime 生成的独立 label，Hermes 0.15.1 历史环境中为 `ai.hermes.gateway-livis-test`。
+
+不得把两个进程塞入同一个 plist，也不得覆盖或停止用户默认的 `ai.hermes.gateway`。一期仍只允许唯一 `node_id`；daemon 的 `security.allowedNodeIds` 与 Hermes 的 `LIVIS_ALLOWED_USERS` 必须读回为同一个单元素值。
+
+服务应绑定独立、干净、路径稳定的部署 checkout，不要使用正在开发或带未提交改动的工作树：
+
+```bash
+git clone https://github.com/Jassy930/livis-relay-daemon.git \
+  "$HOME/.local/share/livis-relay-daemon"
+cd "$HOME/.local/share/livis-relay-daemon"
+git switch --detach '<已审阅提交>'
+bun install --frozen-lockfile
+git status --short
+bun run check
+```
+
+`git status --short` 必须为空，且 `<已审阅提交>` 必须与部署记录一致。不要让 LaunchAgent 跟随会被开发工具重写、删除或切换分支的目录。
+
+启动前还必须确认：
+
+- active protocol profile 是当前支持的 schema v2，supported proof 未过期；
+- Hermes runtime 固定在 `[0.15.1, 0.15.2)`，bridge 固定在配置允许范围；未知版本保持失败关闭；
+- state directory 位于仓库外并为 `0700`，config、proof、token 与数据库文件不进入部署 checkout；
+- 若旧 `relay.db` 尚未由当前代码打开，先按第 8 节停服备份，再允许 JobStore v3 自动迁移。
+
+#### 7.2 安装 Relay 与 Hermes LaunchAgent
+
+从 [`packaging/launchd/com.local.livis-relayd.plist.example`](../packaging/launchd/com.local.livis-relayd.plist.example) 复制本机 plist，并人工替换三个占位符：
+
+- `__BUN__`：`command -v bun` 返回的绝对路径；
+- `__PROJECT_DIR__`：上述稳定 checkout 的绝对路径；
+- `__HOME__`：当前用户 home 的绝对路径。
+
+不要把 token、node ID 或私有 profile 内容写入 plist。模板显式设置 `HOME`，并提供可解析常见 Bun/Hermes 安装位置的 `PATH`；如果 `command -v bun` 或 `command -v hermes` 位于其他目录，必须先更新本机副本的绝对路径或 `PATH`。`ThrottleInterval=10` 限制崩溃重启频率，plist 十进制 `Umask=63` 等价于八进制 `077`。
+
+```bash
+install -d -m 0700 "$HOME/.livis-relay"
+plutil -lint '/绝对路径/com.local.livis-relayd.plist'
+plutil -p '/绝对路径/com.local.livis-relayd.plist'
+install -m 0644 '/绝对路径/com.local.livis-relayd.plist' \
+  "$HOME/Library/LaunchAgents/com.local.livis-relayd.plist"
+```
+
+`plutil -p` 读回时必须核对 label、Bun、checkout、config、HOME、PATH、日志路径、`ThrottleInterval=10` 和 `Umask=63`，且不能残留 `__...__` 占位符。
+
+Hermes plist 必须由审核范围内的 Hermes runtime 针对隔离 profile 生成；不要从本仓库复制模板，也不要手写冻结内部参数：
+
+```bash
+(
+set -euo pipefail
+: "${LIVIS_HERMES_HOME:?请先把 LIVIS_HERMES_HOME 设为隔离 livis-test profile 的绝对路径}"
+test "$LIVIS_HERMES_HOME" = "$HOME/.hermes/profiles/livis-test" || {
+  echo "拒绝操作非 livis-test Hermes profile: $LIVIS_HERMES_HOME" >&2
+  exit 1
+}
+test -d "$LIVIS_HERMES_HOME" && ! test -L "$LIVIS_HERMES_HOME" || {
+  echo "livis-test profile 不存在、不是目录或末级为 symlink" >&2
+  exit 1
+}
+test "$(cd "$LIVIS_HERMES_HOME" && pwd -P)" = "$LIVIS_HERMES_HOME" || {
+  echo "livis-test profile 物理路径不精确，拒绝安装 Gateway" >&2
+  exit 1
+}
+HERMES_HOME="$LIVIS_HERMES_HOME" hermes gateway install
+plutil -p "$HOME/Library/LaunchAgents/ai.hermes.gateway-livis-test.plist"
+)
+```
+
+读回生成 plist 的 label、程序路径、`HERMES_HOME` 和日志路径；若 label 或文件路径不同，先检查生成的 plist 和精确 `launchctl print "gui/$(id -u)/ai.hermes.gateway-livis-test"` 目标，不得改为操作默认 `ai.hermes.gateway`。`hermes gateway status` 只可作辅助诊断；0.15.1 在 macOS 上即使报告“not loaded”也可能返回 0，不能用它的退出码证明 job 已加载或运行。如果 `gateway install` 同时加载或启动了 job，应使用第 7.3 节的精确 label/PID 停服段处理，随后仍按 Relay → Hermes 的固定顺序启动；不要在该关键路径依赖 0.15.1 `gateway stop` 的退出码或 PID 强制终止逻辑。每次新开 shell 或进入后续启停、升级步骤，都必须重新执行非空与精确路径检查；不能让空的 `HERMES_HOME` 回退到 active/default profile。Hermes 命令的具体行为以审核中的 0.15.1 runtime 为准，不能拿未来版本 CLI 的输出扩大支持窗口。
+
+#### 7.3 启动、停止与卸载
+
+启动顺序固定为 Relay → Hermes：
+
+```bash
+(
+set -euo pipefail
+: "${LIVIS_HERMES_HOME:?请先把 LIVIS_HERMES_HOME 设为隔离 livis-test profile 的绝对路径}"
+test "$LIVIS_HERMES_HOME" = "$HOME/.hermes/profiles/livis-test" || {
+  echo "拒绝操作非 livis-test Hermes profile: $LIVIS_HERMES_HOME" >&2
+  exit 1
+}
+test -d "$LIVIS_HERMES_HOME" && ! test -L "$LIVIS_HERMES_HOME" || {
+  echo "livis-test profile 不存在、不是目录或末级为 symlink" >&2
+  exit 1
+}
+test "$(cd "$LIVIS_HERMES_HOME" && pwd -P)" = "$LIVIS_HERMES_HOME" || {
+  echo "livis-test profile 物理路径不精确，拒绝启动 Gateway" >&2
+  exit 1
+}
+RELAY_TARGET="gui/$(id -u)/com.local.livis-relayd"
+HERMES_TARGET="gui/$(id -u)/ai.hermes.gateway-livis-test"
+RELAY_CHECKOUT="$HOME/.local/share/livis-relay-daemon"
+RELAY_CONFIG="$HOME/.livis-relay/config.json"
+test -d "$RELAY_CHECKOUT/.git" || {
+  echo "Relay 稳定 checkout 不存在：$RELAY_CHECKOUT" >&2
+  exit 1
+}
+relay_status() {
+  (
+    cd "$RELAY_CHECKOUT"
+    bun run src/index.ts status --config "$RELAY_CONFIG"
+  )
+}
+connector_ready() {
+  STATUS_JSON="$(relay_status 2>/dev/null)" || return 1
+  STATUS_JSON="$STATUS_JSON" bun -e '
+    const status = JSON.parse(process.env.STATUS_JSON ?? "");
+    if (status?.daemon?.connector?.ready !== true) process.exit(1);
+  '
+}
+HERMES_PLIST="$HOME/Library/LaunchAgents/ai.hermes.gateway-livis-test.plist"
+assert_hermes_definition() {
+  DEFINITION_JOB="$1"
+  test -f "$HERMES_PLIST" && ! test -L "$HERMES_PLIST" || {
+    echo "Hermes LaunchAgent plist 缺失、不是普通文件或为 symlink" >&2
+    return 1
+  }
+  test "$(stat -f '%l' "$HERMES_PLIST")" = 1 || {
+    echo "Hermes LaunchAgent plist 必须是单链接文件" >&2
+    return 1
+  }
+  plutil -lint "$HERMES_PLIST" >/dev/null
+  test "$(plutil -extract Label raw "$HERMES_PLIST")" = "ai.hermes.gateway-livis-test" && \
+    test "$(plutil -extract EnvironmentVariables.HERMES_HOME raw "$HERMES_PLIST")" = "$LIVIS_HERMES_HOME" && \
+    test "$(plutil -extract WorkingDirectory raw "$HERMES_PLIST")" = "$LIVIS_HERMES_HOME" && \
+    test "$(plutil -extract ProgramArguments raw "$HERMES_PLIST")" = 8 && \
+    test "$(plutil -extract ProgramArguments.1 raw "$HERMES_PLIST")" = "-m" && \
+    test "$(plutil -extract ProgramArguments.2 raw "$HERMES_PLIST")" = "hermes_cli.main" && \
+    test "$(plutil -extract ProgramArguments.3 raw "$HERMES_PLIST")" = "--profile" && \
+    test "$(plutil -extract ProgramArguments.4 raw "$HERMES_PLIST")" = "livis-test" && \
+    test "$(plutil -extract ProgramArguments.5 raw "$HERMES_PLIST")" = "gateway" && \
+    test "$(plutil -extract ProgramArguments.6 raw "$HERMES_PLIST")" = "run" && \
+    test "$(plutil -extract ProgramArguments.7 raw "$HERMES_PLIST")" = "--replace" || {
+      echo "Hermes LaunchAgent plist 不是已审阅的 livis-test 定义" >&2
+      return 1
+    }
+  HERMES_PROGRAM="$(plutil -extract ProgramArguments.0 raw "$HERMES_PLIST")"
+  case "$HERMES_PROGRAM" in
+    /*) ;;
+    *)
+      echo "Hermes LaunchAgent 程序路径不是绝对路径" >&2
+      return 1
+      ;;
+  esac
+  test -x "$HERMES_PROGRAM" || {
+    echo "Hermes LaunchAgent 程序不可执行：$HERMES_PROGRAM" >&2
+    return 1
+  }
+  if test -n "$DEFINITION_JOB"; then
+    for EXPECTED_LINE in \
+      "$(printf '\tpath = %s' "$HERMES_PLIST")" \
+      "$(printf '\tprogram = %s' "$HERMES_PROGRAM")" \
+      "$(printf '\tworking directory = %s' "$LIVIS_HERMES_HOME")" \
+      "$(printf '\t\tHERMES_HOME => %s' "$LIVIS_HERMES_HOME")"; do
+      test "$(printf '%s\n' "$DEFINITION_JOB" | grep -Fxc -- "$EXPECTED_LINE")" = 1 || {
+        echo "已加载的 Hermes job 与 livis-test plist 不一致" >&2
+        return 1
+      }
+    done
+    LOADED_ARGUMENTS="$(
+      printf '%s\n' "$DEFINITION_JOB" | awk '
+        /^[[:space:]]*arguments = \{$/ {
+          starts += 1
+          inside = 1
+          next
+        }
+        inside && /^[[:space:]]*\}$/ {
+          closes += 1
+          inside = 0
+          next
+        }
+        inside {
+          line = $0
+          sub(/^[[:space:]]+/, "", line)
+          print line
+        }
+        END {
+          if (starts != 1 || closes != 1 || inside) exit 1
+        }
+      '
+    )" || {
+      echo "无法唯一解析已加载 Hermes job 的 arguments 块" >&2
+      return 1
+    }
+    EXPECTED_ARGUMENTS="$(printf '%s\n' \
+      "$HERMES_PROGRAM" \
+      "-m" \
+      "hermes_cli.main" \
+      "--profile" \
+      "livis-test" \
+      "gateway" \
+      "run" \
+      "--replace")"
+    test "$LOADED_ARGUMENTS" = "$EXPECTED_ARGUMENTS" || {
+      echo "已加载 Hermes job 的 arguments 数量、顺序或内容发生漂移" >&2
+      return 1
+    }
+  fi
+}
+hermes_preflight() {
+  PRE_HERMES_JOB="$(launchctl print "$HERMES_TARGET" 2>/dev/null)" || PRE_HERMES_JOB=""
+  assert_hermes_definition "$PRE_HERMES_JOB"
+  PRE_HERMES_LAUNCHD_PID="$(printf '%s\n' "$PRE_HERMES_JOB" | awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }')"
+  PRE_HERMES_PROFILE_PID=""
+  if test -L "$LIVIS_HERMES_HOME/gateway.pid"; then
+    echo "Hermes PID 路径是 symlink，拒绝启动" >&2
+    return 1
+  elif test -f "$LIVIS_HERMES_HOME/gateway.pid"; then
+    test "$(stat -f '%l' "$LIVIS_HERMES_HOME/gateway.pid")" = 1 || {
+      echo "Hermes PID 记录必须是单链接文件，拒绝启动" >&2
+      return 1
+    }
+    PRE_HERMES_PROFILE_PID="$(plutil -extract pid raw "$LIVIS_HERMES_HOME/gateway.pid")" || {
+      echo "Hermes PID 记录不可读，拒绝启动" >&2
+      return 1
+    }
+  elif test -e "$LIVIS_HERMES_HOME/gateway.pid"; then
+    echo "Hermes PID 路径不是普通文件，拒绝启动" >&2
+    return 1
+  fi
+  case "$PRE_HERMES_PROFILE_PID" in
+    "") ;;
+    *[!0-9]*)
+      echo "Hermes profile PID 不是正整数，拒绝启动" >&2
+      return 1
+      ;;
+  esac
+  if test -n "$PRE_HERMES_PROFILE_PID" && ! test "$PRE_HERMES_PROFILE_PID" -gt 0; then
+    echo "Hermes profile PID 必须大于 0，拒绝启动" >&2
+    return 1
+  fi
+  if test -n "$PRE_HERMES_LAUNCHD_PID" && test -z "$PRE_HERMES_PROFILE_PID"; then
+    echo "Hermes LaunchAgent 已有运行 PID 但 profile PID 缺失，拒绝启动" >&2
+    return 1
+  fi
+  if test -n "$PRE_HERMES_LAUNCHD_PID" && \
+      test "$PRE_HERMES_LAUNCHD_PID" != "$PRE_HERMES_PROFILE_PID"; then
+    echo "Hermes LaunchAgent PID 与 profile PID 不一致，拒绝执行任何启动副作用" >&2
+    return 1
+  fi
+  if test -z "$PRE_HERMES_LAUNCHD_PID" && \
+      test -n "$PRE_HERMES_PROFILE_PID" && \
+      ps -p "$PRE_HERMES_PROFILE_PID" -o pid= >/dev/null 2>&1; then
+    echo "Hermes profile PID 仍存活但精确 LaunchAgent 无运行 PID，拒绝自动启动" >&2
+    return 1
+  fi
+}
+cleanup_failed_start() {
+  set +e
+  CLEANUP_NEWLINE=$'\n'
+  CLEAN_HERMES_JOB="$(launchctl print "$HERMES_TARGET" 2>/dev/null)"
+  CLEAN_HERMES_PID="$(printf '%s\n' "$CLEAN_HERMES_JOB" | awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }')"
+  CLEAN_PROFILE_PID=""
+  CLEANUP_PID_PROOF=true
+  CLEAN_HERMES_PIDS=""
+  case "$CLEAN_HERMES_PID" in
+    "") ;;
+    *)
+      if test "$CLEAN_HERMES_PID" -gt 0; then
+        CLEAN_HERMES_PIDS="$CLEAN_HERMES_PID"
+      else
+        CLEANUP_PID_PROOF=false
+      fi
+      ;;
+  esac
+  CLEAN_PROFILE_PID_VALID=true
+  if test -L "$LIVIS_HERMES_HOME/gateway.pid"; then
+    CLEANUP_PID_PROOF=false
+    CLEAN_PROFILE_PID_VALID=false
+  elif test -f "$LIVIS_HERMES_HOME/gateway.pid"; then
+    if ! test "$(stat -f '%l' "$LIVIS_HERMES_HOME/gateway.pid")" = 1; then
+      CLEANUP_PID_PROOF=false
+      CLEAN_PROFILE_PID_VALID=false
+    fi
+    CLEAN_PROFILE_PID="$(plutil -extract pid raw "$LIVIS_HERMES_HOME/gateway.pid" 2>/dev/null)"
+    case "$CLEAN_PROFILE_PID" in
+      ""|*[!0-9]*)
+        CLEANUP_PID_PROOF=false
+        CLEAN_PROFILE_PID_VALID=false
+        ;;
+      *)
+        if ! test "$CLEAN_PROFILE_PID" -gt 0; then
+          CLEANUP_PID_PROOF=false
+          CLEAN_PROFILE_PID_VALID=false
+        fi
+        ;;
+    esac
+  elif test -e "$LIVIS_HERMES_HOME/gateway.pid"; then
+    CLEANUP_PID_PROOF=false
+    CLEAN_PROFILE_PID_VALID=false
+  fi
+  CLEAN_RELAY_JOB="$(launchctl print "$RELAY_TARGET" 2>/dev/null)"
+  CLEAN_RELAY_PID="$(printf '%s\n' "$CLEAN_RELAY_JOB" | awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }')"
+  CLEAN_RELAY_PIDS=""
+  case "$CLEAN_RELAY_PID" in
+    "") ;;
+    *)
+      if test "$CLEAN_RELAY_PID" -gt 0; then
+        CLEAN_RELAY_PIDS="$CLEAN_RELAY_PID"
+      else
+        CLEANUP_PID_PROOF=false
+      fi
+      ;;
+  esac
+  CLEAN_PROFILE_PIDS=""
+  if test "$CLEAN_PROFILE_PID_VALID" = true && test -n "$CLEAN_PROFILE_PID"; then
+    CLEAN_PROFILE_PIDS="$CLEAN_PROFILE_PID"
+  fi
+  test -z "$CLEAN_HERMES_JOB" || launchctl bootout "$HERMES_TARGET"
+  test -z "$CLEAN_RELAY_JOB" || launchctl bootout "$RELAY_TARGET"
+  CLEANUP_DONE=false
+  CLEANUP_DEADLINE=$((SECONDS + 30))
+  while test "$SECONDS" -lt "$CLEANUP_DEADLINE"; do
+    HERMES_LABEL_LEFT=false
+    RELAY_LABEL_LEFT=false
+    HERMES_PID_LEFT=false
+    PROFILE_PID_LEFT=false
+    RELAY_PID_LEFT=false
+    POST_HERMES_JOB="$(launchctl print "$HERMES_TARGET" 2>/dev/null)"
+    if test -n "$POST_HERMES_JOB"; then
+      HERMES_LABEL_LEFT=true
+      POST_HERMES_PID="$(printf '%s\n' "$POST_HERMES_JOB" | awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }')"
+      case "$POST_HERMES_PID" in
+        "") ;;
+        *)
+          if test "$POST_HERMES_PID" -gt 0; then
+            if ! printf '%s\n' "$CLEAN_HERMES_PIDS" | grep -Fqx -- "$POST_HERMES_PID"; then
+              CLEAN_HERMES_PIDS="${CLEAN_HERMES_PIDS:+${CLEAN_HERMES_PIDS}${CLEANUP_NEWLINE}}${POST_HERMES_PID}"
+            fi
+          else
+            CLEANUP_PID_PROOF=false
+          fi
+          ;;
+      esac
+      launchctl bootout "$HERMES_TARGET" >/dev/null 2>&1
+    fi
+    POST_RELAY_JOB="$(launchctl print "$RELAY_TARGET" 2>/dev/null)"
+    if test -n "$POST_RELAY_JOB"; then
+      RELAY_LABEL_LEFT=true
+      POST_RELAY_PID="$(printf '%s\n' "$POST_RELAY_JOB" | awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }')"
+      case "$POST_RELAY_PID" in
+        "") ;;
+        *)
+          if test "$POST_RELAY_PID" -gt 0; then
+            if ! printf '%s\n' "$CLEAN_RELAY_PIDS" | grep -Fqx -- "$POST_RELAY_PID"; then
+              CLEAN_RELAY_PIDS="${CLEAN_RELAY_PIDS:+${CLEAN_RELAY_PIDS}${CLEANUP_NEWLINE}}${POST_RELAY_PID}"
+            fi
+          else
+            CLEANUP_PID_PROOF=false
+          fi
+          ;;
+      esac
+      launchctl bootout "$RELAY_TARGET" >/dev/null 2>&1
+    fi
+    POST_PROFILE_PID=""
+    if test -L "$LIVIS_HERMES_HOME/gateway.pid"; then
+      CLEANUP_PID_PROOF=false
+    elif test -f "$LIVIS_HERMES_HOME/gateway.pid"; then
+      if test "$(stat -f '%l' "$LIVIS_HERMES_HOME/gateway.pid")" = 1; then
+        POST_PROFILE_PID="$(plutil -extract pid raw "$LIVIS_HERMES_HOME/gateway.pid" 2>/dev/null)"
+        case "$POST_PROFILE_PID" in
+          ""|*[!0-9]*) CLEANUP_PID_PROOF=false ;;
+          *)
+            if test "$POST_PROFILE_PID" -gt 0; then
+              if ! printf '%s\n' "$CLEAN_PROFILE_PIDS" | grep -Fqx -- "$POST_PROFILE_PID"; then
+                CLEAN_PROFILE_PIDS="${CLEAN_PROFILE_PIDS:+${CLEAN_PROFILE_PIDS}${CLEANUP_NEWLINE}}${POST_PROFILE_PID}"
+              fi
+            else
+              CLEANUP_PID_PROOF=false
+            fi
+            ;;
+        esac
+      else
+        CLEANUP_PID_PROOF=false
+      fi
+    elif test -e "$LIVIS_HERMES_HOME/gateway.pid"; then
+      CLEANUP_PID_PROOF=false
+    fi
+    while IFS= read -r KNOWN_PID; do
+      if test -n "$KNOWN_PID" && ps -p "$KNOWN_PID" -o pid= >/dev/null 2>&1; then
+        HERMES_PID_LEFT=true
+      fi
+    done <<< "$CLEAN_HERMES_PIDS"
+    while IFS= read -r KNOWN_PID; do
+      if test -n "$KNOWN_PID" && ps -p "$KNOWN_PID" -o pid= >/dev/null 2>&1; then
+        PROFILE_PID_LEFT=true
+      fi
+    done <<< "$CLEAN_PROFILE_PIDS"
+    while IFS= read -r KNOWN_PID; do
+      if test -n "$KNOWN_PID" && ps -p "$KNOWN_PID" -o pid= >/dev/null 2>&1; then
+        RELAY_PID_LEFT=true
+      fi
+    done <<< "$CLEAN_RELAY_PIDS"
+    if test "$HERMES_LABEL_LEFT" = false && \
+        test "$RELAY_LABEL_LEFT" = false && \
+        test "$HERMES_PID_LEFT" = false && \
+        test "$PROFILE_PID_LEFT" = false && \
+        test "$RELAY_PID_LEFT" = false && \
+        test "$CLEANUP_PID_PROOF" = true; then
+      CLEANUP_DONE=true
+      break
+    fi
+    sleep 0.5
+  done
+  if test "$CLEANUP_DONE" != true || test "$CLEANUP_PID_PROOF" != true; then
+    echo "启动失败后已尝试 bootout 两个精确 label，但无法证明全部 label/PID 均已退出；拒绝继续验收" >&2
+  fi
+}
+hermes_preflight
+trap cleanup_failed_start EXIT
+if launchctl print "$RELAY_TARGET" >/dev/null 2>&1; then
+  launchctl kickstart -k "$RELAY_TARGET"
+else
+  launchctl bootstrap "gui/$(id -u)" \
+    "$HOME/Library/LaunchAgents/com.local.livis-relayd.plist"
+fi
+RELAY_READY=false
+RELAY_JOB=""
+RELAY_PID=""
+RELAY_DEADLINE=$((SECONDS + 120))
+while test "$SECONDS" -lt "$RELAY_DEADLINE"; do
+  RELAY_JOB="$(launchctl print "$RELAY_TARGET" 2>/dev/null)" || RELAY_JOB=""
+  RELAY_PID="$(printf '%s\n' "$RELAY_JOB" | awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }')"
+  if test -n "$RELAY_PID" && \
+      ps -p "$RELAY_PID" -o pid= >/dev/null 2>&1 && \
+      relay_status >/dev/null 2>&1 && \
+      test "$SECONDS" -lt "$RELAY_DEADLINE"; then
+    RELAY_READY=true
+    break
+  fi
+  sleep 0.5
+done
+test "$RELAY_READY" = true || {
+  echo "Relay 未在 120 秒内同时满足精确 label、运行 PID 和本地 status 就绪" >&2
+  exit 1
+}
+printf '%s\n' "$RELAY_JOB"
+hermes_preflight
+HERMES_HOME="$LIVIS_HERMES_HOME" hermes gateway start
+HERMES_READY=false
+HERMES_JOB=""
+HERMES_LAUNCHD_PID=""
+HERMES_PROFILE_PID=""
+HERMES_DEADLINE=$((SECONDS + 120))
+while test "$SECONDS" -lt "$HERMES_DEADLINE"; do
+  HERMES_JOB="$(launchctl print "$HERMES_TARGET" 2>/dev/null)" || HERMES_JOB=""
+  if test -n "$HERMES_JOB"; then
+    assert_hermes_definition "$HERMES_JOB" || exit 1
+  fi
+  HERMES_LAUNCHD_PID="$(printf '%s\n' "$HERMES_JOB" | awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }')"
+  HERMES_PROFILE_PID=""
+  if test -f "$LIVIS_HERMES_HOME/gateway.pid" && ! test -L "$LIVIS_HERMES_HOME/gateway.pid"; then
+    HERMES_PROFILE_PID="$(plutil -extract pid raw "$LIVIS_HERMES_HOME/gateway.pid" 2>/dev/null)" || HERMES_PROFILE_PID=""
+  fi
+  if test -n "$HERMES_LAUNCHD_PID" && \
+      test "$HERMES_LAUNCHD_PID" = "$HERMES_PROFILE_PID" && \
+      ps -p "$HERMES_LAUNCHD_PID" -o pid= >/dev/null 2>&1 && \
+      connector_ready && \
+      test "$SECONDS" -lt "$HERMES_DEADLINE"; then
+    HERMES_READY=true
+    break
+  fi
+  sleep 0.5
+done
+test "$HERMES_READY" = true || {
+  echo "Hermes 未在 120 秒内同时满足精确 label、PID 一致和 connector ready" >&2
+  exit 1
+}
+hermes_preflight
+test -n "$PRE_HERMES_LAUNCHD_PID" && \
+  ps -p "$PRE_HERMES_LAUNCHD_PID" -o pid= >/dev/null 2>&1 && \
+  connector_ready || {
+    echo "Hermes 最终读回时 label、PID 或 connector readiness 已漂移" >&2
+    exit 1
+  }
+printf '%s\n' "$PRE_HERMES_JOB"
+relay_status
+trap - EXIT
+)
+```
+
+三个操作段都在 `set -euo pipefail` 子 shell 中执行：任一步失败都不会继续启动下一服务，也不会把 shell 选项泄漏到操作者当前会话。启动段在任何服务副作前先闭合验证 livis-test plist、loaded job、profile 物理路径和 PID；已加载 job 的 arguments 必须与磁盘 plist 在数量、顺序和内容上逐项相等。随后安装 `EXIT` 补偿，启动后在 readiness 轮询及解除 trap 前再次读回定义；只有最终 status 读回成功才解除。中间任一失败或 readiness 超时都会先按 Hermes → Relay 对两个精确 label 执行 `bootout`，并在 30 秒内持续重读、验证和累计启动窗口内见过的 label/profile PID；无法证明时保持失败结论，不会把后续才上线的 KeepAlive job 误判为已清理。已加载的 Relay job 走 `kickstart -k`，因此正常退出后仍为 loaded/inactive 的 job 也会真正启动；未加载时才走 `bootstrap`。`kickstart -k` 会重启已在运行的 job，只能在明确的启动或重启窗口执行。Relay 必须先在 120 秒有界窗口内同时通过精确 label、运行 PID 和本地鉴权 status，才会启动 Hermes；该窗口覆盖 `serve` 启动时 upstream package 探测的三段 30 秒单次超时与初始化余量。Hermes 随后也必须在 120 秒内同时读回精确 label、与隔离 profile `gateway.pid` 一致的存活 PID，并由 Relay status 证明 connector ready。任一窗口超时都失败关闭，不依赖 `gateway status` 的退出码。停止顺序固定为 Hermes → Relay，避免 daemon 继续向正在退出的 connector 派发：
+
+```bash
+(
+set -euo pipefail
+: "${LIVIS_HERMES_HOME:?请先把 LIVIS_HERMES_HOME 设为隔离 livis-test profile 的绝对路径}"
+test "$LIVIS_HERMES_HOME" = "$HOME/.hermes/profiles/livis-test" || {
+  echo "拒绝操作非 livis-test Hermes profile: $LIVIS_HERMES_HOME" >&2
+  exit 1
+}
+test -d "$LIVIS_HERMES_HOME" && ! test -L "$LIVIS_HERMES_HOME" || {
+  echo "livis-test profile 不存在、不是目录或末级为 symlink" >&2
+  exit 1
+}
+test "$(cd "$LIVIS_HERMES_HOME" && pwd -P)" = "$LIVIS_HERMES_HOME" || {
+  echo "livis-test profile 物理路径不精确，拒绝停止 Gateway" >&2
+  exit 1
+}
+HERMES_TARGET="gui/$(id -u)/ai.hermes.gateway-livis-test"
+RELAY_TARGET="gui/$(id -u)/com.local.livis-relayd"
+HERMES_PLIST="$HOME/Library/LaunchAgents/ai.hermes.gateway-livis-test.plist"
+HERMES_JOB="$(launchctl print "$HERMES_TARGET" 2>/dev/null)" || HERMES_JOB=""
+test -f "$HERMES_PLIST" && ! test -L "$HERMES_PLIST" || {
+  echo "Hermes LaunchAgent plist 缺失、不是普通文件或为 symlink" >&2
+  exit 1
+}
+test "$(stat -f '%l' "$HERMES_PLIST")" = 1 || {
+  echo "Hermes LaunchAgent plist 必须是单链接文件" >&2
+  exit 1
+}
+plutil -lint "$HERMES_PLIST" >/dev/null
+test "$(plutil -extract Label raw "$HERMES_PLIST")" = "ai.hermes.gateway-livis-test" && \
+  test "$(plutil -extract EnvironmentVariables.HERMES_HOME raw "$HERMES_PLIST")" = "$LIVIS_HERMES_HOME" && \
+  test "$(plutil -extract WorkingDirectory raw "$HERMES_PLIST")" = "$LIVIS_HERMES_HOME" && \
+  test "$(plutil -extract ProgramArguments raw "$HERMES_PLIST")" = 8 && \
+  test "$(plutil -extract ProgramArguments.1 raw "$HERMES_PLIST")" = "-m" && \
+  test "$(plutil -extract ProgramArguments.2 raw "$HERMES_PLIST")" = "hermes_cli.main" && \
+  test "$(plutil -extract ProgramArguments.3 raw "$HERMES_PLIST")" = "--profile" && \
+  test "$(plutil -extract ProgramArguments.4 raw "$HERMES_PLIST")" = "livis-test" && \
+  test "$(plutil -extract ProgramArguments.5 raw "$HERMES_PLIST")" = "gateway" && \
+  test "$(plutil -extract ProgramArguments.6 raw "$HERMES_PLIST")" = "run" && \
+  test "$(plutil -extract ProgramArguments.7 raw "$HERMES_PLIST")" = "--replace" || {
+    echo "Hermes LaunchAgent plist 不是已审阅的 livis-test 定义" >&2
+    exit 1
+  }
+HERMES_PROGRAM="$(plutil -extract ProgramArguments.0 raw "$HERMES_PLIST")"
+case "$HERMES_PROGRAM" in
+  /*) ;;
+  *)
+    echo "Hermes LaunchAgent 程序路径不是绝对路径" >&2
+    exit 1
+    ;;
+esac
+test -x "$HERMES_PROGRAM" || {
+  echo "Hermes LaunchAgent 程序不可执行：$HERMES_PROGRAM" >&2
+  exit 1
+}
+if test -n "$HERMES_JOB"; then
+  for EXPECTED_LINE in \
+    "$(printf '\tpath = %s' "$HERMES_PLIST")" \
+    "$(printf '\tprogram = %s' "$HERMES_PROGRAM")" \
+    "$(printf '\tworking directory = %s' "$LIVIS_HERMES_HOME")" \
+    "$(printf '\t\tHERMES_HOME => %s' "$LIVIS_HERMES_HOME")"; do
+    test "$(printf '%s\n' "$HERMES_JOB" | grep -Fxc -- "$EXPECTED_LINE")" = 1 || {
+      echo "已加载的 Hermes job 与 livis-test plist 不一致" >&2
+      exit 1
+    }
+  done
+  LOADED_ARGUMENTS="$(
+    printf '%s\n' "$HERMES_JOB" | awk '
+      /^[[:space:]]*arguments = \{$/ {
+        starts += 1
+        inside = 1
+        next
+      }
+      inside && /^[[:space:]]*\}$/ {
+        closes += 1
+        inside = 0
+        next
+      }
+      inside {
+        line = $0
+        sub(/^[[:space:]]+/, "", line)
+        print line
+      }
+      END {
+        if (starts != 1 || closes != 1 || inside) exit 1
+      }
+    '
+  )" || {
+    echo "无法唯一解析已加载 Hermes job 的 arguments 块" >&2
+    exit 1
+  }
+  EXPECTED_ARGUMENTS="$(printf '%s\n' \
+    "$HERMES_PROGRAM" \
+    "-m" \
+    "hermes_cli.main" \
+    "--profile" \
+    "livis-test" \
+    "gateway" \
+    "run" \
+    "--replace")"
+  test "$LOADED_ARGUMENTS" = "$EXPECTED_ARGUMENTS" || {
+    echo "已加载 Hermes job 的 arguments 数量、顺序或内容发生漂移" >&2
+    exit 1
+  }
+fi
+HERMES_LAUNCHD_PID="$(printf '%s\n' "$HERMES_JOB" | awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }')"
+HERMES_PROFILE_PID=""
+if test -L "$LIVIS_HERMES_HOME/gateway.pid"; then
+  echo "Hermes PID 路径是 symlink，拒绝停止" >&2
+  exit 1
+elif test -f "$LIVIS_HERMES_HOME/gateway.pid"; then
+  test "$(stat -f '%l' "$LIVIS_HERMES_HOME/gateway.pid")" = 1 || {
+    echo "Hermes PID 记录必须是单链接文件，拒绝停止" >&2
+    exit 1
+  }
+  HERMES_PROFILE_PID="$(plutil -extract pid raw "$LIVIS_HERMES_HOME/gateway.pid")" || {
+    echo "Hermes PID 记录不可读，拒绝停止" >&2
+    exit 1
+  }
+elif test -e "$LIVIS_HERMES_HOME/gateway.pid"; then
+  echo "Hermes PID 路径不是普通文件，拒绝停止" >&2
+  exit 1
+fi
+case "$HERMES_PROFILE_PID" in
+  "") ;;
+  *[!0-9]*)
+    echo "Hermes profile PID 不是正整数，拒绝停止" >&2
+    exit 1
+    ;;
+esac
+if test -n "$HERMES_PROFILE_PID" && ! test "$HERMES_PROFILE_PID" -gt 0; then
+  echo "Hermes profile PID 必须大于 0，拒绝停止" >&2
+  exit 1
+fi
+if test -n "$HERMES_LAUNCHD_PID" && test -z "$HERMES_PROFILE_PID"; then
+  echo "Hermes LaunchAgent 已有运行 PID 但 profile PID 缺失，拒绝停止" >&2
+  exit 1
+fi
+if test -n "$HERMES_LAUNCHD_PID" && \
+    test "$HERMES_LAUNCHD_PID" != "$HERMES_PROFILE_PID"; then
+  echo "Hermes LaunchAgent PID 与 profile PID 不一致，拒绝执行任何停止副作用" >&2
+  exit 1
+fi
+if test -z "$HERMES_LAUNCHD_PID" && \
+    test -n "$HERMES_PROFILE_PID" && \
+    ps -p "$HERMES_PROFILE_PID" -o pid= >/dev/null 2>&1; then
+  echo "Hermes profile PID 仍存活但精确 LaunchAgent 无运行 PID，拒绝自动停止" >&2
+  exit 1
+fi
+if test -n "$HERMES_JOB"; then
+  launchctl bootout "$HERMES_TARGET"
+fi
+HERMES_STOPPED=false
+ATTEMPT=0
+while test "$ATTEMPT" -lt 60; do
+  ATTEMPT=$((ATTEMPT + 1))
+  HERMES_LABEL_LOADED=false
+  HERMES_LAUNCHD_ALIVE=false
+  HERMES_PROFILE_ALIVE=false
+  HERMES_POST_ALIVE=false
+  POST_PID=""
+  if launchctl print "$HERMES_TARGET" >/dev/null 2>&1; then
+    HERMES_LABEL_LOADED=true
+  fi
+  if test -n "$HERMES_LAUNCHD_PID" && ps -p "$HERMES_LAUNCHD_PID" -o pid= >/dev/null 2>&1; then
+    HERMES_LAUNCHD_ALIVE=true
+  fi
+  if test -n "$HERMES_PROFILE_PID" && ps -p "$HERMES_PROFILE_PID" -o pid= >/dev/null 2>&1; then
+    HERMES_PROFILE_ALIVE=true
+  fi
+  if test -L "$LIVIS_HERMES_HOME/gateway.pid"; then
+    echo "停止后的 Hermes PID 路径变成 symlink，拒绝停止 Relay" >&2
+    exit 1
+  elif test -f "$LIVIS_HERMES_HOME/gateway.pid"; then
+    test "$(stat -f '%l' "$LIVIS_HERMES_HOME/gateway.pid")" = 1 || {
+      echo "停止后的 Hermes PID 记录不是单链接文件，拒绝停止 Relay" >&2
+      exit 1
+    }
+    POST_PID="$(plutil -extract pid raw "$LIVIS_HERMES_HOME/gateway.pid")" || {
+      echo "停止后的 Hermes PID 记录不可读，拒绝停止 Relay" >&2
+      exit 1
+    }
+    case "$POST_PID" in
+      ""|*[!0-9]*)
+        echo "停止后的 Hermes PID 不是正整数，拒绝停止 Relay" >&2
+        exit 1
+        ;;
+    esac
+    if ! test "$POST_PID" -gt 0; then
+      echo "停止后的 Hermes PID 必须大于 0，拒绝停止 Relay" >&2
+      exit 1
+    fi
+    if test -n "$POST_PID" && ps -p "$POST_PID" -o pid= >/dev/null 2>&1; then
+      HERMES_POST_ALIVE=true
+    fi
+  elif test -e "$LIVIS_HERMES_HOME/gateway.pid"; then
+    echo "停止后的 Hermes PID 路径不是普通文件，拒绝停止 Relay" >&2
+    exit 1
+  fi
+  if test "$HERMES_LABEL_LOADED" = false && \
+      test "$HERMES_LAUNCHD_ALIVE" = false && \
+      test "$HERMES_PROFILE_ALIVE" = false && \
+      test "$HERMES_POST_ALIVE" = false; then
+    HERMES_STOPPED=true
+    break
+  fi
+  sleep 0.5
+done
+test "$HERMES_STOPPED" = true || {
+  echo "Hermes 未在 30 秒内同时释放 label 和所有已记录 PID，拒绝停止 Relay" >&2
+  exit 1
+}
+RELAY_JOB="$(launchctl print "$RELAY_TARGET" 2>/dev/null)" || RELAY_JOB=""
+RELAY_PID="$(printf '%s\n' "$RELAY_JOB" | awk '/^[[:space:]]*pid = [0-9]+$/ { print $3; exit }')"
+if test -n "$RELAY_JOB"; then
+  launchctl bootout "$RELAY_TARGET"
+fi
+RELAY_STOPPED=false
+ATTEMPT=0
+while test "$ATTEMPT" -lt 60; do
+  ATTEMPT=$((ATTEMPT + 1))
+  RELAY_LABEL_LOADED=false
+  RELAY_PID_ALIVE=false
+  if launchctl print "$RELAY_TARGET" >/dev/null 2>&1; then
+    RELAY_LABEL_LOADED=true
+  fi
+  if test -n "$RELAY_PID" && ps -p "$RELAY_PID" -o pid= >/dev/null 2>&1; then
+    RELAY_PID_ALIVE=true
+  fi
+  if test "$RELAY_LABEL_LOADED" = false && test "$RELAY_PID_ALIVE" = false; then
+    RELAY_STOPPED=true
+    break
+  fi
+  sleep 0.5
+done
+test "$RELAY_STOPPED" = true || {
+  echo "Relay 未在 30 秒内同时释放 label 和原 PID" >&2
+  exit 1
+}
+)
+```
+
+Hermes 0.15.1 的 `gateway stop` 不仅退出码不能证明进程已经退出，还会信任 `gateway.pid` 并在等待失败后对该 PID 发送强制终止。为避免陈旧或被改写的普通 PID 文件误伤默认 Gateway，上述关键停服路径不调用该命令：它会先比对已存在的 launchd/profile PID，任何存活且无对应精确 label 的 PID 都在副作用前失败关闭；然后只 `bootout` 精确 `ai.hermes.gateway-livis-test` 目标，并在 30 秒有界窗口内同时读回 label、所有原 PID 和停止后残留的 PID 记录。任一 Hermes 进程仍存活时都不会继续停止 Relay。Relay 的 `bootout` 也会先保留顶层 PID，只有 label 消失且原 PID 退出后才完成停服；此后才可进入 SQLite/WAL/SHM 备份。
+
+只有明确要卸载时，才在停止后删除 Relay plist，并通过对应隔离 profile 的 Hermes uninstall 命令移除 Hermes job；任何命令都必须保留正确的 `HERMES_HOME`。不要删除 state directory，卸载服务不等于删除消息、token 或迁移备份。
+
+#### 7.4 日志与故障定位
+
+Relay 模板把结构化日志分别写入：
+
+```text
+$HOME/.livis-relay/daemon.stdout.log
+$HOME/.livis-relay/daemon.stderr.log
+```
+
+读取而不是清空日志：
+
+```bash
+tail -n 200 "$HOME/.livis-relay/daemon.stdout.log"
+tail -n 200 "$HOME/.livis-relay/daemon.stderr.log"
+launchctl print "gui/$(id -u)/com.local.livis-relayd"
+launchctl print "gui/$(id -u)/ai.hermes.gateway-livis-test"
+```
+
+Hermes 的 stdout/stderr 路径以 runtime 生成的 plist 为准，先用 `plutil -p` 读回，再读取对应文件；不要假设它与 Relay 共用日志。`launchctl print` 中有 PID 或 `state=running` 只证明进程级状态，不能证明 Relay handshake、connector ready 或消息闭环。
+
+#### 7.5 升级与回滚
+
+升级必须在停服窗口完成：
+
+1. 按 Hermes → Relay 顺序停止两个 LaunchAgent，并确认 label 均不再运行。
+2. 完整备份 state directory；JobStore v3 场景必须包含 `relay.db`、WAL 和 SHM。备份前不要运行会打开数据库的新版 `serve`、`doctor` 或 `session release`。
+3. 在稳定 checkout 中获取并切换到精确已审阅提交，确认工作树干净，执行 `bun install --frozen-lockfile` 与 `bun run check`。
+4. 按第 6 节把当前提交中的 bridge 三个文件重新安装到隔离 Hermes profile；不要从 LiViS 通道执行 `/update`，也不要在其他 Gateway 运行期间执行未经评审的全局 Hermes 更新。
+5. 若 active protocol profile 仍为 schema v1，只能按升级 runbook 在停服状态执行 `profile migrate-v2` 并重新生成 proof；普通 `upstream activate` 不能替代 schema migration，也不得由 launchd 自动猜测或旁路迁移。
+6. 若 active profile 已是 schema v2，但新提交需要切换到另一份已人工审阅的兼容 v2 profile，保持双服务停止，按[普通 profile 激活事务](PROFILE-ACTIVATION.md)执行 `upstream activate`；记录 `backupConfigPath` 与 `receiptPath`，在线复核通过后才继续。
+7. 若 Relay plist 模板变化，重新生成本机副本、`plutil -lint`、读回占位符和路径，再覆盖 LaunchAgents 中的副本。
+8. 按 Relay → Hermes 顺序启动，并完成下一节的服务级和消息级验收。
+
+第 6 步只适用于 schema v2 内的普通兼容 profile 切换，固定命令如下：
+
+```bash
+(
+set -euo pipefail
+CONFIG="$HOME/.livis-relay/config.json"
+if test "${LIVIS_RELAY_STATE_DIR+x}" = x; then
+  echo "普通 profile 激活禁止设置 LIVIS_RELAY_STATE_DIR" >&2
+  exit 1
+fi
+bun run src/index.ts upstream activate \
+  --config "$CONFIG" \
+  --profile '/绝对路径/已审阅-profile.json' \
+  --acknowledge-reviewed-profile
+bun run src/index.ts upstream check --config "$CONFIG"
+bun run src/index.ts doctor --online --config "$CONFIG"
+)
+```
+
+必须保存激活输出中的 `backupConfigPath`、`receiptPath` 和精确 profile SHA；只有新的 current supported proof 与 online doctor 都通过，才进入启动步骤。普通 v2 激活失败或需要恢复旧 profile 时，继续保持双服务停止，使用对应 config 备份显式回滚：
+
+```bash
+(
+set -euo pipefail
+CONFIG="$HOME/.livis-relay/config.json"
+if test "${LIVIS_RELAY_STATE_DIR+x}" = x; then
+  echo "普通 profile 回滚禁止设置 LIVIS_RELAY_STATE_DIR" >&2
+  exit 1
+fi
+bun run src/index.ts upstream rollback \
+  --config "$CONFIG" \
+  --backup '/绝对路径/config-backups/<activation-id>.json' \
+  --acknowledge-rollback
+bun run src/index.ts upstream check --config "$CONFIG"
+bun run src/index.ts doctor --online --config "$CONFIG"
+)
+```
+
+普通回滚只恢复 `profile` 与 `profileSha256`，不会恢复 relay、security、Hermes、connector 或 stateDir 等其他字段；旧 profile 无法重新得到 current supported proof 时不得启动。schema v1→v2 migration 的回滚是另一套 `profile rollback-migration` 状态机，不能混用普通 activation 备份。
+
+回滚到不认识 JobStore v3 的旧 daemon 时，必须同时恢复升级前的完整数据库备份；只切回 checkout 或只回滚 protocol profile 都不安全。Hermes runtime 或 bridge 变更后仍须保持 `[0.15.1, 0.15.2)` 的 fail-closed 支持窗，除非独立升级评审已经修改代码、配置和 canary 证据。
+
+#### 7.6 分层验收
+
+验收必须分层记录，不能用前一层替代后一层：
+
+1. **静态部署**：两个 plist 均通过 `plutil -lint`，绝对路径存在，无占位符或秘密，稳定 checkout 精确命中已审阅提交。
+2. **服务与连接就绪**：两个独立 label 正常；`bun run src/index.ts doctor --online` 和 `status` 显示当前 protocol profile v2、wire revision/mode、未过期 proof、Relay handshake、connector ready、JobStore v3 integrity 及无意外 quarantine。
+3. **真实消息闭环**：从唯一获准设备发送带随机后缀的单条纯文本 canary，App 收到预期纯文本；同一 job 在 daemon 中为 `Succeeded`，outbox 为 `Delivered`，Hermes 日志存在对应 inbound/response，且没有第二 final、fallback send 或权限错误。
+
+“LaunchAgent 已加载”“服务在线”“Relay 已握手”或“connector ready”都不等于消息闭环。只有第 3 层在精确部署提交、profile、Hermes 0.15.1/bridge 版本和时间上留下脱敏记录后，才能写成 launchd canary 通过；未执行时必须明确写“未验证”。
 
 ## 8. 结果 ACK 退避与 JobStore v3 升级
 
