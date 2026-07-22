@@ -346,10 +346,23 @@ bun run src/index.ts status
 bun run src/index.ts doctor --online
 ```
 
-Codex 模式的 `status` 必须显示 `daemon.execution.kind=codex`、
-`daemon.execution.ready=true`、稳定 thread ID 和位于 state directory 内的 workspace；
-Hermes 模式则要求 connector ready。
+Codex 模式的稳定就绪状态必须显示 `daemon.execution.kind=codex`、
+`daemon.execution.state=running`、`daemon.execution.ready=true`、稳定 thread ID 和位于
+state directory 内的 workspace；同时读回账号/模型字段
+`accountType/accountIdentityStrength/requestedModel/effectiveModel/modelProvider`、
+`checkpoint.{turnId,turnStatus,turnCount,checkpointedAt}`，以及
+`recovery.{inProgress,attempts,maxAttempts,nextAttemptAt,lastError}`。其中 `attempts` 是本次
+daemon 生命周期累计已消费次数，`maxAttempts` 固定为 3。Hermes 模式则要求 connector
+ready。
 无论哪种模式，服务在线都不等于消息闭环。
+
+idle app-server 意外退出且内存/SQLite 都无 active、无 recovery/quarantine、Store anchor
+未漂移时，`state` 会暂时变为 `recovering`、`ready=false`，并按
+`250/1000/5000 ms` 的 daemon 生命周期累计预算恢复同一 thread。此时不要另起第二个
+app-server，也不要修改 config、SQLite、rollout 或 workspace；观察 `nextAttemptAt` 与
+`lastError`。成功后应回到 `state=running`、`ready=true`，thread ID、账号/模型与
+checkpoint 均保持不变。漂移会直接 quarantine 且不继续重试，预算耗尽则失败关闭。
+活动 turn 期间退出不会走这条自动恢复路径，必须按第 9 节保留证据并人工处置。
 
 生产运行可参考：
 
@@ -1247,10 +1260,14 @@ JobStore v6 与 protocol profile schema v1→v2 是两条独立迁移：profile 
 - 如果超过 `outboxNextAttemptAt` 且 Relay 已连接后仍长时间没有新投递，保留
   `status`、`doctor --online` 与 daemon 日志；不要直接编辑 SQLite。
 
-## 9. Session 隔离恢复
+## 9. Session 隔离与 active turn 人工恢复
 
 看到 `CancelUnknown`、`Interrupted` 对应的 session quarantine，或 Codex
 `backend_sessions.recovery_required` 后：
+
+本节也适用于 idle recovery 检测到 immutable metadata、Store anchor、rollout、checkpoint
+或 tail 漂移、候选进程组关闭无法确认以及三次预算耗尽后的失败关闭。它不适用于已经按
+第 7 节自动恢复成功、thread/checkpoint 均未变化的普通 idle 退出。
 
 1. 停止 daemon；Hermes 模式停止并重启专用 Gateway，Codex 模式确认旧 app-server
    与全部工具子进程已经退出。

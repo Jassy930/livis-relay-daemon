@@ -39,6 +39,7 @@ flowchart LR
 - Codex 由 daemon 通过 stdio app-server 直接管理；JobStore schema v6 在 v5 的 job 目标 backend 绑定之上，继续固定账号身份强度、请求/实际模型、安全配置、feature 快照和单调 thread-tail checkpoint，配置或 thread 尾部漂移均失败关闭。
 - Codex 只在完整 turn deadline 内的 terminal `turn/completed` 后返回一个 agent final；超时先请求 interrupt，再按固定 grace 失败关闭。工具网络关闭、workspace 是唯一可写根，审批请求默认拒绝。
 - Codex app-server 使用 workspace 外的宿主 HOME/TMPDIR，agent 使用 workspace 内独立 HOME/TMPDIR；关闭时按独立 POSIX 进程组执行 `SIGTERM → SIGKILL → 收口确认`。
+- Codex app-server 只在无内存/SQLite active attempt、无 recovery/quarantine 且持久 Store anchor 未漂移的 idle 状态自动恢复；daemon 生命周期累计最多按 `250/1000/5000 ms` 尝试三次，只恢复并回读同一 thread。活动 turn 期间退出仍失败关闭并要求人工处置，绝不自动重放。
 - LiViS profile 按 SHA-256 固定；未知 wire protocol、版本或 artifact 漂移默认拒绝。
 - `login/serve` 要求近期 supported proof；daemon 每 6 小时在线复核。
 - `wireContractRevision + credentialMode` 同时绑定 profile、runtime digest 与 supported proof；机器可读 registry、append-only 历史门禁和本地脱敏 probe artifact 防止 wire 代码静默漂移或覆写旧基线。

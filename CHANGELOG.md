@@ -7,6 +7,7 @@
 ### 修复
 
 - Codex app-server 现在以独立 POSIX 进程组运行；关闭按 `SIGTERM`、有界等待、`SIGKILL`、再次等待和进程组/stdio 收口回执执行，无法确认时向上抛错，不再把直接子进程退出等同于全部后代已结束。
+- Codex idle app-server 意外退出后新增 daemon 生命周期累计三次的有界自动恢复，固定退避为 `250/1000/5000 ms`。只有内存与 SQLite 都无 active attempt、无 recovery/quarantine 且 immutable metadata、Store anchor、rollout 与 thread-tail checkpoint 一致时，才会在确认旧进程组收口后对同一 thread 执行 `thread/resume + thread/read`；漂移立即 quarantine，候选进程组未确认关闭或预算耗尽均失败关闭，活动 turn 不进入自动恢复。`stop()` 会取消退避并等待 recovery、disconnect 与进程组关闭。
 - Codex turn 新增从 `turn/start` 前开始计算的绝对 deadline；超时后只允许一个 interrupt owner，并在固定 grace 后失败关闭。deadline 之后的 terminal、取消或迟到通知不会写入 result/outbox，`stop()` 会等待同一断连和进程组收口结果。
 - Codex `turn/interrupt` 的 RPC response 不再被误当成 terminal；取消与 `turn/start` 并发时先持久化 turn ID，等待权威 `turn/completed` 并 checkpoint 实际尾部后才进入 `CancelUnknown`。人工 `session release` 会退役不确定的 backend session/thread 绑定，下次创建新 thread，避免清除 active 后错误恢复已漂移尾部。
 - Codex app-server 的宿主 HOME/TMPDIR 已移到 workspace 外，agent shell 使用 workspace 内独立 HOME/TMPDIR；四类目录均固定为 `0700` 并校验 realpath、symlink 与 inode，避免 agent 持久修改宿主后续会读取的运行目录。

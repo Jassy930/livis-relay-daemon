@@ -145,15 +145,25 @@ tail；任一字段、未映射 turn 或固定配置漂移都失败关闭。
 
 JobStore 先原子 claim job 并保留 backend attempt，随后才允许发送 `turn/start`。
 只有 transport 明确证明请求未写入时才可撤销 attempt；请求可能已写入、响应无法绑定
-turn、app-server 断连或 daemon 重启时，均保留 attempt 并进入
+turn、活动 turn 期间 app-server 断连或 daemon 重启时，均保留 attempt 并进入
 `Interrupted`/`CancelUnknown`、recovery 和 quarantine，绝不自动重发或创建替代
-thread。
+thread。只有 `running` 状态下内存与 SQLite 都没有 active attempt、持久 session 未要求
+recovery 且没有 quarantine 时，app-server 意外退出才可进入 idle 自动恢复。
 
 完整 turn 的 deadline 在发送 `turn/start` 前安装。超时取得唯一 interruption owner 后，
 只发送一次 `turn/interrupt`，固定 grace 结束仍未安全收敛就断开 backend；deadline 后的
 任何 terminal 都不会进入 outbox。app-server 位于独立 POSIX 进程组，关闭按 TERM/KILL
 两阶段并等待直接 child、stdout/stderr 和进程组消失；逃逸到其他 session/进程组的后代
 仍需目标机 cgroup/systemd 等更强边界。
+
+idle 自动恢复在一次 daemon 生命周期内累计最多尝试三次，固定退避为
+`[250, 1000, 5000] ms`；成功不会重置已消耗预算。开始首个候选前必须确认退出的旧
+进程组已经关闭，候选失败后也必须先确认候选进程组关闭才可继续。恢复只允许对 SQLite
+已绑定的同一 thread 执行 `thread/resume` 和 `thread/read`，禁止 `thread/start`、
+`thread/memoryMode/set`、`turn/start` 或自动重放 job。CLI/runtime、账号、模型、配置与
+feature 等 immutable metadata、Store anchor、rollout、checkpoint 或 tail 任一漂移都会
+立即 quarantine 且不再重试；普通瞬时失败在剩余预算内重试，预算耗尽后失败关闭。
+daemon `stop()` 会取消未到期退避，并等待 recovery、disconnect、候选关闭与事件链收口。
 
 Codex 0.145.0 的新 thread 在首个 turn 前不会自动落盘。daemon 只在有界物化回读确认
 rollout 位于专用 `CODEX_HOME/sessions`、首条 `session_meta.id` 匹配后写入 SQLite；

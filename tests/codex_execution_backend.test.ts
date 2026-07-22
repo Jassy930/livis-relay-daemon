@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { chmod, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  CODEX_IDLE_RECOVERY_DELAYS_MS,
   CodexExecutionBackend,
   type CodexCommandRunner,
+  type CodexExecutionBackendDependencies,
   validateDisabledCodexFeatures,
 } from "../src/backends/codex/codex-execution-backend.ts";
 import type {
@@ -13,6 +15,7 @@ import type {
 import {
   CODEX_0145_ALLOWED_ENABLED_FEATURES,
   CODEX_DISABLED_FEATURES,
+  CodexAppServerProcessOwnershipUnconfirmedError,
   type CodexAppServerProcess,
   type CodexAppServerSpawn,
   type CodexAppServerSpawnOptions,
@@ -109,9 +112,12 @@ class FakeCodexAppServer {
   holdTurnStart = false;
   holdTurnInterrupt = false;
   autoInterruptTerminal = true;
+  holdMethod: string | null = null;
+  ignoreKill = false;
   readonly heldTurnStart = deferred<Record<string, unknown>>();
   readonly heldTurnInterrupt = deferred<Record<string, unknown>>();
   readonly heldWrite = deferred<void>();
+  readonly heldMethod = deferred<Record<string, unknown>>();
 
   private readonly stdout = new TransformStream<Uint8Array, Uint8Array>();
   private readonly stderr = new TransformStream<Uint8Array, Uint8Array>();
@@ -154,7 +160,7 @@ class FakeCodexAppServer {
       stderr: this.stderr.readable,
       exited: this.exit.promise,
       kill: () => {
-        void this.stop(0);
+        if (!this.ignoreKill) void this.stop(0);
       },
     };
     this.spawn = (command, options) => {
@@ -167,6 +173,12 @@ class FakeCodexAppServer {
 
   async onMessage(message: Record<string, unknown>): Promise<void> {
     if (typeof message.id !== "number" || typeof message.method !== "string") return;
+    if (message.method === this.holdMethod) {
+      void this.heldMethod.promise
+        .then((response) => this.respond(message.id as number, response))
+        .catch(() => undefined);
+      return;
+    }
     if (message.method === "initialize") {
       await this.respond(message.id, {
         userAgent: "livis-relay-daemon/0.145.0 (test; test) unknown (livis-relay-daemon; 0.1.0)",
@@ -395,6 +407,50 @@ class FakeCodexAppServer {
     await Promise.allSettled([this.stdoutWriter.close(), this.stderrWriter.close()]);
     this.exit.resolve(exitCode);
   }
+
+  exitWithoutClosingStreams(exitCode: number): void {
+    this.exit.resolve(exitCode);
+  }
+
+  get isStopped(): boolean {
+    return this.stopped;
+  }
+}
+
+class FakeCodexAppServerSequence {
+  readonly spawnTimes: number[] = [];
+  private nextIndex = 0;
+
+  constructor(
+    readonly steps: ReadonlyArray<FakeCodexAppServer | Error>,
+    private readonly beforeSpawn?: (index: number) => void,
+  ) {
+    if (!(steps[0] instanceof FakeCodexAppServer)) {
+      throw new Error("fake app-server 序列首项必须可启动");
+    }
+  }
+
+  get spawnCount(): number {
+    return this.nextIndex;
+  }
+
+  readonly spawn: CodexAppServerSpawn = (command, options) => {
+    const index = this.nextIndex++;
+    this.spawnTimes.push(Date.now());
+    this.beforeSpawn?.(index);
+    const step = this.steps[index];
+    if (!step) throw new Error(`fake app-server 序列已耗尽：${index}`);
+    if (step instanceof Error) throw step;
+    if (index > 0) {
+      const initial = this.steps[0];
+      if (!(initial instanceof FakeCodexAppServer)) {
+        throw new Error("fake app-server 序列首项非法");
+      }
+      step.threadId = initial.threadId;
+      step.rolloutPath = initial.rolloutPath;
+    }
+    return step.spawn(command, options);
+  };
 }
 
 interface Harness {
@@ -435,13 +491,19 @@ async function createHarness(options: {
   existingRollout?: "valid" | "missing";
   maxOutputChars?: number;
   acceptedGate?: Promise<void>;
+  readyGate?: Promise<void>;
+  readyFailureAt?: number;
+  fake?: FakeCodexAppServer;
+  appServerSpawn?: CodexAppServerSpawn;
+  recoveryDelaysMs?: readonly number[];
+  shutdownTimeoutMs?: number;
 } = {}): Promise<Harness> {
   const directory = await temporaryDirectory("livis-codex-backend-");
   await chmod(directory.path, 0o700);
   const scopeKey = "scope-test";
   const sessionKey = "livis:agent-test";
   const store = new JobStore(`${directory.path}/relay.db`, scopeKey);
-  const fake = new FakeCodexAppServer();
+  const fake = options.fake ?? new FakeCodexAppServer();
   options.configureFake?.(fake);
   if (options.existingThreadId) {
     const layout = await ensureCodexRuntimeLayout({
@@ -488,6 +550,11 @@ async function createHarness(options: {
   const handlers: ExecutionBackendHandlers = {
     onReady: async () => {
       events.push("ready");
+      await options.readyGate;
+      const readyCount = events.filter((event) => event === "ready").length;
+      if (options.readyFailureAt === readyCount) {
+        throw new Error(`synthetic ready failure ${readyCount}`);
+      }
     },
     onAccepted: async (event) => {
       events.push(`accepted:${event.jobId}`);
@@ -576,13 +643,16 @@ async function createHarness(options: {
     requestTimeoutMs: options.requestTimeoutMs ?? 100,
     turnTimeoutMs: options.turnTimeoutMs ?? 5_000,
     interruptGraceMs: options.interruptGraceMs ?? 25,
-    shutdownTimeoutMs: 100,
+    shutdownTimeoutMs: options.shutdownTimeoutMs ?? 100,
   }, {
     store,
     handlers,
-    appServerSpawn: fake.spawn,
+    appServerSpawn: options.appServerSpawn ?? fake.spawn,
     commandRunner: options.commandRunner ?? successfulVersion,
-  });
+    ...(options.recoveryDelaysMs === undefined
+      ? {}
+      : { recoveryDelaysMs: options.recoveryDelaysMs }),
+  } satisfies CodexExecutionBackendDependencies);
 
   if (options.start !== false) {
     await backend.start();
@@ -746,6 +816,107 @@ describe("CodexExecutionBackend", () => {
         .toEqual({ threadId: harness.fake.threadId, includeTurns: true });
       expect(harness.fake.rolloutPath).not.toBeNull();
     } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("初次 start 的 ready 交接尚未完成时退出，不得并发启动 idle recovery", async () => {
+    const readyGate = deferred<void>();
+    const initial = new FakeCodexAppServer();
+    const sequence = new FakeCodexAppServerSequence([
+      initial,
+      new FakeCodexAppServer(),
+    ]);
+    const harness = await createHarness({
+      start: false,
+      fake: initial,
+      appServerSpawn: sequence.spawn,
+      readyGate: readyGate.promise,
+      recoveryDelaysMs: [0, 0, 0],
+    });
+    try {
+      const startPromise = harness.backend.start();
+      await waitFor(() => harness.events.includes("ready"), "initial ready handler");
+      await initial.stop(38);
+      readyGate.resolve();
+
+      await expect(startPromise).rejects.toThrow(/ready handler 期间失效/);
+      await Bun.sleep(10);
+      expect(sequence.spawnCount).toBe(1);
+      expect(harness.backend.status()).toMatchObject({ state: "failed", ready: false });
+      expect(harness.disconnects).toEqual([]);
+    } finally {
+      readyGate.resolve();
+      await harness.cleanup();
+    }
+  });
+
+  test("初次 initialize 失败且进程组收口未确认时持久 quarantine", async () => {
+    const initial = new FakeCodexAppServer();
+    initial.holdMethod = "initialize";
+    initial.ignoreKill = true;
+    const harness = await createHarness({
+      start: false,
+      fake: initial,
+      requestTimeoutMs: 20,
+      shutdownTimeoutMs: 20,
+    });
+    try {
+      const startPromise = harness.backend.start();
+      await waitFor(
+        () => initial.messages.some((message) => message.method === "initialize"),
+        "initial initialize",
+      );
+      await expect(startPromise).rejects.toThrow(/初始化失败且进程组收口未确认/);
+      expect(harness.store.getSessionQuarantine("livis:agent-test")).not.toBeNull();
+      await expect(harness.backend.stop()).rejects.toThrow(/进程组收口|初始化/);
+    } finally {
+      initial.ignoreKill = false;
+      initial.heldMethod.resolve({});
+      await initial.stop(0);
+      await harness.cleanup();
+    }
+  });
+
+  test("初次 spawn 后无法取得进程组所有权时持久 quarantine", async () => {
+    const harness = await createHarness({
+      start: false,
+      appServerSpawn: () => {
+        throw new CodexAppServerProcessOwnershipUnconfirmedError();
+      },
+    });
+    try {
+      await expect(harness.backend.start()).rejects.toThrow(/进程组所有权/);
+      expect(harness.store.getSessionQuarantine("livis:agent-test")).not.toBeNull();
+      await expect(harness.backend.stop()).rejects.toThrow(/进程组收口|所有权/);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("初次 ready 交接中 child 退出且进程组不收口时持久 quarantine", async () => {
+    const readyGate = deferred<void>();
+    const initial = new FakeCodexAppServer();
+    initial.ignoreKill = true;
+    const harness = await createHarness({
+      start: false,
+      fake: initial,
+      readyGate: readyGate.promise,
+      shutdownTimeoutMs: 20,
+    });
+    try {
+      const startPromise = harness.backend.start();
+      await waitFor(() => harness.events.includes("ready"), "initial ready close fence");
+      initial.exitWithoutClosingStreams(41);
+      readyGate.resolve();
+
+      await expect(startPromise).rejects.toThrow(/进程组收口未确认/);
+      expect(harness.store.getSessionQuarantine("livis:agent-test")).not.toBeNull();
+      await expect(harness.backend.stop()).rejects.toThrow(/进程组收口/);
+    } finally {
+      readyGate.resolve();
+      initial.ignoreKill = false;
+      await initial.stop(0);
       await harness.cleanup();
     }
   });
@@ -1572,17 +1743,28 @@ describe("CodexExecutionBackend", () => {
     }
   });
 
-  test("活动 turn 中 app-server 退出会断连、Interrupted 并保留 recovery evidence", async () => {
-    const harness = await createHarness();
+  test("活动 turn 中 app-server 退出不会自动恢复，并保留 Interrupted recovery evidence", async () => {
+    const initial = new FakeCodexAppServer();
+    const sequence = new FakeCodexAppServerSequence([
+      initial,
+      new FakeCodexAppServer(),
+    ]);
+    const harness = await createHarness({
+      fake: initial,
+      appServerSpawn: sequence.spawn,
+      recoveryDelaysMs: [0, 0, 0],
+    });
     try {
       const job = claimJob(harness, "job-exit");
       await harness.backend.dispatch(job);
-      await harness.fake.stop(23);
+      await initial.stop(23);
       await waitFor(() => harness.disconnects.length === 1, "process exit disconnect");
       expect(harness.store.require(job.jobId).status).toBe("Interrupted");
       const session = harness.store.getBackendSession("codex", "livis:agent-test");
       expect(session?.activeTurnId).toBe("019f-turn-1");
       expect(session?.recoveryRequired).toBeTrue();
+      await Bun.sleep(10);
+      expect(sequence.spawnCount).toBe(1);
     } finally {
       await harness.cleanup();
     }
@@ -1768,14 +1950,516 @@ describe("CodexExecutionBackend", () => {
     }
   });
 
-  test("idle app-server 退出会撤销 ready，但不会凭空 quarantine session", async () => {
-    const harness = await createHarness();
+  test("idle 自动恢复默认固定三档退避，并暴露运行与 checkpoint 状态", async () => {
+    expect(CODEX_IDLE_RECOVERY_DELAYS_MS).toEqual([250, 1_000, 5_000]);
+
+    const initial = new FakeCodexAppServer();
+    const recovered = new FakeCodexAppServer();
+    const sequence = new FakeCodexAppServerSequence([initial, recovered], (index) => {
+      if (index > 0 && !initial.isStopped) {
+        throw new Error("旧 app-server stdio 尚未收口就启动了新 client");
+      }
+    });
+    const harness = await createHarness({
+      fake: initial,
+      appServerSpawn: sequence.spawn,
+      recoveryDelaysMs: [50, 0, 0],
+    });
     try {
-      await harness.fake.stop(17);
-      await waitFor(() => harness.disconnects.length === 1, "idle process exit");
+      const executionId = harness.backend.executionId;
+      const threadId = initial.threadId;
+      const initialStatus = harness.backend.status();
+      expect(initialStatus).toMatchObject({
+        state: "running",
+        ready: true,
+        executionId,
+        threadId,
+        accountType: "chatgpt",
+        accountIdentityStrength: "type-only",
+        requestedModel: null,
+        effectiveModel: "gpt-5.6-sol",
+        modelProvider: "openai",
+        recovery: {
+          inProgress: false,
+          attempts: 0,
+          maxAttempts: 3,
+          nextAttemptAt: null,
+          lastError: null,
+        },
+        checkpoint: {
+          turnId: null,
+          turnStatus: null,
+          turnCount: 0,
+        },
+      });
+      const checkpoint = initialStatus.checkpoint;
+      if (!isRecord(checkpoint)) throw new Error("status 缺 checkpoint");
+      expect(checkpoint.checkpointedAt).toBeNumber();
+
+      initial.exitWithoutClosingStreams(17);
+      await waitFor(
+        () => harness.backend.status().state === "recovering",
+        "idle recovery state",
+      );
       expect(harness.backend.ready).toBeFalse();
+      expect(harness.backend.status()).toMatchObject({
+        state: "recovering",
+        recovery: { inProgress: true, attempts: 0, maxAttempts: 3 },
+      });
+      const recoveryStatus = harness.backend.status().recovery;
+      if (!isRecord(recoveryStatus)) throw new Error("status 缺 recovery");
+      expect(recoveryStatus.nextAttemptAt).toBeNumber();
+      expect(harness.disconnects).toEqual([]);
+
+      await waitFor(
+        () => sequence.spawnCount === 2 && harness.backend.ready,
+        "idle recovery success",
+      );
+      expect(harness.backend.executionId).toBe(executionId);
+      expect(harness.backend.status()).toMatchObject({
+        state: "running",
+        ready: true,
+        executionId,
+        threadId,
+        recovery: {
+          inProgress: false,
+          attempts: 1,
+          maxAttempts: 3,
+          nextAttemptAt: null,
+          lastError: null,
+        },
+      });
+      expect(harness.disconnects).toEqual([]);
+      expect(harness.store.getSessionQuarantine("livis:agent-test")).toBeNull();
+      expect(recovered.messages.filter((message) => message.method === "thread/resume"))
+        .toHaveLength(1);
+      expect(recovered.messages.filter((message) => message.method === "thread/read"))
+        .toHaveLength(1);
+      expect(recovered.messages.some((message) => message.method === "thread/start")).toBeFalse();
+      expect(recovered.messages.some((message) => message.method === "thread/memoryMode/set"))
+        .toBeFalse();
+      expect(recovered.messages.some((message) => message.method === "turn/start")).toBeFalse();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("idle 多次崩溃按 client epoch 恢复，旧 client 退出不会误伤新 client", async () => {
+    const initial = new FakeCodexAppServer();
+    const recoveredOnce = new FakeCodexAppServer();
+    const recoveredTwice = new FakeCodexAppServer();
+    const recoveredThrice = new FakeCodexAppServer();
+    const sequence = new FakeCodexAppServerSequence([
+      initial,
+      recoveredOnce,
+      recoveredTwice,
+      recoveredThrice,
+      new FakeCodexAppServer(),
+    ]);
+    const harness = await createHarness({
+      fake: initial,
+      appServerSpawn: sequence.spawn,
+      recoveryDelaysMs: [0, 0, 0],
+    });
+    try {
+      const executionId = harness.backend.executionId;
+      await initial.stop(21);
+      await waitFor(
+        () => sequence.spawnCount === 2 && harness.backend.ready,
+        "first epoch recovery",
+      );
+      await recoveredOnce.stop(22);
+      await waitFor(
+        () => sequence.spawnCount === 3 && harness.backend.ready,
+        "second epoch recovery",
+      );
+
+      expect(harness.backend.executionId).toBe(executionId);
+      expect(harness.backend.status()).toMatchObject({
+        state: "running",
+        recovery: { inProgress: false, attempts: 2, maxAttempts: 3 },
+      });
+      expect(harness.disconnects).toEqual([]);
+      for (const fake of [recoveredOnce, recoveredTwice]) {
+        expect(fake.messages.some((message) => message.method === "thread/start")).toBeFalse();
+        expect(fake.messages.some((message) => message.method === "turn/start")).toBeFalse();
+        expect(fake.messages.filter((message) => message.method === "thread/resume"))
+          .toHaveLength(1);
+      }
+
+      // Promise exit callback 对同一旧进程至多结算一次；重复 stop 不得再消费恢复预算。
+      await initial.stop(99);
+      await Bun.sleep(10);
+      expect(sequence.spawnCount).toBe(3);
+      expect(harness.backend.ready).toBeTrue();
+
+      await recoveredTwice.stop(23);
+      await waitFor(
+        () => sequence.spawnCount === 4 && harness.backend.ready,
+        "third epoch recovery",
+      );
+      expect(harness.backend.status()).toMatchObject({
+        state: "running",
+        recovery: { inProgress: false, attempts: 3, maxAttempts: 3 },
+      });
+      expect(recoveredThrice.messages.some((message) => message.method === "thread/start"))
+        .toBeFalse();
+      expect(recoveredThrice.messages.some((message) => message.method === "turn/start"))
+        .toBeFalse();
+
+      await recoveredThrice.stop(24);
+      await waitFor(() => harness.disconnects.length === 1, "recovery budget exhausted");
+      expect(sequence.spawnCount).toBe(4);
+      expect(harness.backend.status()).toMatchObject({
+        state: "failed",
+        ready: false,
+        recovery: { inProgress: false, attempts: 3, maxAttempts: 3 },
+      });
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("Store 已 claim 但 dispatch 尚未入场时退出，必须 fail-closed 而非误判 idle", async () => {
+    const initial = new FakeCodexAppServer();
+    const sequence = new FakeCodexAppServerSequence([
+      initial,
+      new FakeCodexAppServer(),
+    ]);
+    const harness = await createHarness({
+      fake: initial,
+      appServerSpawn: sequence.spawn,
+      recoveryDelaysMs: [0, 0, 0],
+    });
+    try {
+      const job = claimJob(harness, "job-claimed-before-dispatch");
+      expect(harness.backend.status().active).toBeNull();
+      expect(harness.store.require(job.jobId).status).toBe("Dispatching");
+
+      await initial.stop(31);
+      await waitFor(() => harness.disconnects.length === 1, "claimed job disconnect");
+
+      expect(sequence.spawnCount).toBe(1);
+      expect(harness.store.require(job.jobId).status).toBe("Interrupted");
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")?.recoveryRequired)
+        .toBeTrue();
+      expect(harness.backend.status()).toMatchObject({ state: "failed", ready: false });
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("quarantine 中的 idle session 不自动恢复", async () => {
+    const initial = new FakeCodexAppServer();
+    const sequence = new FakeCodexAppServerSequence([
+      initial,
+      new FakeCodexAppServer(),
+    ]);
+    const harness = await createHarness({
+      fake: initial,
+      appServerSpawn: sequence.spawn,
+      recoveryDelaysMs: [0, 0, 0],
+    });
+    try {
+      expect(harness.store.quarantineSession("livis:agent-test", "synthetic quarantine"))
+        .toBeTrue();
+      await initial.stop(32);
+      await waitFor(() => harness.disconnects.length === 1, "quarantined idle disconnect");
+
+      expect(sequence.spawnCount).toBe(1);
+      expect(harness.backend.status()).toMatchObject({ state: "failed", ready: false });
+      expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
+        .toBe("synthetic quarantine");
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("idle recovery 严格按三档退避尝试，第三次失败后才断连", async () => {
+    const initial = new FakeCodexAppServer();
+    const sequence = new FakeCodexAppServerSequence([
+      initial,
+      new Error("synthetic recovery failure 1"),
+      new Error("synthetic recovery failure 2"),
+      new Error("synthetic recovery failure 3"),
+    ]);
+    const delays = [20, 30, 40] as const;
+    const harness = await createHarness({
+      fake: initial,
+      appServerSpawn: sequence.spawn,
+      recoveryDelaysMs: delays,
+    });
+    try {
+      const crashedAt = Date.now();
+      await initial.stop(33);
+      await waitFor(() => harness.disconnects.length === 1, "recovery attempts exhausted");
+
+      expect(sequence.spawnCount).toBe(4);
+      expect(sequence.spawnTimes[1]! - crashedAt).toBeGreaterThanOrEqual(delays[0] - 2);
+      expect(sequence.spawnTimes[2]! - sequence.spawnTimes[1]!)
+        .toBeGreaterThanOrEqual(delays[1] - 2);
+      expect(sequence.spawnTimes[3]! - sequence.spawnTimes[2]!)
+        .toBeGreaterThanOrEqual(delays[2] - 2);
+      expect(harness.disconnects).toHaveLength(1);
+      expect(harness.backend.status()).toMatchObject({
+        state: "failed",
+        ready: false,
+        recovery: {
+          inProgress: false,
+          attempts: 3,
+          maxAttempts: 3,
+          nextAttemptAt: null,
+          lastError: expect.stringContaining("synthetic recovery failure 3"),
+        },
+      });
       expect(harness.store.getSessionQuarantine("livis:agent-test")).toBeNull();
     } finally {
+      await harness.cleanup();
+    }
+  });
+
+  for (const variant of ["metadata", "checkpoint", "tail"] as const) {
+    test(`idle recovery 发现 ${variant} 漂移会立即 quarantine 且停止重试`, async () => {
+      const initial = new FakeCodexAppServer();
+      const drifted = new FakeCodexAppServer();
+      const sequence = new FakeCodexAppServerSequence([
+        initial,
+        drifted,
+        new FakeCodexAppServer(),
+      ]);
+      const harness = await createHarness({
+        fake: initial,
+        appServerSpawn: sequence.spawn,
+        recoveryDelaysMs: [0, 0, 0],
+      });
+      try {
+        if (variant === "metadata") {
+          drifted.account = {
+            type: "chatgpt",
+            email: "other-account@example.com",
+            planType: "plus",
+          };
+        } else if (variant === "checkpoint") {
+          harness.store.checkpointBackendThreadTail({
+            backend: "codex",
+            sessionKey: "livis:agent-test",
+            threadId: initial.threadId,
+            checkpointTurnId: "019f-checkpoint-drift",
+            checkpointTurnStatus: "completed",
+            checkpointTurnCount: 1,
+            checkpointTurnsSha256: sha256("synthetic checkpoint drift"),
+            checkpointedAt: Date.now(),
+            fence: { kind: "idle" },
+          });
+        } else {
+          drifted.turns = [{ id: "019f-external-tail", status: "completed" }];
+        }
+
+        await initial.stop(34);
+        await waitFor(() => harness.disconnects.length === 1, `${variant} drift disconnect`);
+        await Bun.sleep(10);
+
+        const driftDetectedBeforeSpawn = variant === "checkpoint";
+        expect(sequence.spawnCount).toBe(driftDetectedBeforeSpawn ? 1 : 2);
+        expect(harness.backend.status()).toMatchObject({
+          state: "failed",
+          ready: false,
+          recovery: {
+            inProgress: false,
+            attempts: driftDetectedBeforeSpawn ? 0 : 1,
+            maxAttempts: 3,
+          },
+        });
+        expect(harness.store.getSessionQuarantine("livis:agent-test")).not.toBeNull();
+        expect(drifted.messages.some((message) => message.method === "turn/start")).toBeFalse();
+      } finally {
+        await harness.cleanup();
+      }
+    });
+  }
+
+  test("stop 会取消尚在退避的 idle recovery 并等待其收口", async () => {
+    const initial = new FakeCodexAppServer();
+    const sequence = new FakeCodexAppServerSequence([
+      initial,
+      new FakeCodexAppServer(),
+    ]);
+    const harness = await createHarness({
+      fake: initial,
+      appServerSpawn: sequence.spawn,
+      recoveryDelaysMs: [100, 0, 0],
+    });
+    try {
+      await initial.stop(35);
+      await waitFor(
+        () => harness.backend.status().state === "recovering",
+        "recovery backoff before stop",
+      );
+      await Promise.race([
+        harness.backend.stop(),
+        Bun.sleep(300).then(() => {
+          throw new Error("stop 未取消 recovery backoff");
+        }),
+      ]);
+
+      expect(sequence.spawnCount).toBe(1);
+      expect(harness.backend.status()).toMatchObject({
+        state: "stopped",
+        ready: false,
+        recovery: { inProgress: false },
+      });
+      expect(harness.disconnects).toEqual([]);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("stop 与 recovery client 初始化并发时 join，且传播进程组关闭失败", async () => {
+    const initial = new FakeCodexAppServer();
+    const recovering = new FakeCodexAppServer();
+    recovering.holdMethod = "account/read";
+    recovering.ignoreKill = true;
+    const sequence = new FakeCodexAppServerSequence([
+      initial,
+      recovering,
+      new FakeCodexAppServer(),
+    ]);
+    const harness = await createHarness({
+      fake: initial,
+      appServerSpawn: sequence.spawn,
+      recoveryDelaysMs: [0, 0, 0],
+      shutdownTimeoutMs: 20,
+    });
+    try {
+      await initial.stop(36);
+      await waitFor(
+        () => recovering.messages.some((message) => message.method === "account/read"),
+        "recovery account/read",
+      );
+
+      await expect(harness.backend.stop()).rejects.toThrow(/收口|关闭|SIGKILL/);
+      expect(sequence.spawnCount).toBe(2);
+      expect(harness.backend.ready).toBeFalse();
+      expect(harness.store.getSessionQuarantine("livis:agent-test")).not.toBeNull();
+    } finally {
+      recovering.ignoreKill = false;
+      recovering.heldMethod.resolve({});
+      await recovering.stop(0);
+      await harness.cleanup();
+    }
+  });
+
+  test("recovery candidate 在 initialize 阶段收口未确认时立即隔离且不得启动下一候选", async () => {
+    const initial = new FakeCodexAppServer();
+    const recovering = new FakeCodexAppServer();
+    recovering.holdMethod = "initialize";
+    recovering.ignoreKill = true;
+    const sequence = new FakeCodexAppServerSequence([
+      initial,
+      recovering,
+      new FakeCodexAppServer(),
+    ]);
+    const harness = await createHarness({
+      fake: initial,
+      appServerSpawn: sequence.spawn,
+      recoveryDelaysMs: [0, 0, 0],
+      requestTimeoutMs: 20,
+      shutdownTimeoutMs: 20,
+    });
+    try {
+      await initial.stop(37);
+      await waitFor(
+        () => recovering.messages.some((message) => message.method === "initialize"),
+        "recovery initialize",
+      );
+      await waitFor(
+        () => harness.disconnects.length === 1,
+        "initialize close-unconfirmed disconnect",
+      );
+
+      expect(sequence.spawnCount).toBe(2);
+      expect(harness.backend.status()).toMatchObject({
+        state: "failed",
+        ready: false,
+        recovery: { attempts: 1, maxAttempts: 3 },
+      });
+      expect(harness.store.getSessionQuarantine("livis:agent-test")).not.toBeNull();
+      await expect(harness.backend.stop()).rejects.toThrow(/进程组收口|initialize/);
+    } finally {
+      recovering.ignoreKill = false;
+      recovering.heldMethod.resolve({});
+      await recovering.stop(0);
+      await harness.cleanup();
+    }
+  });
+
+  test("recovery candidate spawn 后无进程组所有权时立即隔离且不得重试", async () => {
+    const initial = new FakeCodexAppServer();
+    const sequence = new FakeCodexAppServerSequence([
+      initial,
+      new CodexAppServerProcessOwnershipUnconfirmedError(),
+      new FakeCodexAppServer(),
+    ]);
+    const harness = await createHarness({
+      fake: initial,
+      appServerSpawn: sequence.spawn,
+      recoveryDelaysMs: [0, 0, 0],
+    });
+    try {
+      await initial.stop(39);
+      await waitFor(
+        () => harness.disconnects.length === 1,
+        "process ownership unconfirmed disconnect",
+      );
+
+      expect(sequence.spawnCount).toBe(2);
+      expect(harness.backend.status()).toMatchObject({
+        state: "failed",
+        ready: false,
+        recovery: { attempts: 1, maxAttempts: 3 },
+      });
+      expect(harness.store.getSessionQuarantine("livis:agent-test")).not.toBeNull();
+      await expect(harness.backend.stop()).rejects.toThrow(/进程组收口|所有权/);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("recovery ready 失败且进程组收口未确认时必须持久 quarantine", async () => {
+    const initial = new FakeCodexAppServer();
+    const recovering = new FakeCodexAppServer();
+    recovering.ignoreKill = true;
+    const sequence = new FakeCodexAppServerSequence([
+      initial,
+      recovering,
+      new FakeCodexAppServer(),
+    ]);
+    const harness = await createHarness({
+      fake: initial,
+      appServerSpawn: sequence.spawn,
+      recoveryDelaysMs: [0, 0, 0],
+      shutdownTimeoutMs: 20,
+      readyFailureAt: 2,
+    });
+    try {
+      await initial.stop(40);
+      await waitFor(
+        () => harness.store.getSessionQuarantine("livis:agent-test") !== null,
+        "recovery ready close-unconfirmed quarantine",
+      );
+      await waitFor(
+        () => harness.backend.status().recovery !== null &&
+          (harness.backend.status().recovery as Record<string, unknown>).inProgress === false,
+        "recovery ready close-unconfirmed settle",
+      );
+
+      expect(sequence.spawnCount).toBe(2);
+      expect(harness.disconnects).toHaveLength(1);
+      expect(harness.backend.status()).toMatchObject({ state: "failed", ready: false });
+      await expect(harness.backend.stop()).rejects.toThrow(/进程组收口|ready/);
+    } finally {
+      recovering.ignoreKill = false;
+      await recovering.stop(0);
       await harness.cleanup();
     }
   });

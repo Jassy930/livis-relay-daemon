@@ -3,6 +3,7 @@ import {
   CODEX_APP_SERVER_COMMAND,
   CodexAppServerClient,
   CodexAppServerCloseUnconfirmedError,
+  CodexAppServerProcessOwnershipUnconfirmedError,
   CodexAppServerRequestTransportError,
   CodexAppServerRpcError,
   CodexAppServerTimeoutError,
@@ -500,6 +501,36 @@ describe("Codex app-server stdio client", () => {
       await expect(client.close()).rejects.toBeInstanceOf(CodexAppServerCloseUnconfirmedError);
       expect(fake.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
     } finally {
+      await fake.stop(137);
+    }
+  });
+
+  test("spawn 后缺少有效 PID 时把进程组所有权视为未确认且绝不继续初始化", async () => {
+    const fake = new FakeAppServer();
+    fake.ignoreAllSignals = true;
+    const processWithoutPid: CodexAppServerProcess = {
+      ...fake.process,
+      pid: undefined,
+    };
+    const spawn: CodexAppServerSpawn = () => processWithoutPid;
+    const controller: CodexProcessGroupController = {
+      signal() {
+        throw new Error("没有 PGID 时不应发送进程组信号");
+      },
+      exists() {
+        return true;
+      },
+    };
+
+    try {
+      await expect(CodexAppServerClient.start({
+        spawn,
+        processGroupController: controller,
+      })).rejects.toBeInstanceOf(CodexAppServerProcessOwnershipUnconfirmedError);
+      expect(fake.killSignals).toEqual(["SIGKILL"]);
+      expect(fake.messages).toEqual([]);
+    } finally {
+      fake.ignoreAllSignals = false;
       await fake.stop(137);
     }
   });

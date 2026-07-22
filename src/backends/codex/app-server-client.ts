@@ -248,6 +248,26 @@ export class CodexAppServerRpcError extends Error {
   }
 }
 
+export class CodexAppServerStartCloseUnconfirmedError extends AggregateError {
+  constructor(startError: unknown, closeError: unknown) {
+    super(
+      [startError, closeError],
+      "Codex app-server 初始化失败且进程组收口未确认",
+    );
+    this.name = "CodexAppServerStartCloseUnconfirmedError";
+  }
+}
+
+export class CodexAppServerProcessOwnershipUnconfirmedError extends Error {
+  constructor(killError?: unknown) {
+    super(
+      "Codex app-server 已 spawn，但无法取得有效 PID/进程组所有权，关闭未确认",
+      killError === undefined ? undefined : { cause: killError },
+    );
+    this.name = "CodexAppServerProcessOwnershipUnconfirmedError";
+  }
+}
+
 export class CodexAppServerTimeoutError extends Error {
   constructor(
     readonly method: string,
@@ -426,12 +446,14 @@ export class CodexAppServerClient {
       ? this.child.pid!
       : null;
     if (this.processGroupController !== null && this.processGroupId === null) {
+      let killError: unknown;
       try {
         this.child.kill("SIGKILL");
-      } catch {
+      } catch (error) {
+        killError = error;
         // 构造失败时只能尽力终止直接 child；没有 PID 时不能声明进程组收口。
       }
-      throw new Error("Codex app-server 进程组控制要求有效 child pid");
+      throw new CodexAppServerProcessOwnershipUnconfirmedError(killError);
     }
     this.stderrTask = this.collectStderr();
     void this.stderrTask.catch((error: unknown) => {
@@ -475,10 +497,7 @@ export class CodexAppServerClient {
       try {
         await client.close();
       } catch (closeError) {
-        throw new AggregateError(
-          [error, closeError],
-          "Codex app-server 初始化失败且进程组收口未确认",
-        );
+        throw new CodexAppServerStartCloseUnconfirmedError(error, closeError);
       }
       throw error;
     }
@@ -499,6 +518,11 @@ export class CodexAppServerClient {
 
   get pendingRequestCount(): number {
     return this.pending.size;
+  }
+
+  /** 供持有方在 ready/recovery 交接前确认 transport 仍然可用。 */
+  get running(): boolean {
+    return this.state === "running" && this.terminalError === null;
   }
 
   get stderrText(): string {

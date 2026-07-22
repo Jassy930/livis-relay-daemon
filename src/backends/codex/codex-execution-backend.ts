@@ -18,6 +18,7 @@ import {
 import type {
   ExecutionBackend,
   ExecutionBackendHandlers,
+  ExecutionReadyEvent,
   ExecutionSubmission,
 } from "../execution-backend.ts";
 import {
@@ -26,7 +27,10 @@ import {
   CODEX_DISABLED_FEATURES,
   CodexAppServerClient,
   codexLocalEnvironment,
+  CodexAppServerProcessOwnershipUnconfirmedError,
+  CodexAppServerRpcError,
   CodexAppServerRequestTransportError,
+  CodexAppServerStartCloseUnconfirmedError,
   CodexAppServerTimeoutError,
   type CodexAppServerNotification,
   type CodexAppServerSpawn,
@@ -51,6 +55,21 @@ const CODEX_AGENT_MESSAGE_HARD_MAX_CHARS = 4 * 1024 * 1024;
 const CODEX_ROLLOUT_SESSION_META_MAX_BYTES = 1024 * 1024;
 export const DEFAULT_CODEX_FRESH_THREAD_MATERIALIZATION_TIMEOUT_MS = 5_000;
 const CODEX_FRESH_THREAD_MATERIALIZATION_POLL_INTERVAL_MS = 25;
+export const CODEX_IDLE_RECOVERY_DELAYS_MS = [250, 1_000, 5_000] as const;
+
+class CodexIdleRecoveryDriftError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "CodexIdleRecoveryDriftError";
+  }
+}
+
+class CodexIdleRecoveryCloseError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "CodexIdleRecoveryCloseError";
+  }
+}
 
 class CodexThreadNotMaterializedError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -99,6 +118,8 @@ export interface CodexExecutionBackendDependencies {
   appServerSpawn?: CodexAppServerSpawn;
   /** 仅供测试注入版本探针；生产使用无 shell 的 argv spawn。 */
   commandRunner?: CodexCommandRunner;
+  /** 仅供测试缩短退避；生产固定使用 CODEX_IDLE_RECOVERY_DELAYS_MS。 */
+  recoveryDelaysMs?: readonly number[];
 }
 
 interface Deferred<T> {
@@ -146,11 +167,39 @@ interface ActiveAttempt {
 interface AdmittedNotification {
   notification: CodexAppServerNotification;
   bytes: number;
+  clientEpoch: number;
+}
+
+function backendSessionRecoveryAnchor(session: StoredBackendSession): string {
+  return sha256(JSON.stringify([
+    session.scopeKey,
+    session.backend,
+    session.sessionKey,
+    session.sessionHash,
+    session.threadId,
+    session.cwd,
+    session.cliVersion,
+    session.accountType,
+    session.accountSubjectSha256,
+    session.accountIdentityStrength,
+    session.requestedModel,
+    session.effectiveModel,
+    session.modelProvider,
+    session.securityConfigSha256,
+    session.featureSnapshotSha256,
+    session.checkpointTurnId,
+    session.checkpointTurnStatus,
+    session.checkpointTurnCount,
+    session.checkpointTurnsSha256,
+    session.checkpointedAt,
+    session.createdAt,
+  ]));
 }
 
 type BackendState =
   | "idle"
   | "starting"
+  | "recovering"
   | "running"
   | "stopping"
   | "stopped"
@@ -800,12 +849,21 @@ export class CodexExecutionBackend implements ExecutionBackend {
   private cliVersion: string | null = null;
   private accountType: string | null = null;
   private threadId: string | null = null;
+  private recoveryAnchorSha256: string | null = null;
   private _executionId: string | null = null;
   private activeAttempt: ActiveAttempt | null = null;
   private eventTail: Promise<void> = Promise.resolve();
   private disconnectPromise: Promise<void> | null = null;
+  private recoveryPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
-  private suppressProcessDisconnect = false;
+  private startInProgress = false;
+  private clientEpoch = 0;
+  private recoveryAttempts = 0;
+  private recoveryNextAttemptAt: number | null = null;
+  private recoveryLastError: string | null = null;
+  private terminalCleanupError: unknown | null = null;
+  private cancelRecoveryDelay: (() => void) | null = null;
+  private readonly recoveryDelaysMs: readonly number[];
   private readonly agentMessageMaxChars: number;
 
   constructor(
@@ -835,6 +893,17 @@ export class CodexExecutionBackend implements ExecutionBackend {
     this.logger = dependencies.logger;
     this.appServerSpawn = dependencies.appServerSpawn;
     this.commandRunner = dependencies.commandRunner ?? runCodexCommand;
+    this.recoveryDelaysMs = Object.freeze([
+      ...(dependencies.recoveryDelaysMs ?? CODEX_IDLE_RECOVERY_DELAYS_MS),
+    ]);
+    if (
+      this.recoveryDelaysMs.length !== CODEX_IDLE_RECOVERY_DELAYS_MS.length ||
+      this.recoveryDelaysMs.some((delayMs) =>
+        !Number.isSafeInteger(delayMs) || delayMs < 0
+      )
+    ) {
+      throw new Error("Codex idle recovery 退避必须包含三个非负安全整数");
+    }
     this.agentMessageMaxChars = Math.min(
       CODEX_AGENT_MESSAGE_HARD_MAX_CHARS,
       options.maxOutputChars * 4,
@@ -851,6 +920,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
 
   async start(): Promise<void> {
     if (this.state !== "idle") throw new Error(`Codex backend 不能从 ${this.state} 状态启动`);
+    this.startInProgress = true;
     this.state = "starting";
     let client: CodexAppServerClient | null = null;
     try {
@@ -888,6 +958,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
         throw new Error(`Codex backend session 仍在 quarantine：${quarantine.reason}`);
       }
 
+      const clientEpoch = ++this.clientEpoch;
       client = await CodexAppServerClient.start({
         command: buildAppServerCommand(command),
         cwd: layout.workspace,
@@ -896,15 +967,15 @@ export class CodexExecutionBackend implements ExecutionBackend {
         requestTimeoutMs: this.options.requestTimeoutMs,
         closeTimeoutMs: this.options.shutdownTimeoutMs,
         capabilities: { experimentalApi: true, requestAttestation: false },
-        onNotification: (notification) => this.receiveNotification(notification),
+        onNotification: (notification) => this.receiveNotification(notification, clientEpoch),
         onApprovalRequest: (request) => {
           this.logger?.warn("Codex app-server 审批请求已默认拒绝", { method: request.method });
         },
       });
       this.client = client;
       void client.exited.then(
-        (exitCode) => this.onProcessExit(exitCode),
-        (error: unknown) => this.onProcessExit(null, error),
+        (exitCode) => this.onProcessExit(client!, clientEpoch, exitCode),
+        (error: unknown) => this.onProcessExit(client!, clientEpoch, null, error),
       );
 
       validateCodexInitializeResponse(client.initializeResult, layout, cliVersion);
@@ -1037,10 +1108,9 @@ export class CodexExecutionBackend implements ExecutionBackend {
         } else if (ensuredSession.threadId !== threadId) {
           throw new Error("Codex backend session 已绑定不同 thread");
         }
-        assertStoredThreadCheckpoint(
-          this.store.getBackendSession(this.kind, this.options.sessionKey)!,
-          threadTail,
-        );
+        const boundSession = this.store.getBackendSession(this.kind, this.options.sessionKey)!;
+        assertStoredThreadCheckpoint(boundSession, threadTail);
+        this.recoveryAnchorSha256 = backendSessionRecoveryAnchor(boundSession);
       } catch (error) {
         this.store.quarantineSession(
           this.options.sessionKey,
@@ -1055,6 +1125,9 @@ export class CodexExecutionBackend implements ExecutionBackend {
       this.accountType = account.accountType;
       this.threadId = threadId;
       this._executionId = `codex:${threadId}`;
+      if (!client.running) {
+        throw new Error("Codex app-server 在 ready 发布前已经退出");
+      }
       this.state = "running";
       try {
         await this.handlers.onReady({
@@ -1075,21 +1148,37 @@ export class CodexExecutionBackend implements ExecutionBackend {
         await this.failClosed(`Codex ready handler 失败：${errorMessage(error)}`);
         throw error;
       }
-      if (!this.ready) {
+      if (!this.ready || !client.running) {
         throw new Error("Codex backend 在 ready handler 期间失效");
       }
+      this.startInProgress = false;
       this.logger?.info("Codex app-server backend 已就绪", {
         executionId: this._executionId,
         cliVersion,
       });
     } catch (error) {
+      this.startInProgress = false;
       this.state = "failed";
-      this.suppressProcessDisconnect = true;
       this.client = null;
+      if (
+        error instanceof CodexAppServerStartCloseUnconfirmedError ||
+        error instanceof CodexAppServerProcessOwnershipUnconfirmedError
+      ) {
+        this.terminalCleanupError ??= error;
+        this.store.quarantineSession(
+          this.options.sessionKey,
+          `Codex backend 启动后无法确认进程组所有权或收口：${errorMessage(error)}`,
+        );
+      }
       if (client) {
         try {
           await client.close();
         } catch (closeError) {
+          this.terminalCleanupError ??= closeError;
+          this.store.quarantineSession(
+            this.options.sessionKey,
+            `Codex backend 启动失败且 app-server 进程组收口未确认：${errorMessage(closeError)}`,
+          );
           throw new AggregateError(
             [error, closeError],
             "Codex backend 启动失败且 app-server 进程组收口未确认",
@@ -1100,6 +1189,494 @@ export class CodexExecutionBackend implements ExecutionBackend {
     }
   }
 
+  private recoveryEligibilityIssue(): string | null {
+    if (this.activeAttempt !== null) return "内存中仍有 active attempt";
+    if (!this.layout || !this.cliVersion || !this.threadId || !this.recoveryAnchorSha256) {
+      return "运行时、thread 或 recovery anchor 未完整绑定";
+    }
+    const stored = this.store.getBackendSession(this.kind, this.options.sessionKey);
+    if (!stored) return "持久 backend session 不存在";
+    if (stored.threadId !== this.threadId) return "持久 threadId 已漂移";
+    if (stored.recoveryRequired) return "持久 session 已要求人工 recovery";
+    if (
+      stored.activeJobId !== null || stored.activeLeaseId !== null ||
+      stored.activeRunGeneration !== null || stored.activeTurnId !== null
+    ) {
+      return "SQLite 已存在 active attempt evidence";
+    }
+    if (backendSessionRecoveryAnchor(stored) !== this.recoveryAnchorSha256) {
+      return "持久 metadata/checkpoint 已偏离最后一次 daemon anchor";
+    }
+    const quarantine = this.store.getSessionQuarantine(this.options.sessionKey);
+    return quarantine ? `session 已在 quarantine：${quarantine.reason}` : null;
+  }
+
+  private isStopping(): boolean {
+    return this.state === "stopping" || this.state === "stopped";
+  }
+
+  private requireRecoveryStoreFence(): StoredBackendSession {
+    const issue = this.recoveryEligibilityIssue();
+    if (issue) {
+      throw new CodexIdleRecoveryDriftError(`Codex idle recovery Store fence 失败：${issue}`);
+    }
+    return this.store.getBackendSession(this.kind, this.options.sessionKey)!;
+  }
+
+  private recoveryDrift<T>(label: string, operation: () => T): T {
+    try {
+      return operation();
+    } catch (error) {
+      throw new CodexIdleRecoveryDriftError(`${label}：${errorMessage(error)}`, { cause: error });
+    }
+  }
+
+  private waitForRecoveryDelay(delayMs: number): Promise<boolean> {
+    if (this.state !== "recovering") return Promise.resolve(false);
+    this.recoveryNextAttemptAt = Date.now() + delayMs;
+    return new Promise<boolean>((resolvePromise) => {
+      let settled = false;
+      const finish = (elapsed: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (this.cancelRecoveryDelay === cancel) this.cancelRecoveryDelay = null;
+        this.recoveryNextAttemptAt = null;
+        resolvePromise(elapsed);
+      };
+      const cancel = (): void => finish(false);
+      const timer = setTimeout(() => finish(true), delayMs);
+      this.cancelRecoveryDelay = cancel;
+    });
+  }
+
+  private beginIdleRecovery(
+    exitedClient: CodexAppServerClient,
+    detail: string,
+  ): void {
+    if (this.recoveryPromise !== null || this.disconnectPromise !== null) return;
+    this.state = "recovering";
+    this.recoveryLastError = null;
+    let tracked!: Promise<void>;
+    tracked = this.recoverIdleAppServer(exitedClient, detail)
+      .catch(async (error) => {
+        if (this.isStopping()) throw error;
+        if (this.disconnectPromise) {
+          try {
+            await this.disconnectPromise;
+          } catch (disconnectError) {
+            throw new AggregateError(
+              [error, disconnectError],
+              "Codex idle recovery 异常退出且 fail-closed 收口失败",
+            );
+          }
+          if (error instanceof CodexIdleRecoveryCloseError) throw error;
+          return;
+        }
+        await this.failIdleRecovery(
+          `Codex idle recovery 异常退出：${errorMessage(error)}`,
+          error,
+          error instanceof CodexIdleRecoveryCloseError,
+        );
+        if (error instanceof CodexIdleRecoveryCloseError) throw error;
+      })
+      .finally(() => {
+        if (this.recoveryPromise === tracked) {
+          this.recoveryPromise = null;
+          this.recoveryNextAttemptAt = null;
+          this.cancelRecoveryDelay = null;
+        }
+      });
+    this.recoveryPromise = tracked;
+    void tracked.catch((error) => {
+      this.logger?.error("Codex idle recovery 收口失败", { error: errorMessage(error) });
+    });
+  }
+
+  private async closeRecoveryClient(
+    client: CodexAppServerClient,
+    label: string,
+  ): Promise<void> {
+    try {
+      await client.close();
+    } catch (error) {
+      const closeError = new CodexIdleRecoveryCloseError(
+        `${label}的进程组收口未确认：${errorMessage(error)}`,
+        { cause: error },
+      );
+      this.terminalCleanupError ??= closeError;
+      throw closeError;
+    }
+    if (this.client === client) this.client = null;
+  }
+
+  private async closeClientForStop(client: CodexAppServerClient): Promise<void> {
+    try {
+      await client.close();
+    } catch (error) {
+      this.terminalCleanupError ??= error;
+      this.store.quarantineSession(
+        this.options.sessionKey,
+        `Codex stop 无法确认 app-server 进程组收口：${errorMessage(error)}`,
+      );
+      throw error;
+    }
+  }
+
+  private async failIdleRecovery(
+    reason: string,
+    error: unknown,
+    quarantine: boolean,
+  ): Promise<void> {
+    this.recoveryLastError = errorMessage(error);
+    if (quarantine) {
+      this.store.quarantineSession(this.options.sessionKey, reason);
+    }
+    try {
+      await this.failClosed(reason);
+    } catch (disconnectError) {
+      throw new AggregateError(
+        [error, disconnectError],
+        `Codex idle recovery 失败且最终收口未确认：${reason}`,
+      );
+    }
+  }
+
+  private async recoverIdleAppServer(
+    exitedClient: CodexAppServerClient,
+    exitDetail: string,
+  ): Promise<void> {
+    try {
+      await this.closeRecoveryClient(exitedClient, "退出的 Codex app-server");
+    } catch (error) {
+      if (this.state === "stopping") throw error;
+      await this.failIdleRecovery(
+        `Codex idle app-server 退出后旧进程组无法确认关闭（${exitDetail}）`,
+        error,
+        true,
+      );
+      throw error;
+    }
+    if (this.state !== "recovering") return;
+
+    while (this.recoveryAttempts < this.recoveryDelaysMs.length) {
+      const delayMs = this.recoveryDelaysMs[this.recoveryAttempts]!;
+      if (!await this.waitForRecoveryDelay(delayMs) || this.state !== "recovering") return;
+      this.recoveryAttempts += 1;
+
+      let readyEvent: ExecutionReadyEvent;
+      try {
+        readyEvent = await this.recoverIdleAttempt();
+      } catch (error) {
+        this.recoveryLastError = errorMessage(error);
+        const candidate = this.client;
+        if (candidate) {
+          try {
+            await this.closeRecoveryClient(candidate, "失败的 Codex recovery candidate");
+          } catch (closeError) {
+            if (this.isStopping()) throw closeError;
+            await this.failIdleRecovery(
+              "Codex idle recovery candidate 的进程组收口未确认",
+              closeError,
+              true,
+            );
+            throw closeError;
+          }
+        }
+        if (error instanceof CodexIdleRecoveryCloseError) {
+          if (this.isStopping()) throw error;
+          await this.failIdleRecovery(
+            "Codex idle recovery candidate 在启动/initialize 阶段的进程组收口未确认",
+            error,
+            true,
+          );
+          throw error;
+        }
+        if (this.isStopping()) return;
+        if (error instanceof CodexIdleRecoveryDriftError) {
+          await this.failIdleRecovery(
+            `Codex idle recovery 检测到 metadata/checkpoint/tail 漂移：${errorMessage(error)}`,
+            error,
+            true,
+          );
+          return;
+        }
+        if (this.recoveryAttempts >= this.recoveryDelaysMs.length) {
+          await this.failIdleRecovery(
+            `Codex idle recovery 已耗尽 ${this.recoveryAttempts} 次 daemon 生命周期预算：${errorMessage(error)}`,
+            error,
+            false,
+          );
+          return;
+        }
+        this.state = "recovering";
+        continue;
+      }
+
+      const recoveredClient = this.client;
+      if (
+        this.state !== "recovering" || !recoveredClient || !recoveredClient.running ||
+        this.activeAttempt !== null
+      ) {
+        if (recoveredClient) {
+          await this.closeRecoveryClient(recoveredClient, "未能发布 ready 的 recovery candidate");
+        }
+        if (this.isStopping()) return;
+        const error = new Error("Codex recovery candidate 在 ready 发布前失效");
+        await this.failIdleRecovery(error.message, error, false);
+        return;
+      }
+
+      // 必须先原子撤销 recovering/ready=false，daemon 的 onReady 才能看到可派发状态。
+      // onReady 不进入 eventTail，避免 onReady→dispatch→onAccepted 与 eventTail 自死锁。
+      this.state = "running";
+      try {
+        await this.handlers.onReady(readyEvent);
+      } catch (error) {
+        if (this.isStopping()) return;
+        await this.failIdleRecovery(
+          `Codex idle recovery ready handler 失败：${errorMessage(error)}`,
+          error,
+          false,
+        );
+        return;
+      }
+      if (this.isStopping()) return;
+      if (!this.ready || this.client !== recoveredClient || !recoveredClient.running) {
+        const error = new Error("Codex backend 在 recovery ready handler 期间失效");
+        await this.failIdleRecovery(error.message, error, false);
+        return;
+      }
+      this.logger?.info("Codex app-server idle recovery 已完成", {
+        executionId: this._executionId,
+        recoveryAttempts: this.recoveryAttempts,
+      });
+      return;
+    }
+  }
+
+  private async recoverIdleAttempt(): Promise<ExecutionReadyEvent> {
+    const layout = this.layout;
+    const expectedCliVersion = this.cliVersion;
+    const expectedThreadId = this.threadId;
+    if (!layout || !expectedCliVersion || !expectedThreadId) {
+      throw new CodexIdleRecoveryDriftError("Codex recovery anchor 未完整绑定");
+    }
+    this.requireRecoveryStoreFence();
+    try {
+      await assertCodexRuntimeLayout(layout);
+    } catch (error) {
+      throw new CodexIdleRecoveryDriftError(
+        `Codex recovery runtime layout 已漂移：${errorMessage(error)}`,
+        { cause: error },
+      );
+    }
+    const environment = await buildCodexEnvironment(layout).catch((error) => {
+      throw new CodexIdleRecoveryDriftError(
+        `Codex recovery environment 无法重建：${errorMessage(error)}`,
+        { cause: error },
+      );
+    });
+    const command = this.appServerSpawn === undefined && this.commandRunner === runCodexCommand
+      ? await resolveCodexCommand(layout, this.options.command).catch((error) => {
+          throw new CodexIdleRecoveryDriftError(
+            `Codex recovery command 已漂移：${errorMessage(error)}`,
+            { cause: error },
+          );
+        })
+      : this.options.command;
+    const versionResult = await this.commandRunner([command, "--version"], {
+      cwd: layout.workspace,
+      env: environment,
+      timeoutMs: this.options.requestTimeoutMs,
+    });
+    const cliVersion = this.recoveryDrift(
+      "Codex recovery CLI 版本无效",
+      () => validateCodexVersion(versionResult),
+    );
+    if (cliVersion !== expectedCliVersion) {
+      throw new CodexIdleRecoveryDriftError(
+        `Codex recovery CLI 版本漂移：${expectedCliVersion} → ${cliVersion}`,
+      );
+    }
+    this.requireRecoveryStoreFence();
+    if (this.state !== "recovering") throw new Error("Codex recovery 已被停止");
+
+    const clientEpoch = ++this.clientEpoch;
+    let client: CodexAppServerClient;
+    try {
+      client = await CodexAppServerClient.start({
+        command: buildAppServerCommand(command),
+        cwd: layout.workspace,
+        env: environment,
+        spawn: this.appServerSpawn,
+        requestTimeoutMs: this.options.requestTimeoutMs,
+        closeTimeoutMs: this.options.shutdownTimeoutMs,
+        capabilities: { experimentalApi: true, requestAttestation: false },
+        onNotification: (notification) => this.receiveNotification(notification, clientEpoch),
+        onApprovalRequest: (request) => {
+          if (clientEpoch !== this.clientEpoch) return;
+          this.logger?.warn("Codex recovery app-server 审批请求已默认拒绝", {
+            method: request.method,
+          });
+        },
+      });
+    } catch (error) {
+      if (
+        error instanceof CodexAppServerStartCloseUnconfirmedError ||
+        error instanceof CodexAppServerProcessOwnershipUnconfirmedError
+      ) {
+        const closeError = new CodexIdleRecoveryCloseError(
+          `Codex recovery candidate 在启动/initialize 阶段的进程组收口未确认：${errorMessage(error)}`,
+          { cause: error },
+        );
+        this.terminalCleanupError ??= closeError;
+        throw closeError;
+      }
+      throw error;
+    }
+    this.client = client;
+    void client.exited.then(
+      (exitCode) => this.onProcessExit(client, clientEpoch, exitCode),
+      (error: unknown) => this.onProcessExit(client, clientEpoch, null, error),
+    );
+    if (this.state !== "recovering") throw new Error("Codex recovery 已被停止");
+
+    this.recoveryDrift(
+      "Codex recovery initialize 回读漂移",
+      () => validateCodexInitializeResponse(client.initializeResult, layout, cliVersion),
+    );
+    const accountResponse = await client.request("account/read", { refreshToken: false });
+    const account = this.recoveryDrift(
+      "Codex recovery account 回读漂移",
+      () => validateAccountResponse(accountResponse),
+    );
+    const permissionProfiles = await client.request("permissionProfile/list", {
+      cwd: layout.workspace,
+    });
+    this.recoveryDrift(
+      "Codex recovery permission profile 漂移",
+      () => validatePermissionProfiles(permissionProfiles),
+    );
+    const featureList = await client.request("experimentalFeature/list", {
+      cursor: null,
+      limit: 256,
+    });
+    const featureSnapshotSha256 = this.recoveryDrift(
+      "Codex recovery feature snapshot 漂移",
+      () => validateDisabledCodexFeatures(featureList, cliVersion),
+    );
+    try {
+      await assertCodexRuntimeLayout(layout);
+    } catch (error) {
+      throw new CodexIdleRecoveryDriftError(
+        `Codex recovery 安全回读后 runtime layout 已漂移：${errorMessage(error)}`,
+        { cause: error },
+      );
+    }
+    const securityConfigSha256 = sha256(codexRemoteConfig(layout.workspace));
+    const storedBeforeResume = this.requireRecoveryStoreFence();
+    if (
+      storedBeforeResume.accountType !== account.accountType ||
+      storedBeforeResume.accountSubjectSha256 !== account.accountSubjectSha256 ||
+      storedBeforeResume.accountIdentityStrength !== account.identityStrength ||
+      storedBeforeResume.requestedModel !== this.options.model ||
+      storedBeforeResume.securityConfigSha256 !== securityConfigSha256 ||
+      storedBeforeResume.featureSnapshotSha256 !== featureSnapshotSha256
+    ) {
+      throw new CodexIdleRecoveryDriftError(
+        "Codex recovery 账号、请求模型、安全配置或 feature snapshot 已漂移",
+      );
+    }
+
+    const commonThreadParams = {
+      cwd: layout.workspace,
+      runtimeWorkspaceRoots: [layout.workspace],
+      approvalPolicy: "never",
+      approvalsReviewer: "user",
+      permissions: CODEX_REMOTE_PERMISSION_PROFILE,
+      ...(this.options.model === null ? {} : { model: this.options.model }),
+    } as const;
+    let threadResponse: unknown;
+    try {
+      threadResponse = await client.threadResume({
+        threadId: expectedThreadId,
+        ...commonThreadParams,
+      });
+    } catch (error) {
+      if (error instanceof CodexAppServerRpcError) {
+        throw new CodexIdleRecoveryDriftError(
+          `Codex recovery 无法 resume 已绑定 thread：${errorMessage(error)}`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+    const threadInspection = this.recoveryDrift(
+      "Codex recovery thread response 漂移",
+      () => inspectThreadResponse(threadResponse, layout, expectedThreadId),
+    );
+    if (
+      (this.options.model !== null && threadInspection.effectiveModel !== this.options.model) ||
+      storedBeforeResume.effectiveModel !== threadInspection.effectiveModel ||
+      storedBeforeResume.modelProvider !== threadInspection.modelProvider
+    ) {
+      throw new CodexIdleRecoveryDriftError("Codex recovery 实际 model/provider 已漂移");
+    }
+    const persisted = await client.threadRead({
+      threadId: expectedThreadId,
+      includeTurns: true,
+    });
+    try {
+      await validatePersistedCodexThread(persisted, layout, expectedThreadId);
+    } catch (error) {
+      throw new CodexIdleRecoveryDriftError(
+        `Codex recovery rollout/tail 回读漂移：${errorMessage(error)}`,
+        { cause: error },
+      );
+    }
+    const actualTail = this.recoveryDrift(
+      "Codex recovery thread tail 漂移",
+      () => inspectCodexThreadTail(persisted, expectedThreadId),
+    );
+    const storedAfterRead = this.requireRecoveryStoreFence();
+    this.recoveryDrift(
+      "Codex recovery checkpoint 漂移",
+      () => assertStoredThreadCheckpoint(storedAfterRead, actualTail),
+    );
+    try {
+      await assertCodexRuntimeLayout(layout);
+    } catch (error) {
+      throw new CodexIdleRecoveryDriftError(
+        `Codex recovery 完成前 runtime layout 已漂移：${errorMessage(error)}`,
+        { cause: error },
+      );
+    }
+    this.requireRecoveryStoreFence();
+    if (
+      this.state !== "recovering" || this.client !== client ||
+      clientEpoch !== this.clientEpoch || !client.running
+    ) {
+      throw new Error("Codex recovery candidate 在安全交接前退出");
+    }
+
+    this.accountType = account.accountType;
+    return {
+      kind: this.kind,
+      executionId: `codex:${expectedThreadId}`,
+      implementation: {
+        name: "codex-app-server",
+        version: cliVersion,
+        accountType: account.accountType,
+        accountIdentityStrength: account.identityStrength,
+        effectiveModel: threadInspection.effectiveModel,
+        modelProvider: threadInspection.modelProvider,
+        featureSnapshotSha256,
+        permissionProfile: CODEX_REMOTE_PERMISSION_PROFILE,
+      },
+    };
+  }
+
   stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     this.stopPromise = this.stopInternal();
@@ -1108,28 +1685,57 @@ export class CodexExecutionBackend implements ExecutionBackend {
 
   private async stopInternal(): Promise<void> {
     if (this.state === "stopped") return;
-    if (this.disconnectPromise) {
-      await this.disconnectPromise;
-      this.state = "stopped";
-      return;
-    }
     const hadActiveAttempt = this.activeAttempt !== null && !this.activeAttempt.terminal;
     this.state = "stopping";
+    this.cancelRecoveryDelay?.();
+
+    const failures: unknown[] = [];
+    const seen = new Set<Promise<unknown>>();
+    const settle = async (promises: Array<Promise<unknown> | null>): Promise<void> => {
+      const pending = promises.filter((promise): promise is Promise<unknown> => {
+        if (!promise || seen.has(promise)) return false;
+        seen.add(promise);
+        return true;
+      });
+      const results = await Promise.allSettled(pending);
+      for (const result of results) {
+        if (result.status === "rejected") failures.push(result.reason);
+      }
+    };
+
+    let stopDisconnect: Promise<void> | null = null;
     if (hadActiveAttempt) {
-      await this.failClosed("daemon 停止时 Codex turn 仍处于活动状态");
+      stopDisconnect = this.failClosed("daemon 停止时 Codex turn 仍处于活动状态");
     } else {
-      this.suppressProcessDisconnect = true;
+      const client = this.client;
+      this.client = null;
+      if (client) {
+        await settle([this.closeClientForStop(client)]);
+      }
     }
-    await this.eventTail.catch(() => undefined);
-    if (this.disconnectPromise) {
-      await this.disconnectPromise;
-      this.state = "stopped";
-      return;
-    }
-    const client = this.client;
+
+    await settle([
+      stopDisconnect,
+      this.recoveryPromise,
+      this.disconnectPromise,
+      this.eventTail,
+    ]);
+    const lateClient = this.client;
     this.client = null;
-    if (client) await client.close();
+    await settle([
+      this.recoveryPromise,
+      this.disconnectPromise,
+      lateClient ? this.closeClientForStop(lateClient) : null,
+      this.eventTail,
+    ]);
+    if (this.terminalCleanupError !== null) failures.push(this.terminalCleanupError);
     this.state = "stopped";
+    if (failures.length > 0) {
+      throw new AggregateError(
+        failures,
+        "Codex backend 停止期间存在未确认的进程组收口或清理错误",
+      );
+    }
   }
 
   async dispatch(job: StoredJob): Promise<ExecutionSubmission> {
@@ -1356,12 +1962,34 @@ export class CodexExecutionBackend implements ExecutionBackend {
   }
 
   status(): Record<string, unknown> {
+    const stored = this.store.getBackendSession(this.kind, this.options.sessionKey);
     return {
       kind: this.kind,
+      state: this.state,
       ready: this.ready,
       executionId: this.executionId,
       cliVersion: this.cliVersion,
       threadId: this.threadId,
+      accountType: stored?.accountType ?? this.accountType,
+      accountIdentityStrength: stored?.accountIdentityStrength ?? null,
+      requestedModel: stored?.requestedModel ?? this.options.model,
+      effectiveModel: stored?.effectiveModel ?? null,
+      modelProvider: stored?.modelProvider ?? null,
+      checkpoint: stored
+        ? {
+            turnId: stored.checkpointTurnId,
+            turnStatus: stored.checkpointTurnStatus,
+            turnCount: stored.checkpointTurnCount,
+            checkpointedAt: stored.checkpointedAt,
+          }
+        : null,
+      recovery: {
+        inProgress: this.recoveryPromise !== null,
+        attempts: this.recoveryAttempts,
+        maxAttempts: this.recoveryDelaysMs.length,
+        nextAttemptAt: this.recoveryNextAttemptAt,
+        lastError: this.recoveryLastError,
+      },
       permissionProfile: CODEX_REMOTE_PERMISSION_PROFILE,
       workspace: this.layout?.workspace ?? null,
       active: this.activeAttempt
@@ -1396,11 +2024,15 @@ export class CodexExecutionBackend implements ExecutionBackend {
     };
   }
 
-  private receiveNotification(notification: CodexAppServerNotification): void {
+  private receiveNotification(
+    notification: CodexAppServerNotification,
+    clientEpoch: number,
+  ): void {
+    if (clientEpoch !== this.clientEpoch) return;
     if (!relevantNotification(notification)) return;
     const attempt = this.activeAttempt;
     if (!attempt || attempt.terminal || notificationThreadId(notification) !== this.threadId) return;
-    const admitted = this.admitNotification(attempt, notification);
+    const admitted = this.admitNotification(attempt, notification, clientEpoch);
     if (!admitted) return;
     if (attempt.turnId === null) {
       attempt.bufferedNotifications.push(admitted);
@@ -1411,7 +2043,8 @@ export class CodexExecutionBackend implements ExecutionBackend {
 
   private enqueueNotification(attempt: ActiveAttempt, admitted: AdmittedNotification): void {
     void this.enqueueEvent(async () => {
-      await this.processNotification(admitted.notification);
+      if (admitted.clientEpoch !== this.clientEpoch) return;
+      await this.processNotification(admitted.notification, admitted.clientEpoch);
     }).finally(() => {
       this.releaseNotification(attempt, admitted);
     }).catch(() => undefined);
@@ -1420,6 +2053,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
   private admitNotification(
     attempt: ActiveAttempt,
     notification: CodexAppServerNotification,
+    clientEpoch: number,
   ): AdmittedNotification | null {
     const bytes = Buffer.byteLength(JSON.stringify(notification), "utf8");
     if (
@@ -1436,7 +2070,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
     }
     attempt.pendingNotificationCount += 1;
     attempt.pendingNotificationBytes += bytes;
-    return { notification, bytes };
+    return { notification, bytes, clientEpoch };
   }
 
   private releaseNotification(attempt: ActiveAttempt, admitted: AdmittedNotification): void {
@@ -1444,7 +2078,11 @@ export class CodexExecutionBackend implements ExecutionBackend {
     attempt.pendingNotificationBytes = Math.max(0, attempt.pendingNotificationBytes - admitted.bytes);
   }
 
-  private async processNotification(notification: CodexAppServerNotification): Promise<void> {
+  private async processNotification(
+    notification: CodexAppServerNotification,
+    clientEpoch: number,
+  ): Promise<void> {
+    if (clientEpoch !== this.clientEpoch) return;
     const attempt = this.activeAttempt;
     if (!attempt || attempt.terminal || !attempt.turnId) return;
     if (
@@ -1688,7 +2326,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
         `Codex terminal checkpoint 与通知不一致：${tail.turnId ?? "<empty>"}/${tail.turnStatus ?? "<empty>"}`,
       );
     }
-    this.store.checkpointBackendThreadTail({
+    const checkpointedSession = this.store.checkpointBackendThreadTail({
       backend: this.kind,
       sessionKey: this.options.sessionKey,
       threadId: this.threadId,
@@ -1705,6 +2343,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
         turnId: attempt.turnId,
       },
     });
+    this.recoveryAnchorSha256 = backendSessionRecoveryAnchor(checkpointedSession);
   }
 
   private armTurnDeadline(attempt: ActiveAttempt): void {
@@ -1834,13 +2473,13 @@ export class CodexExecutionBackend implements ExecutionBackend {
 
   private failClosed(reason: string): Promise<void> {
     if (this.disconnectPromise) return this.disconnectPromise;
+    this.cancelRecoveryDelay?.();
     if (this.activeAttempt) {
       this.clearTurnDeadline(this.activeAttempt);
       this.activeAttempt.terminal = true;
     }
     this.state = this.state === "stopping" ? "stopping" : "failed";
     const executionId = this._executionId ?? `codex:${this.options.sessionKey}`;
-    this.suppressProcessDisconnect = true;
     const client = this.client;
     this.client = null;
     this.disconnectPromise = (async () => {
@@ -1856,7 +2495,17 @@ export class CodexExecutionBackend implements ExecutionBackend {
       ]);
       const failures: unknown[] = [];
       if (persistence.status === "rejected") failures.push(persistence.reason);
-      if (close.status === "rejected") failures.push(close.reason);
+      if (close.status === "rejected") {
+        try {
+          this.store.quarantineSession(
+            this.options.sessionKey,
+            `Codex fail-closed 进程组收口未确认：${reason}`,
+          );
+        } catch (quarantineError) {
+          failures.push(quarantineError);
+        }
+        failures.push(close.reason);
+      }
       if (failures.length > 0) {
         throw new AggregateError(
           failures,
@@ -1870,7 +2519,6 @@ export class CodexExecutionBackend implements ExecutionBackend {
   private async disableBeforeSubmission(reason: string): Promise<void> {
     this.logger?.error("Codex backend 在请求写入前失效", { reason });
     this.state = "failed";
-    this.suppressProcessDisconnect = true;
     const client = this.client;
     this.client = null;
     if (client) await client.close();
@@ -1878,17 +2526,65 @@ export class CodexExecutionBackend implements ExecutionBackend {
 
   private async disableAfterTerminal(): Promise<void> {
     this.state = "failed";
-    this.suppressProcessDisconnect = true;
     const client = this.client;
     this.client = null;
     if (client) await client.close();
   }
 
-  private onProcessExit(exitCode: number | null, cause?: unknown): void {
-    if (this.suppressProcessDisconnect || this.state === "stopped") return;
+  private onProcessExit(
+    sourceClient: CodexAppServerClient,
+    clientEpoch: number,
+    exitCode: number | null,
+    cause?: unknown,
+  ): void {
+    if (
+      sourceClient !== this.client || clientEpoch !== this.clientEpoch ||
+      this.state === "stopped" || this.state === "stopping" || this.state === "failed"
+    ) {
+      return;
+    }
     const detail = cause ? errorMessage(cause) : `exit ${exitCode ?? "unknown"}`;
-    void this.failClosed(`Codex app-server 意外退出（${detail}）`).catch((error) => {
-      this.logger?.error("Codex app-server 断连持久化失败", { error: errorMessage(error) });
-    });
+    if (this.state === "starting" || this.state === "recovering") {
+      // 启动/恢复 RPC 会观察 transport 终止并负责候选重试或失败关闭。
+      return;
+    }
+    if (this.state !== "running") return;
+    if (this.startInProgress) {
+      // 初次 start() 尚未完成 ready 交接，由 start 自身的 client.running 与
+      // 请求错误路径裁决；这里不得并发启动 recovery。
+      return;
+    }
+    if (this.recoveryPromise !== null) {
+      void this.failClosed(
+        `Codex app-server 在 recovery ready 交接期间退出（${detail}）`,
+      ).catch((error) => {
+        this.logger?.error("Codex recovery ready 交接失败", { error: errorMessage(error) });
+      });
+      return;
+    }
+    const eligibilityIssue = this.recoveryEligibilityIssue();
+    if (eligibilityIssue) {
+      this.store.quarantineSession(
+        this.options.sessionKey,
+        `Codex app-server 退出时不满足 idle recovery fence：${eligibilityIssue}`,
+      );
+      void this.failClosed(
+        `Codex app-server 意外退出且禁止自动恢复（${detail}；${eligibilityIssue}）`,
+      ).catch((error) => {
+        this.logger?.error("Codex app-server 断连持久化失败", { error: errorMessage(error) });
+      });
+      return;
+    }
+    if (this.recoveryAttempts >= this.recoveryDelaysMs.length) {
+      void this.failClosed(
+        `Codex app-server 意外退出且 daemon 生命周期恢复预算已耗尽（${detail}）`,
+      ).catch((error) => {
+        this.logger?.error("Codex app-server 恢复预算耗尽后的收口失败", {
+          error: errorMessage(error),
+        });
+      });
+      return;
+    }
+    this.beginIdleRecovery(sourceClient, detail);
   }
 }
