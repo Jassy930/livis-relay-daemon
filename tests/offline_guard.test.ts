@@ -113,6 +113,7 @@ describe("离线与 profile 操作 guard", () => {
       "session-release",
     );
     expect(guard.document.operation).toBe("session-release");
+    expect(guard.canonicalStateDir).toBe(await realpath(directory.path));
     expect((await stat(guard.path)).mode & 0o777).toBe(0o600);
 
     const server = connectorServer(socketPath);

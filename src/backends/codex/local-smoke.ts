@@ -54,6 +54,8 @@ export interface CodexAppServerLocalSmokeDependencies {
   readIsolationStateDirAsserter?: (stateDir: string) => Promise<void>;
   /** 仅供 deterministic 测试替换宿主 loopback socket；生产调用不得传入。 */
   loopbackProbeFactory?: () => CodexLocalSmokeLoopbackProbe;
+  /** 仅供测试观察牺牲文件成功创建顺序；生产调用不得传入。 */
+  canaryFileCreatedObserver?: (path: string) => void;
 }
 
 export interface CodexLocalSmokeLoopbackProbe {
@@ -113,7 +115,7 @@ export interface CodexAppServerLocalSmokeReport {
     externalFileIdentityStable: true;
     commandIdentityStable: true;
     loopbackEndpointReachable: true;
-    perlSocketProbeAvailable: true;
+    systemNcProbeAvailable: true;
     toolNetworkPermissionDenied: true;
   };
   appServerStderrObserved: boolean;
@@ -226,6 +228,33 @@ function inspectCommandExec(value: unknown, label: string): CommandExecInspectio
     stdout: response.stdout,
     stderr: response.stderr,
   };
+}
+
+function macOsNcPermissionErrno(
+  result: CommandExecInspection,
+  port: number,
+): 1 | 13 | null {
+  if (
+    result.exitCode !== 1 ||
+    !result.stdout.endsWith("\n") ||
+    !result.stderr.endsWith("\n")
+  ) {
+    return null;
+  }
+  const stdoutLines = result.stdout.slice(0, -1).split("\n");
+  const stderrLines = result.stderr.slice(0, -1).split("\n");
+  if (stdoutLines.length !== 1 || stderrLines.length !== 1) return null;
+  const errnoMatch = /^error = 0 (1|13) ?$/.exec(stdoutLines[0]!);
+  if (!errnoMatch) return null;
+  const errno = Number(errnoMatch[1]) as 1 | 13;
+  const errorText = errno === 1 ? "Operation not permitted" : "Permission denied";
+  if (
+    stderrLines[0] !==
+      `nc: connect to 127.0.0.1 port ${port} (tcp) failed: ${errorText}`
+  ) {
+    return null;
+  }
+  return errno;
 }
 
 interface CanaryFileIdentity {
@@ -384,6 +413,7 @@ async function runReadIsolationCanary(
   timeoutMs: number,
   stateDirAsserter: (stateDir: string) => Promise<void>,
   loopbackProbeFactory: () => CodexLocalSmokeLoopbackProbe,
+  canaryFileCreatedObserver: (path: string) => void,
 ): Promise<NonNullable<CodexAppServerLocalSmokeReport["readIsolationCanary"]>> {
   await stateDirAsserter(layout.stateDir);
   const workspaceMarker = "livis-workspace-read-canary-v1\n";
@@ -576,12 +606,14 @@ async function runReadIsolationCanary(
     );
     ownedCanaryPaths.push({ path: hardlinkControlSource, identity: controlIdentity });
     ownedCanaryPaths.unshift({ path: hardlinkControlTarget, identity: controlIdentity });
+    canaryFileCreatedObserver(hardlinkControlSource);
     const externalIdentity = await createExclusiveCanaryFile(
       externalSource,
       "livis-hardlink-external-v2\n",
     );
     ownedCanaryPaths.push({ path: externalSource, identity: externalIdentity });
     ownedCanaryPaths.unshift({ path: externalTarget, identity: externalIdentity });
+    canaryFileCreatedObserver(externalSource);
     if (
       workspaceInfo.dev !== controlIdentity.dev ||
       workspaceInfo.dev !== externalIdentity.dev
@@ -677,48 +709,32 @@ async function runReadIsolationCanary(
     ) {
       throw new Error("Codex 工具网络 canary 的 host TCP 正向 control 失败");
     }
-    const perlControl = inspectCommandExec(
-      await client.request("command/exec", {
-        ...common,
-        command: ["/usr/bin/perl", "-MSocket", "-e", "print qq(PERL_SOCKET_OK\\n)"],
-      }),
-      "Codex sandbox Perl/Socket 正向 control",
-    );
-    if (perlControl.exitCode !== 0 || perlControl.stdout !== "PERL_SOCKET_OK\n") {
-      throw new Error(
-        "Codex sandbox Perl/Socket 正向 control 失败，网络 canary 无法裁决：" +
-          `exit=${perlControl.exitCode} stdout=${JSON.stringify(perlControl.stdout.slice(0, 512))} ` +
-          `stderr=${JSON.stringify(perlControl.stderr.slice(0, 512))}`,
-      );
-    }
-    const perlSocketProbe = [
-      "use strict; use warnings; use Socket qw(PF_INET SOCK_STREAM inet_aton sockaddr_in);",
-      "socket(my $socket, PF_INET, SOCK_STREAM, getprotobyname('tcp')) or do { print 'SOCKET_ERRNO='.(0+$!).qq(\\n); exit 78; };",
-      "my $address = sockaddr_in($ARGV[1], inet_aton($ARGV[0]));",
-      "if (connect($socket, $address)) { print qq(CONNECTED=1\\n); exit 0; }",
-      "print 'CONNECTED=0'.qq(\\n).'ERRNO='.(0+$!).qq(\\n); exit 77;",
-    ].join(" ");
     const networkProbe = inspectCommandExec(
       await client.request("command/exec", {
         ...common,
         command: [
-          "/usr/bin/perl",
-          "-MSocket",
-          "-e",
-          perlSocketProbe,
+          "/usr/bin/nc",
+          "-4",
+          "-n",
+          "-O",
+          "-G",
+          "1",
+          "-v",
+          "-z",
           "127.0.0.1",
           String(loopback.port),
         ],
       }),
-      "Codex 工具网络权限负向 canary",
+      "Codex macOS 系统 nc 工具网络权限负向 canary",
     );
-    await Promise.resolve();
-    const errnoMatch = /^ERRNO=(\d+)$/m.exec(networkProbe.stdout);
-    const errno = errnoMatch ? Number(errnoMatch[1]) : null;
+    const delayedAccept = await loopback.waitForAcceptCount(
+      2,
+      Math.min(timeoutMs, 250),
+    );
+    const errno = macOsNcPermissionErrno(networkProbe, loopback.port);
     if (
-      networkProbe.exitCode !== 77 ||
-      !networkProbe.stdout.includes("CONNECTED=0\n") ||
       (errno !== 1 && errno !== 13) ||
+      delayedAccept ||
       loopback.acceptCount() !== 1
     ) {
       throw new Error(
@@ -749,7 +765,7 @@ async function runReadIsolationCanary(
     externalFileIdentityStable: true,
     commandIdentityStable: true,
     loopbackEndpointReachable: true,
-    perlSocketProbeAvailable: true,
+    systemNcProbeAvailable: true,
     toolNetworkPermissionDenied: true,
   };
 }
@@ -861,6 +877,7 @@ export async function runCodexAppServerLocalSmoke(
           requestTimeoutMs,
           dependencies.readIsolationStateDirAsserter ?? requireStateOutsideTemporaryRoots,
           dependencies.loopbackProbeFactory ?? createLoopbackProbe,
+          dependencies.canaryFileCreatedObserver ?? (() => undefined),
         )
       : null;
     const threadResponse = await client.threadStart({

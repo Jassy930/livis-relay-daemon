@@ -32,6 +32,7 @@ import {
 import { SecretStore } from "./secrets.ts";
 import { fetchDaemonStatus } from "./status-client.ts";
 import {
+  canonicalDaemonSocketPath,
   DaemonOfflineGuard,
   ProfileOperationGuard,
   rethrowAfterProfileOperationCleanup,
@@ -625,13 +626,26 @@ async function commandStatus(args: string[]): Promise<void> {
 }
 
 async function commandReleaseSession(args: string[]): Promise<void> {
-  const sessionKey = args.find((arg) => !arg.startsWith("--") && arg !== "session" && arg !== "release");
-  if (!sessionKey) {
+  const configPath = optionValue(args, "--config");
+  const positional: string[] = [];
+  for (let index = 2; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (argument === "--config") {
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith("--")) {
+      throw new Error(`session release 未知选项：${argument}`);
+    }
+    positional.push(argument);
+  }
+  if (positional.length !== 1) {
     throw new Error(
       "用法：session release <sessionKey>；执行前必须停止 daemon、备份状态，并确认旧执行进程与工具副作用均已退出；Codex recovery 会退役旧 thread 绑定",
     );
   }
-  const initial = await loadRelayConfig(optionValue(args, "--config"));
+  const sessionKey = positional[0]!;
+  const initial = await loadRelayConfig(configPath);
   const offlineGuard = await DaemonOfflineGuard.acquire(
     initial.config.connector.socketPath,
     initial.config.stateDir,
@@ -640,15 +654,19 @@ async function commandReleaseSession(args: string[]): Promise<void> {
   let receipt: SessionReleaseReceipt;
   try {
     const context = await loadContext(initial.path);
+    const canonicalStateDir = await realpath(context.config.stateDir);
     if (
-      await realpath(context.config.stateDir) !== await realpath(initial.config.stateDir) ||
-      resolve(context.config.connector.socketPath) !== offlineGuard.path
+      canonicalStateDir !== offlineGuard.canonicalStateDir ||
+      await canonicalDaemonSocketPath(
+        context.config.connector.socketPath,
+        context.config.stateDir,
+      ) !== offlineGuard.path
     ) {
       throw new Error("config stateDir 或 connector.socketPath 在 session release 门禁期间发生变化");
     }
     await offlineGuard.assertHeld();
     const store = new JobStore(
-      join(context.config.stateDir, "relay.db"),
+      join(offlineGuard.canonicalStateDir, "relay.db"),
       IdentityStore.scopeKey(context.identity),
       { legacyV4JobBackend: context.config.execution.legacyV4JobBackend ?? undefined },
     );

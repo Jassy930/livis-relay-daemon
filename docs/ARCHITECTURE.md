@@ -102,9 +102,10 @@ dev/ino/mode/link/内容摘要”。它在项目协作路径、daemon 重启与 
 同版本 binary 替换，并成为 execution attempt 账本中的执行环境锚点；最后一次 pathname
 复核到 `exec` 仍不是内核原子 CAS，不能宣称防住同一 OS 用户的外部并发改写。command
 或安全配置发生合法升级时，旧 session 不会被原地接管：启动会先 quarantine，操作者
-停机审阅并执行 `session release`。该命令先在 connector socket 路径取得 daemon offline
-guard，再由同一个 SQLite 事务返回实际退役的 backend 列表；被退役的 Codex session
-下一次启动创建新 thread，job/outbox 和旧 rollout 仍保留。
+停机审阅并执行 `session release`。该命令先在 canonical connector socket 路径取得 daemon offline
+guard，并固定同一 canonical state directory 打开 SQLite，再由同一个事务返回实际退役的
+backend 列表。旧 Codex 绑定会被退役；后续若成功到达 thread 物化阶段，必须创建新 thread，
+但 release 不保证下一次启动本身会成功。job/outbox 和旧 rollout 仍保留。
 
 fresh 数据库直接创建为 v7，v1-v6 数据库都在同一个 `BEGIN IMMEDIATE` 事务内完成版本
 读取、DDL、旧 `AckFailed` 恢复为 `Pending`、完整性与外键检查以及最终版本提交。版本

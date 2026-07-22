@@ -301,9 +301,9 @@ quarantine 边界后才可把 acknowledgement 设为 `true`。Codex 模式代码
 为 true、Codex 版本命中窗口、SQLite integrity 正常且无 quarantine。它不检查专用
 账号是否真的可创建 thread；最终还要由 `serve` 的 `account/read`、permission profile
 高风险 feature、thread sandbox 与 rollout 持久化回读共同放行。macOS/Codex 0.145.0
-的旧候选非临时基础读取负向 canary 与零 turn 重启恢复曾经通过；新增的 hardlink、command
-identity 与原始 TCP errno 组合 canary 仍因 sandbox 内 Perl/Socket 系统运行时不可读而
-失败关闭，尚未取得完整真实回执。完整 turn deadline 与同一 POSIX 进程组的 TERM/KILL
+的 fresh 非临时 canary 已完整通过基础读取、同卷外部牺牲文件 hardlink、command identity、
+系统 `nc -O` 精确 `EPERM` 与零 turn 重启恢复；该结果只覆盖当前 macOS/CLI/config 组合。
+完整 turn deadline 与同一 POSIX 进程组的 TERM/KILL
 收口已有代码和 fake 回归，但真实账号 turn、Linux/cgroup、资源配额、
 逃逸进程组后代和 LiViS App 回显仍未验收，因此本模式当前只用于受控开发，不得宣称
 生产上线。
@@ -330,16 +330,24 @@ bun run smoke:codex:app-server -- \
   --verify-read-isolation
 ```
 
-只有同时读回 `workspaceRead=true`、`workspaceWrite=true`、
-`codexHomeReadDenied=true`、`codexHomeWriteDenied=true`、
-`sensitiveEnvironmentHidden=true`、`workspaceHardlinkControlPassed=true`、
-`externalFileHardlinkDenied=true`、`externalFileIdentityStable=true`、
-`commandIdentityStable=true`、`loopbackEndpointReachable=true`、
-`perlSocketProbeAvailable=true`、`toolNetworkPermissionDenied=true`、
-`highRiskFeaturesDisabled=true` 和 `bundledSkillsDisabled=true` 才表示本机安全 probe 通过。
+只有同时满足下面三组条件，才表示本机安全 probe 通过：
+
+- 顶层 `ok=true`、`sentModelTurn=false`、`zeroTurnMaterialized=true`、
+  `zeroTurnResumeVerified=true`；
+- `safety` 精确读回 `cwdMatchesWorkspace=true`、`runtimeWorkspaceRootsMatch=true`、
+  `sandboxType=workspaceWrite`、`networkAccess=false`、`additionalWritableRoots=0`、
+  `approvalPolicy=never`、`highRiskFeaturesDisabled=true`、`bundledSkillsDisabled=true`；
+- `readIsolationCanary` 非空，且其中 `stateDirOutsideTemporaryRoots`、`workspaceRead`、
+  `workspaceWrite`、`agentHomeWrite`、`agentTmpWrite`、`agentEnvironmentPinned`、
+  `codexHomeReadDenied`、`codexHomeWriteDenied`、`hostHomeReadDenied`、`hostHomeWriteDenied`、
+  `hostTmpReadDenied`、`hostTmpWriteDenied`、`sensitiveEnvironmentHidden`、
+  `workspaceHardlinkControlPassed`、`externalFileHardlinkDenied`、
+  `externalFileIdentityStable`、`commandIdentityStable`、`loopbackEndpointReachable`、
+  `systemNcProbeAvailable`、`toolNetworkPermissionDenied` 全部为 `true`。
 hardlink 探针使用 workspace 外同卷牺牲文件，不触碰真实 Codex executable；网络探针要求
-Perl/Socket 原始 `connect` 精确返回 `EPERM/EACCES`，普通超时、其他 errno、TCP 命中或
-`/bin/ln`、Perl/Socket 缺失都按无法裁决失败。该命令不登录、不发送模型 turn，也不等于
+macOS 系统 `/usr/bin/nc -O` 的 stdout/stderr 与目标端点严格匹配，并精确返回
+`EPERM/EACCES`。普通超时、其他 errno、多余输出、TCP 命中或 `/bin/ln`、兼容 `nc -O`
+缺失都按无法裁决失败。该命令不登录、不发送模型 turn，也不等于
 真实 LiViS 功能闭环；用完后确认输出路径再删除。
 
 ## 7. 启动顺序
@@ -1309,15 +1317,24 @@ JobStore v7 与 protocol profile schema v1→v2 是两条独立迁移：profile 
 bun run src/index.ts session release '<sessionKey>'
 ```
 
-`session release` 会先在 connector socket 路径取得 daemon offline guard；运行中 daemon、
-遗留 socket/guard 或并发启动存在时拒绝继续。它不会回滚文件或外部系统副作用。对于存在
+`session release` 会先 canonicalize state directory 与 connector socket 父目录，再在该
+socket 路径取得 daemon offline guard，并固定 guard 对应的 canonical state directory 打开
+SQLite；macOS 的 `/var` 与 `/private/var` 等同一目录别名不会被误判为 config drift，配置
+symlink 在门禁后重定向也不会把数据库操作带到另一 target。运行中 daemon、遗留 socket/guard
+或并发启动存在时拒绝继续。
+它不会回滚文件或外部系统副作用。对于存在
 recovery 的 Codex backend，或没有 active/recovery 但因 command/security 等漂移进入
 quarantine 的 idle session，它会退役数据库中的旧 session/thread 绑定，而不是只清 active
-后恢复一个尾部可能漂移的旧 thread；仍有不可释放证据时失败关闭。旧 rollout、workspace、
+后恢复一个尾部可能漂移的旧 thread；同 session 下任何 backend 仍有未进入 recovery 的
+active evidence，recovery 锚点与 job 的 session/backend/lease/generation 不一致，或 recovery
+证据不可释放时都失败关闭。旧 rollout、workspace、
 job/outbox 不会删除。JSON 的 `retiredBackendSessions` 与
 `releasedQuarantineWithoutBackendSession` 由同一个 SQLite 事务生成；只有
 `codexBackendSessionRetired=true` 能精确表示旧 Codex row 已删除。不得把仅 quarantine
 释放解读成 ambiguous `thread/start` 外部副作用已撤销，也不得只为清状态跳过前四步。
+JSON 内容由退役事务计算，但 SQLite commit 后的 guard 复核、guard 删除与 stdout 写出不在
+该事务内；命令若在这些收口步骤失败，可能出现“数据库已退役但没有 JSON 回执”，此时必须
+先保留错误并只读核对数据库和 `status`，不能根据空 stdout 盲目重试。
 release 后必须再运行 `doctor --online`，确认无 quarantine，再启动 daemon 并从 `status`
 读回实际新建或恢复的 thread。
 

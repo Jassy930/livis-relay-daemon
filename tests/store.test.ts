@@ -1185,6 +1185,173 @@ describe("backend session durability", () => {
     expect(store.releaseSessionRecovery(sessionKey)).toBeFalse();
   });
 
+  test("显式 release 遇到同 session 的其他 backend active evidence 时保持全部隔离", () => {
+    const hermesBackend = "hermes";
+    store.ingest(incomingJob("hermes-live"), sessionKey, hermesBackend);
+    store.markAcked("hermes-live");
+
+    const codexClaimed = prepareRunningJob("codex-recovery");
+    store.markBackendInterrupted(
+      codexClaimed.jobId,
+      backend,
+      "lease-1",
+      codexClaimed.runGeneration,
+      null,
+      "codex transport disconnected",
+    );
+
+    // 正常 admission 禁止两个 backend 同时 claim 同一 session。这里仅在 jobs 中注入
+    // Hermes 正常使用的 active evidence，不伪造 backend_sessions row；旧版本、损坏
+    // 数据库或协作外 writer 留下这种状态时，release 仍必须失败关闭。
+    const fixtureDatabase = new Database(databasePath);
+    fixtureDatabase.exec("PRAGMA foreign_keys=ON;");
+    const activeInjected = fixtureDatabase
+      .query(`UPDATE jobs
+              SET status='Dispatching',connector_id=?,lease_id=?,run_generation=1
+              WHERE scope_key=? AND job_id=? AND status='Acked'`)
+      .run("hermes:process-1", "hermes-lease-1", "account:agent", "hermes-live");
+    expect(activeInjected.changes).toBe(1);
+    fixtureDatabase.close();
+
+    expect(store.releaseSessionRecoveryWithReceipt(sessionKey)).toEqual({
+      released: false,
+      retiredBackendSessions: [],
+      releasedQuarantineWithoutBackendSession: false,
+    });
+    expect(store.getBackendSession(backend, sessionKey)?.recoveryRequired).toBeTrue();
+    expect(store.getBackendSession(hermesBackend, sessionKey)).toBeNull();
+    expect(store.require("hermes-live")).toMatchObject({
+      status: "Dispatching",
+      connectorId: "hermes:process-1",
+      leaseId: "hermes-lease-1",
+    });
+    expect(store.getSessionQuarantine(sessionKey)).not.toBeNull();
+  });
+
+  for (const mismatch of [
+    {
+      label: "session",
+      evidenceSessionKey: "livis:unrelated-terminal",
+      evidenceBackend: backend,
+      evidenceLeaseId: "lease-1",
+      generationOffset: 0,
+    },
+    {
+      label: "backend",
+      evidenceSessionKey: sessionKey,
+      evidenceBackend: "hermes",
+      evidenceLeaseId: "lease-1",
+      generationOffset: 0,
+    },
+    {
+      label: "lease",
+      evidenceSessionKey: sessionKey,
+      evidenceBackend: backend,
+      evidenceLeaseId: "other-lease",
+      generationOffset: 0,
+    },
+    {
+      label: "run generation",
+      evidenceSessionKey: sessionKey,
+      evidenceBackend: backend,
+      evidenceLeaseId: "lease-1",
+      generationOffset: 1,
+    },
+  ] as const) {
+    test(`显式 release 拒绝 ${mismatch.label} 不匹配的损坏 recovery 锚点`, () => {
+      const claimed = prepareRunningJob(`codex-corrupt-${mismatch.label}`);
+      store.markBackendInterrupted(
+        claimed.jobId,
+        backend,
+        "lease-1",
+        claimed.runGeneration,
+        null,
+        "transport disconnected",
+      );
+      const evidenceJobId = `terminal-${mismatch.label}`;
+      store.ingest(
+        incomingJob(evidenceJobId),
+        mismatch.evidenceSessionKey,
+        mismatch.evidenceBackend,
+      );
+      expect(store.requestCancel(evidenceJobId)?.status).toBe("Cancelled");
+
+      // schema 的外键只约束 scope/job。损坏数据库或协作外 writer 仍可能让 recovery
+      // row 借用其他终态 job；release 必须逐项复核完整执行锚点。
+      const fixtureDatabase = new Database(databasePath);
+      fixtureDatabase.exec("PRAGMA foreign_keys=ON;");
+      const evidenceUpdated = fixtureDatabase
+        .query(`UPDATE jobs SET lease_id=?,run_generation=?
+                WHERE scope_key=? AND job_id=?`)
+        .run(
+          mismatch.evidenceLeaseId,
+          claimed.runGeneration + mismatch.generationOffset,
+          "account:agent",
+          evidenceJobId,
+        );
+      expect(evidenceUpdated.changes).toBe(1);
+      const corrupted = fixtureDatabase
+        .query(`UPDATE backend_sessions
+                SET active_job_id=?
+                WHERE scope_key=? AND backend=? AND session_key=? AND recovery_required=1`)
+        .run(evidenceJobId, "account:agent", backend, sessionKey);
+      expect(corrupted.changes).toBe(1);
+      fixtureDatabase.close();
+
+      expect(store.releaseBackendSessionRecovery(backend, sessionKey)).toBeFalse();
+      expect(store.releaseSessionRecoveryWithReceipt(sessionKey)).toEqual({
+        released: false,
+        retiredBackendSessions: [],
+        releasedQuarantineWithoutBackendSession: false,
+      });
+      expect(store.getBackendSession(backend, sessionKey)).toMatchObject({
+        activeJobId: evidenceJobId,
+        recoveryRequired: true,
+      });
+      expect(store.getSessionQuarantine(sessionKey)).not.toBeNull();
+    });
+  }
+
+  test("显式 release 的 SQLite 删除异常会回滚 backend 退役与 quarantine", () => {
+    const claimed = prepareRunningJob("release-rollback");
+    store.markBackendInterrupted(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      null,
+      "transport disconnected",
+    );
+    const triggerDatabase = new Database(databasePath);
+    triggerDatabase.exec(`
+      CREATE TRIGGER fail_session_release_quarantine
+      BEFORE DELETE ON session_quarantine
+      BEGIN
+        SELECT RAISE(ABORT, 'synthetic session release failure');
+      END;
+    `);
+    triggerDatabase.close();
+
+    expect(() => store.releaseSessionRecoveryWithReceipt(sessionKey))
+      .toThrow("synthetic session release failure");
+    expect(store.getBackendSession(backend, sessionKey)).toMatchObject({
+      activeJobId: claimed.jobId,
+      recoveryRequired: true,
+    });
+    expect(store.getSessionQuarantine(sessionKey)).not.toBeNull();
+
+    const cleanupDatabase = new Database(databasePath);
+    cleanupDatabase.exec("DROP TRIGGER fail_session_release_quarantine;");
+    cleanupDatabase.close();
+    expect(store.releaseSessionRecoveryWithReceipt(sessionKey)).toEqual({
+      released: true,
+      retiredBackendSessions: [backend],
+      releasedQuarantineWithoutBackendSession: false,
+    });
+    expect(store.getBackendSession(backend, sessionKey)).toBeNull();
+    expect(store.getSessionQuarantine(sessionKey)).toBeNull();
+  });
+
   test("显式 release 会退役无 active/recovery 的 quarantined idle session", () => {
     ensureSession();
     store.bindBackendThread(backend, sessionKey, "thread-idle-drift");

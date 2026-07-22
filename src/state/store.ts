@@ -1400,6 +1400,10 @@ export class JobStore {
                     SELECT 1 FROM jobs
                     WHERE jobs.scope_key=backend_sessions.scope_key
                       AND jobs.job_id=backend_sessions.active_job_id
+                      AND jobs.session_key=backend_sessions.session_key
+                      AND jobs.target_backend=backend_sessions.backend
+                      AND jobs.lease_id=backend_sessions.active_lease_id
+                      AND jobs.run_generation=backend_sessions.active_run_generation
                       AND jobs.status IN (
                         'Succeeded','Cancelled','CancelUnknown','Interrupted','Failed','Rejected'
                       )
@@ -1434,6 +1438,20 @@ export class JobStore {
         )
         .all(this.scopeKey, sessionKey)
         .map((row) => row.backend);
+      const activeJobs = this.database
+        .query<{ count: number }, [string, string]>(
+          `SELECT COUNT(*) AS count FROM jobs
+           WHERE scope_key=? AND session_key=?
+             AND status IN ('Dispatching','Running','Cancelling')`,
+        )
+        .get(this.scopeKey, sessionKey)?.count ?? 0;
+      if (activeJobs !== 0) {
+        return {
+          released: false,
+          retiredBackendSessions: [],
+          releasedQuarantineWithoutBackendSession: false,
+        };
+      }
       const recovery = this.database
         .query<{ total: number; releasable: number }, [string, string]>(
           `SELECT COUNT(*) AS total,
@@ -1441,6 +1459,10 @@ export class JobStore {
                     SELECT 1 FROM jobs
                     WHERE jobs.scope_key=backend_sessions.scope_key
                       AND jobs.job_id=backend_sessions.active_job_id
+                      AND jobs.session_key=backend_sessions.session_key
+                      AND jobs.target_backend=backend_sessions.backend
+                      AND jobs.lease_id=backend_sessions.active_lease_id
+                      AND jobs.run_generation=backend_sessions.active_run_generation
                       AND jobs.status IN (
                         'Succeeded','Cancelled','CancelUnknown','Interrupted','Failed','Rejected'
                       )
@@ -1497,6 +1519,21 @@ export class JobStore {
         };
       }
       if (recovery.releasable !== recovery.total) {
+        return {
+          released: false,
+          retiredBackendSessions: [],
+          releasedQuarantineWithoutBackendSession: false,
+        };
+      }
+
+      const activeWithoutRecovery = this.database
+        .query<{ count: number }, [string, string]>(
+          `SELECT COUNT(*) AS count FROM backend_sessions
+           WHERE scope_key=? AND session_key=?
+             AND active_job_id IS NOT NULL AND recovery_required=0`,
+        )
+        .get(this.scopeKey, sessionKey)?.count ?? 0;
+      if (activeWithoutRecovery !== 0) {
         return {
           released: false,
           retiredBackendSessions: [],

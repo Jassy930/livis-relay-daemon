@@ -257,6 +257,7 @@ function parseOfflineGuard(text: string, path: string): OfflineGuardDocument {
 export class DaemonOfflineGuard {
   private constructor(
     readonly path: string,
+    readonly canonicalStateDir: string,
     readonly document: OfflineGuardDocument,
     private readonly lease: GuardFileLease,
   ) {}
@@ -267,15 +268,7 @@ export class DaemonOfflineGuard {
     operation: OfflineGuardDocument["operation"],
   ): Promise<DaemonOfflineGuard> {
     const canonicalStateDir = await requirePrivateDirectory(stateDir, "offline guard stateDir");
-    const requestedSocketPath = resolve(socketPath);
-    const canonicalSocketDirectory = await requirePrivateDirectory(
-      dirname(requestedSocketPath),
-      "connector socket parent directory",
-    );
-    if (!isWithin(canonicalStateDir, canonicalSocketDirectory)) {
-      throw new Error("connector socket parent directory 必须位于私有 stateDir 内");
-    }
-    const canonicalSocketPath = join(canonicalSocketDirectory, basename(requestedSocketPath));
+    const canonicalSocketPath = await canonicalDaemonSocketPath(socketPath, canonicalStateDir);
     const document: OfflineGuardDocument = {
       schemaVersion: 1,
       kind: "livis-relay-offline-guard",
@@ -289,7 +282,7 @@ export class DaemonOfflineGuard {
       `${JSON.stringify(document, null, 2)}\n`,
       `connector socket 路径已存在：${canonicalSocketPath}；必须先停止 daemon，并人工确认没有遗留 socket/guard`,
     );
-    return new DaemonOfflineGuard(canonicalSocketPath, document, lease);
+    return new DaemonOfflineGuard(canonicalSocketPath, canonicalStateDir, document, lease);
   }
 
   async assertHeld(): Promise<void> {
@@ -309,6 +302,27 @@ export class DaemonOfflineGuard {
     }
     await finishGuardRelease(this.path, this.lease);
   }
+}
+
+/**
+ * 使用和 offline guard 创建完全相同的规则 canonicalize connector socket。
+ * 调用方不得用 resolve() 的字面结果与 guard.path 比较；macOS 的 /var 与
+ * /private/var 等路径别名会把同一个目录误判成配置漂移。
+ */
+export async function canonicalDaemonSocketPath(
+  socketPath: string,
+  stateDir: string,
+): Promise<string> {
+  const canonicalStateDir = await requirePrivateDirectory(stateDir, "offline guard stateDir");
+  const requestedSocketPath = resolve(socketPath);
+  const canonicalSocketDirectory = await requirePrivateDirectory(
+    dirname(requestedSocketPath),
+    "connector socket parent directory",
+  );
+  if (!isWithin(canonicalStateDir, canonicalSocketDirectory)) {
+    throw new Error("connector socket parent directory 必须位于私有 stateDir 内");
+  }
+  return join(canonicalSocketDirectory, basename(requestedSocketPath));
 }
 
 export type ProfileOperation =

@@ -737,7 +737,19 @@ type ReadIsolationScenario = {
     | "wrong-target"
     | "create-fails"
     | "denied-command-drift";
-  network: "eperm" | "eacces" | "connected" | "other-errno" | "timeout" | "perl-unavailable";
+  network:
+    | "eperm"
+    | "eacces"
+    | "connected"
+    | "delayed-connected"
+    | "other-errno"
+    | "timeout"
+    | "nc-unavailable"
+    | "extra-stderr"
+    | "host-control-fails"
+    | "stdout-noise"
+    | "wrong-endpoint";
+  useDefaultStateDirAsserter?: boolean;
 };
 
 async function createReadIsolationSmokeHarness(scenario: ReadIsolationScenario): Promise<{
@@ -745,6 +757,7 @@ async function createReadIsolationSmokeHarness(scenario: ReadIsolationScenario):
   stateDir: string;
   networkPort: () => number | null;
   loopbackStopped: () => boolean;
+  createdCanaryPaths: () => readonly string[];
   cleanup: () => Promise<void>;
 }> {
   const commandDirectory = await temporaryDirectory("livis-codex-smoke-command-");
@@ -759,6 +772,7 @@ async function createReadIsolationSmokeHarness(scenario: ReadIsolationScenario):
   let observedNetworkPort: number | null = null;
   let loopbackAccepts = 0;
   let loopbackStopped = false;
+  const createdCanaryPaths: string[] = [];
   freshFake.commandExecHandler = async (params) => {
     const argv = Array.isArray(params.command) && params.command.every((item) => typeof item === "string")
       ? params.command as string[]
@@ -812,27 +826,55 @@ async function createReadIsolationSmokeHarness(scenario: ReadIsolationScenario):
       }
       return { exitCode: 1, stdout: "", stderr: "Operation not permitted" };
     }
-    if (executable === "/usr/bin/perl") {
-      const program = argv[3] ?? "";
-      if (program.includes("PERL_SOCKET_OK")) {
-        if (scenario.network === "perl-unavailable") {
-          return { exitCode: 127, stdout: "", stderr: "Can't locate Socket.pm" };
-        }
-        return { exitCode: 0, stdout: "PERL_SOCKET_OK\n", stderr: "" };
+    if (executable === "/usr/bin/nc") {
+      if (
+        JSON.stringify(argv.slice(0, -2)) !== JSON.stringify([
+          "/usr/bin/nc",
+          "-4",
+          "-n",
+          "-O",
+          "-G",
+          "1",
+          "-v",
+          "-z",
+        ]) ||
+        argv.at(-2) !== "127.0.0.1"
+      ) {
+        throw new Error(`fake app-server 收到不安全的 nc argv：${JSON.stringify(argv)}`);
       }
       observedNetworkPort = Number(argv.at(-1));
       if (scenario.network === "connected") {
         loopbackAccepts += 1;
-        return { exitCode: 0, stdout: "CONNECTED=1\n", stderr: "" };
+        return { exitCode: 0, stdout: "", stderr: "Connection succeeded\n" };
       }
       if (scenario.network === "timeout") {
         return { exitCode: 124, stdout: "", stderr: "synthetic timeout" };
       }
-      const errno = scenario.network === "eperm" ? 1 : scenario.network === "eacces" ? 13 : 60;
+      if (scenario.network === "nc-unavailable") {
+        return { exitCode: 127, stdout: "", stderr: "/usr/bin/nc: not found\n" };
+      }
+      const errno = scenario.network === "eacces"
+        ? 13
+        : scenario.network === "other-errno"
+          ? 61
+          : 1;
+      const outputPort = scenario.network === "wrong-endpoint"
+        ? observedNetworkPort + 1
+        : observedNetworkPort;
+      const errorText = errno === 1
+        ? "Operation not permitted"
+        : errno === 13
+          ? "Permission denied"
+          : "Connection refused";
+      let stderr =
+        `nc: connect to 127.0.0.1 port ${outputPort} (tcp) failed: ${errorText}\n`;
+      if (scenario.network === "extra-stderr") stderr += "unexpected extra output\n";
       return {
-        exitCode: 77,
-        stdout: `CONNECTED=0\nERRNO=${errno}\n`,
-        stderr: "",
+        exitCode: 1,
+        stdout: scenario.network === "stdout-noise"
+          ? `unexpected stdout\nerror = 0 ${errno} \n`
+          : `error = 0 ${errno} \n`,
+        stderr,
       };
     }
     throw new Error(`fake app-server 收到未覆盖的 command/exec：${JSON.stringify(argv)}`);
@@ -856,22 +898,35 @@ async function createReadIsolationSmokeHarness(scenario: ReadIsolationScenario):
     }, {
       appServerSpawn: smokeSpawn,
       commandRunner: successfulVersion,
-      readIsolationStateDirAsserter: async () => undefined,
+      ...(scenario.useDefaultStateDirAsserter === true
+        ? {}
+        : { readIsolationStateDirAsserter: async () => undefined }),
       loopbackProbeFactory: () => ({
         port: 43_123,
         acceptCount: () => loopbackAccepts,
         connectControl: async () => {
-          loopbackAccepts += 1;
+          if (scenario.network !== "host-control-fails") loopbackAccepts += 1;
         },
-        waitForAcceptCount: async (expected) => loopbackAccepts >= expected,
+        waitForAcceptCount: async (expected) => {
+          if (
+            scenario.network === "delayed-connected" &&
+            expected === 2 &&
+            loopbackAccepts === 1
+          ) {
+            loopbackAccepts += 1;
+          }
+          return loopbackAccepts >= expected;
+        },
         stop: () => {
           loopbackStopped = true;
         },
       }),
+      canaryFileCreatedObserver: (path) => createdCanaryPaths.push(path),
     }),
     stateDir,
     networkPort: () => observedNetworkPort,
     loopbackStopped: () => loopbackStopped,
+    createdCanaryPaths: () => createdCanaryPaths,
     cleanup: async () => {
       await Promise.all([freshFake.stop(0), resumedFake.stop(0)]);
       await Promise.all([commandDirectory.cleanup(), stateParent.cleanup()]);
@@ -983,7 +1038,7 @@ describe("CodexExecutionBackend", () => {
           externalFileIdentityStable: true,
           commandIdentityStable: true,
           loopbackEndpointReachable: true,
-          perlSocketProbeAvailable: true,
+          systemNcProbeAvailable: true,
           toolNetworkPermissionDenied: true,
         });
         expect(await listHardlinkCanaryFiles(harness.stateDir)).toEqual([]);
@@ -1012,7 +1067,9 @@ describe("CodexExecutionBackend", () => {
       network: "eperm",
     });
     try {
-      await expect(harness.run()).rejects.toThrow();
+      await expect(harness.run()).rejects.toThrow("ENOTDIR");
+      expect(harness.createdCanaryPaths()).toHaveLength(1);
+      expect(harness.createdCanaryPaths()[0]).toContain(".livis-hardlink-control-source-");
       expect(await listHardlinkCanaryFiles(harness.stateDir)).toEqual([]);
     } finally {
       await harness.cleanup();
@@ -1049,8 +1106,16 @@ describe("CodexExecutionBackend", () => {
     }
   });
 
-  test("读取隔离 smoke 拒绝 TCP 命中与普通网络 errno", async () => {
-    for (const network of ["connected", "other-errno", "timeout"] as const) {
+  test("读取隔离 smoke 拒绝 TCP 命中、延迟命中、普通 errno 与不完整 nc 输出", async () => {
+    for (const network of [
+      "connected",
+      "delayed-connected",
+      "other-errno",
+      "timeout",
+      "extra-stderr",
+      "stdout-noise",
+      "wrong-endpoint",
+    ] as const) {
       const harness = await createReadIsolationSmokeHarness({
         externalHardlink: "denied",
         network,
@@ -1066,13 +1131,43 @@ describe("CodexExecutionBackend", () => {
     }
   });
 
-  test("读取隔离 smoke 在 Perl/Socket 不可用时拒绝裁决", async () => {
+  test("读取隔离 smoke 在系统 nc 不可用时拒绝裁决", async () => {
     const harness = await createReadIsolationSmokeHarness({
       externalHardlink: "denied",
-      network: "perl-unavailable",
+      network: "nc-unavailable",
     });
     try {
-      await expect(harness.run()).rejects.toThrow("Perl/Socket 正向 control 失败");
+      await expect(harness.run()).rejects.toThrow("未得到明确 EPERM/EACCES");
+      expect(harness.loopbackStopped()).toBeTrue();
+      expect(await listHardlinkCanaryFiles(harness.stateDir)).toEqual([]);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("读取隔离 smoke 默认拒绝系统临时目录", async () => {
+    const harness = await createReadIsolationSmokeHarness({
+      externalHardlink: "denied",
+      network: "eperm",
+      useDefaultStateDirAsserter: true,
+    });
+    try {
+      await expect(harness.run()).rejects.toThrow("不能位于系统临时目录");
+      expect(harness.createdCanaryPaths()).toEqual([]);
+      expect(await listHardlinkCanaryFiles(harness.stateDir)).toEqual([]);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("读取隔离 smoke 在 host loopback 正向 control 失败时拒绝裁决并关闭 listener", async () => {
+    const harness = await createReadIsolationSmokeHarness({
+      externalHardlink: "denied",
+      network: "host-control-fails",
+    });
+    try {
+      await expect(harness.run()).rejects.toThrow("host TCP 正向 control 失败");
+      expect(harness.networkPort()).toBeNull();
       expect(harness.loopbackStopped()).toBeTrue();
       expect(await listHardlinkCanaryFiles(harness.stateDir)).toEqual([]);
     } finally {
