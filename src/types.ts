@@ -64,6 +64,7 @@ export interface StoredOutbox {
   resultJson: string;
   retryCount: number;
   lastMessageId: string | null;
+  nextAttemptAt: number | null;
   createdAt: number;
   updatedAt: number;
   deliveredAt: number | null;

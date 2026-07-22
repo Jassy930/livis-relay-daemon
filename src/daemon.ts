@@ -10,12 +10,17 @@ import type { ProtocolProfile } from "./protocol/profile.ts";
 import { RelayClient, type RelayClientHandlers } from "./relay/client.ts";
 import { SecretStore, type RelaySecrets } from "./secrets.ts";
 import { JobConflictError, JobStore } from "./state/store.ts";
+import {
+  ProfileOperationGuard,
+  ProfileOperationGuardBusyError,
+} from "./state/offline-guard.ts";
 import type { ConnectorHello, ConnectorInboundMessage, RelayEnvelope, StoredJob } from "./types.ts";
 import { UpstreamChecker } from "./upstream/checker.ts";
 import { saveSupportedProof } from "./upstream/proof.ts";
 
 export const DAEMON_VERSION = "0.1.0";
 const UPSTREAM_RECHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const UPSTREAM_PROOF_EXPIRED_REASON = "supported proof 已过期；必须在线复核通过后才能继续派发";
 
 export interface RelayDaemonDependencies {
   config: RelayConfig;
@@ -25,13 +30,28 @@ export interface RelayDaemonDependencies {
   secretValues: RelaySecrets;
   upstreamProofExpiresAt: number;
   logger?: Logger;
+  /** 仅用于 deterministic deadline 测试；生产调用不传。 */
+  testHooks?: RelayDaemonTestHooks;
+}
+
+export interface RelayDaemonTestHooks {
+  now?: () => number;
+  setProofExpiryTimer?: (
+    callback: () => void,
+    delayMs: number,
+  ) => ReturnType<typeof setTimeout>;
+  clearProofExpiryTimer?: (timer: ReturnType<typeof setTimeout>) => void;
 }
 
 export class RelayDaemon {
   private stopping = false;
   private upstreamTimer: ReturnType<typeof setInterval> | null = null;
-  private upstreamCheckRunning = false;
+  private upstreamExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+  private upstreamCheckPromise: Promise<void> | null = null;
+  private upstreamBlockPromise: Promise<void> | null = null;
+  private stopPromise: Promise<void> | null = null;
   private upstreamBlocked: string | null = null;
+  private upstreamRelayStopped = false;
 
   private constructor(
     private readonly config: RelayConfig,
@@ -43,6 +63,7 @@ export class RelayDaemon {
     private readonly logger: Logger,
     private upstreamProofExpiresAt: number,
     private readonly upstreamChecker: UpstreamChecker,
+    private readonly testHooks?: RelayDaemonTestHooks,
   ) {}
 
   static create(dependencies: RelayDaemonDependencies): RelayDaemon {
@@ -104,6 +125,7 @@ export class RelayDaemon {
       logger,
       dependencies.upstreamProofExpiresAt,
       new UpstreamChecker(),
+      dependencies.testHooks,
     );
     return daemon;
   }
@@ -117,22 +139,48 @@ export class RelayDaemon {
     const recovery = this.store.recoverAfterRestart();
     this.logger.info("SQLite 恢复完成", recovery);
     this.connector.start();
-    this.relay.start();
+    if (this.armUpstreamProofExpiry()) {
+      this.relay.start();
+    }
     this.upstreamTimer = setInterval(() => {
-      void this.recheckUpstream();
+      void this.recheckUpstream().catch((error) => {
+        if (!this.stopping) {
+          this.logger.error("官方 upstream 周期复核异常退出", { error: errorMessage(error) });
+        }
+      });
     }, UPSTREAM_RECHECK_INTERVAL_MS);
     this.upstreamTimer.unref?.();
   }
 
-  async stop(): Promise<void> {
-    if (this.stopping) return;
+  stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
     this.stopping = true;
     if (this.upstreamTimer) clearInterval(this.upstreamTimer);
     this.upstreamTimer = null;
-    this.connector.stop();
-    await this.relay.stop();
-    this.store.close();
-    this.logger.info("daemon 已停止");
+    this.clearUpstreamProofExpiryTimer();
+    const upstreamCheckPromise = this.upstreamCheckPromise;
+    const upstreamBlockPromise = this.upstreamBlockPromise;
+    this.stopPromise = (async () => {
+      const results = await Promise.allSettled([
+        Promise.resolve().then(() => this.connector.stop()),
+        Promise.resolve().then(() => this.relay.stop()),
+        upstreamCheckPromise ?? Promise.resolve(),
+        upstreamBlockPromise ?? Promise.resolve(),
+      ]);
+      const failures = results
+        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+        .map((result) => result.reason);
+      try {
+        this.store.close();
+      } catch (error) {
+        failures.push(error);
+      }
+      this.logger.info("daemon 已停止");
+      if (failures.length > 0) {
+        throw new AggregateError(failures, "daemon 停止期间存在未完成的清理错误");
+      }
+    })();
+    return this.stopPromise;
   }
 
   status(): Record<string, unknown> {
@@ -154,6 +202,7 @@ export class RelayDaemon {
         jobId: job.jobId,
         status: job.status,
         outboxStatus: job.outbox?.status ?? null,
+        outboxNextAttemptAt: job.outbox?.nextAttemptAt ?? null,
         runGeneration: job.runGeneration,
         updatedAt: job.updatedAt,
       })),
@@ -165,6 +214,18 @@ export class RelayDaemon {
   }
 
   private async onRelayIncoming(envelope: RelayEnvelope): Promise<void> {
+    if (this.stopping) {
+      throw new Error("daemon 正在停止，拒绝接收新 job");
+    }
+    if (this.isUpstreamProofExpired()) {
+      await this.blockForUpstream(UPSTREAM_PROOF_EXPIRED_REASON);
+      throw new Error(UPSTREAM_PROOF_EXPIRED_REASON);
+    }
+    if (this.upstreamBlocked) {
+      const reason = this.upstreamBlocked;
+      await this.blockForUpstream(reason);
+      throw new Error(`upstream 门禁已关闭，拒绝接收新 job：${reason}`);
+    }
     const incoming = parseIncomingRelayJob(envelope, this.config.security.maxInputChars);
     const sessionKey = `livis:${this.identity.agentId}`;
     let job: StoredJob;
@@ -211,7 +272,10 @@ export class RelayDaemon {
   }
 
   private async onRelayConnected(): Promise<void> {
-    await this.dispatchPending();
+    // RelayClient.connectOnce() 会 await 此回调；这里不能反向 await
+    // relay.stop()（stop 又会等待 connectOnce 所属的 runPromise）。门禁仍
+    // 同步设置并立即发起 stop，只把“等待完全停止”留给回调之外的调用者。
+    await this.dispatchPending(false);
   }
 
   private async onConnectorReady(_hello: ConnectorHello): Promise<void> {
@@ -300,12 +364,30 @@ export class RelayDaemon {
     }
   }
 
-  private async dispatchPending(): Promise<void> {
-    if (!this.connector.ready || this.upstreamBlocked) return;
+  private async dispatchPending(waitForRelayStop = true): Promise<void> {
+    if (this.stopping) return;
+    if (this.isUpstreamProofExpired()) {
+      await this.beginUpstreamBlock(UPSTREAM_PROOF_EXPIRED_REASON, waitForRelayStop);
+      return;
+    }
+    if (this.upstreamBlocked) {
+      await this.beginUpstreamBlock(this.upstreamBlocked, waitForRelayStop);
+      return;
+    }
+    if (!this.connector.ready) return;
     for (const candidate of this.store.listDispatchable()) {
+      if (this.isUpstreamProofExpired()) {
+        await this.beginUpstreamBlock(UPSTREAM_PROOF_EXPIRED_REASON, waitForRelayStop);
+        return;
+      }
       const leaseId = crypto.randomUUID();
       const claimed = this.store.claimForDispatch(candidate.jobId, this.connector.connectorId!, leaseId);
       if (!claimed) continue;
+      if (this.isUpstreamProofExpired()) {
+        this.store.resetUnsentDispatch(claimed.jobId, leaseId);
+        await this.beginUpstreamBlock(UPSTREAM_PROOF_EXPIRED_REASON, waitForRelayStop);
+        return;
+      }
       if (!this.connector.sendJob(claimed)) {
         this.store.resetUnsentDispatch(claimed.jobId, leaseId);
         break;
@@ -317,55 +399,242 @@ export class RelayDaemon {
     return this.config.security.allowAllNodes || this.config.security.allowedNodeIds.includes(nodeId);
   }
 
-  private async recheckUpstream(): Promise<void> {
-    if (this.stopping || this.upstreamCheckRunning) return;
-    this.upstreamCheckRunning = true;
+  private recheckUpstream(): Promise<void> {
+    if (this.stopping) return Promise.resolve();
+    if (this.upstreamCheckPromise) return this.upstreamCheckPromise;
+    let running!: Promise<void>;
+    running = this.runUpstreamRecheck().finally(() => {
+      if (this.upstreamCheckPromise === running) {
+        this.upstreamCheckPromise = null;
+      }
+    });
+    this.upstreamCheckPromise = running;
+    return running;
+  }
+
+  private async runUpstreamRecheck(): Promise<void> {
+    let guardReleaseFailed = false;
+    let upstreamStopAttempted = false;
+    const stopForUpstream = (reason: string): Promise<void> => {
+      upstreamStopAttempted = true;
+      return this.blockForUpstream(reason);
+    };
     try {
-      const snapshot = await this.upstreamChecker.check(this.profile, [this.profile]);
-      if (snapshot.compatibility !== "supported") {
-        await this.blockForUpstream(`官方 upstream 兼容状态变为 ${snapshot.compatibility}`);
+      let guard: ProfileOperationGuard;
+      try {
+        guard = await ProfileOperationGuard.acquire(this.config.stateDir, "upstream-check");
+      } catch (error) {
+        if (this.stopping) return;
+        if (error instanceof ProfileOperationGuardBusyError) {
+          if (this.isUpstreamProofExpired()) {
+            await stopForUpstream(
+              "profile operation guard 被占用且 supported proof 已过期",
+            );
+            return;
+          }
+          if (this.upstreamBlocked && !this.upstreamRelayStopped) {
+            await stopForUpstream(this.upstreamBlocked);
+          }
+          this.logger.info("官方 upstream 周期复核因 profile operation guard 被占用而跳过", {
+            guardPath: error.path,
+            proofExpiresAt: new Date(this.upstreamProofExpiresAt).toISOString(),
+          });
+          return;
+        }
+        throw error;
+      }
+      let workFailed = false;
+      let workError: unknown;
+      try {
+        if (this.stopping) return;
+        if (this.upstreamBlocked && !this.upstreamRelayStopped) {
+          await stopForUpstream(this.upstreamBlocked);
+          if (this.stopping) return;
+        }
+        const snapshot = await this.upstreamChecker.check(this.profile, [this.profile]);
+        if (this.stopping) return;
+        if (snapshot.compatibility !== "supported") {
+          await stopForUpstream(`官方 upstream 兼容状态变为 ${snapshot.compatibility}`);
+          return;
+        }
+        const saved = await saveSupportedProof({
+          stateDir: this.config.stateDir,
+          profile: this.profile,
+          profileSha256: this.config.profileSha256,
+          snapshot,
+          now: this.now(),
+        }, guard);
+        if (this.stopping) return;
+        this.upstreamProofExpiresAt = Date.parse(saved.proof.expiresAt);
+        if (!this.armUpstreamProofExpiry()) return;
+        if (this.upstreamBlocked) {
+          // 门禁关闭可能只是 CDN 抖动导致复核失败；恢复 supported 后自动
+          // 解除，避免必须重启进程。
+          const reason = this.upstreamBlocked;
+          // expiry timer 可能正在停止 relay；等待同一 stop 完成后再清门禁，
+          // 避免 stop/start 交错后留下已解锁但未运行的 client。
+          await stopForUpstream(reason);
+          if (this.stopping) return;
+          if (this.isUpstreamProofExpired()) {
+            this.clearUpstreamProofExpiryTimer();
+            this.upstreamBlocked = UPSTREAM_PROOF_EXPIRED_REASON;
+            this.logger.error("在线复核生成的新 proof 在 relay 停止期间已过期，保持 upstream 门禁关闭", {
+              expiresAt: new Date(this.upstreamProofExpiresAt).toISOString(),
+            });
+            return;
+          }
+          this.upstreamBlocked = null;
+          this.upstreamRelayStopped = false;
+          this.logger.info("官方 upstream 门禁恢复，重新连接 LiViS relay", { previousReason: reason });
+          this.relay.start();
+          await this.dispatchPending();
+          if (this.stopping) return;
+        }
+        this.logger.info("官方 upstream 周期复核通过", {
+          profile: this.profile.id,
+          expiresAt: saved.proof.expiresAt,
+        });
+      } catch (error) {
+        workFailed = true;
+        workError = error;
+        throw error;
+      } finally {
+        try {
+          await guard.release();
+        } catch (releaseError) {
+          guardReleaseFailed = true;
+          if (workFailed) {
+            throw new AggregateError(
+              [workError, releaseError],
+              "daemon upstream 复核失败且 ProfileOperationGuard 无法释放",
+              { cause: workError },
+            );
+          }
+          throw releaseError;
+        }
+      }
+    } catch (error) {
+      if (this.stopping) {
+        if (guardReleaseFailed) throw error;
         return;
       }
-      const saved = await saveSupportedProof({
-        stateDir: this.config.stateDir,
-        profile: this.profile,
-        profileSha256: this.config.profileSha256,
-        snapshot,
-      });
-      this.upstreamProofExpiresAt = Date.parse(saved.proof.expiresAt);
       if (this.upstreamBlocked) {
-        // 门禁关闭可能只是 CDN 抖动导致复核失败；恢复 supported 后自动
-        // 解除，避免必须重启进程。
-        const reason = this.upstreamBlocked;
-        this.upstreamBlocked = null;
-        this.logger.info("官方 upstream 门禁恢复，重新连接 LiViS relay", { previousReason: reason });
-        this.relay.start();
-        await this.dispatchPending();
-      }
-      this.logger.info("官方 upstream 周期复核通过", {
-        profile: this.profile.id,
-        expiresAt: saved.proof.expiresAt,
-      });
-    } catch (error) {
-      if (this.upstreamBlocked) {
+        if (!upstreamStopAttempted && !this.upstreamRelayStopped) {
+          try {
+            await stopForUpstream(this.upstreamBlocked);
+          } catch (stopError) {
+            this.logger.warn("官方 upstream 门禁保持关闭，复核与 relay 停止均失败", {
+              error: errorMessage(error),
+              stopError: errorMessage(stopError),
+            });
+            return;
+          }
+        }
         this.logger.warn("官方 upstream 门禁保持关闭，复核仍失败", { error: errorMessage(error) });
-      } else if (Date.now() >= this.upstreamProofExpiresAt) {
-        await this.blockForUpstream(`在线复核失败且 supported proof 已过期：${errorMessage(error)}`);
+      } else if (this.isUpstreamProofExpired()) {
+        await stopForUpstream(`在线复核失败且 supported proof 已过期：${errorMessage(error)}`);
       } else {
         this.logger.warn("官方 upstream 周期复核失败，暂用未过期证明", {
           error: errorMessage(error),
           proofExpiresAt: new Date(this.upstreamProofExpiresAt).toISOString(),
         });
       }
-    } finally {
-      this.upstreamCheckRunning = false;
     }
   }
 
-  private async blockForUpstream(reason: string): Promise<void> {
-    if (this.upstreamBlocked) return;
-    this.upstreamBlocked = reason;
-    this.logger.error("官方 upstream 门禁关闭：停止新 job 并断开 LiViS relay", { reason });
-    await this.relay.stop();
+  private now(): number {
+    return this.testHooks?.now?.() ?? Date.now();
+  }
+
+  private isUpstreamProofExpired(now = this.now()): boolean {
+    return !Number.isFinite(this.upstreamProofExpiresAt) || now >= this.upstreamProofExpiresAt;
+  }
+
+  private clearUpstreamProofExpiryTimer(): void {
+    if (this.upstreamExpiryTimer) {
+      if (this.testHooks?.clearProofExpiryTimer) {
+        this.testHooks.clearProofExpiryTimer(this.upstreamExpiryTimer);
+      } else {
+        clearTimeout(this.upstreamExpiryTimer);
+      }
+    }
+    this.upstreamExpiryTimer = null;
+  }
+
+  private armUpstreamProofExpiry(): boolean {
+    this.clearUpstreamProofExpiryTimer();
+    if (this.stopping) return false;
+    const delayMs = this.upstreamProofExpiresAt - this.now();
+    if (!Number.isFinite(delayMs) || delayMs <= 0) {
+      void this.blockForUpstream(UPSTREAM_PROOF_EXPIRED_REASON).catch((error) => {
+        if (!this.stopping) {
+          this.logger.error("supported proof 到期关闭 relay 失败", { error: errorMessage(error) });
+        }
+      });
+      return false;
+    }
+    const onExpired = () => {
+      this.upstreamExpiryTimer = null;
+      void this.blockForUpstream(UPSTREAM_PROOF_EXPIRED_REASON).catch((error) => {
+        if (!this.stopping) {
+          this.logger.error("supported proof 到期关闭 relay 失败", { error: errorMessage(error) });
+        }
+      });
+    };
+    this.upstreamExpiryTimer = this.testHooks?.setProofExpiryTimer
+      ? this.testHooks.setProofExpiryTimer(onExpired, delayMs)
+      : setTimeout(onExpired, delayMs);
+    this.upstreamExpiryTimer.unref?.();
+    return true;
+  }
+
+  private async beginUpstreamBlock(reason: string, waitForRelayStop: boolean): Promise<void> {
+    const stopping = this.blockForUpstream(reason);
+    if (waitForRelayStop) {
+      await stopping;
+      return;
+    }
+    void stopping.catch((error) => {
+      if (!this.stopping) {
+        this.logger.error("连接回调发起 upstream 门禁后停止 relay 失败", {
+          error: errorMessage(error),
+        });
+      }
+    });
+  }
+
+  private blockForUpstream(reason: string): Promise<void> {
+    if (!this.upstreamBlocked) {
+      this.upstreamBlocked = reason;
+      this.upstreamRelayStopped = false;
+      this.clearUpstreamProofExpiryTimer();
+      this.logger.error("官方 upstream 门禁关闭：停止新 job 并断开 LiViS relay", { reason });
+    }
+    if (this.upstreamBlockPromise) return this.upstreamBlockPromise;
+    if (this.upstreamRelayStopped) return Promise.resolve();
+
+    let blocking: Promise<void>;
+    try {
+      blocking = Promise.resolve(this.relay.stop());
+    } catch (error) {
+      blocking = Promise.reject(error);
+    }
+    let tracked!: Promise<void>;
+    tracked = blocking.then(
+      () => {
+        if (this.upstreamBlockPromise === tracked) {
+          this.upstreamRelayStopped = true;
+          this.upstreamBlockPromise = null;
+        }
+      },
+      (error) => {
+        if (this.upstreamBlockPromise === tracked) {
+          this.upstreamBlockPromise = null;
+        }
+        throw error;
+      },
+    );
+    this.upstreamBlockPromise = tracked;
+    return tracked;
   }
 }

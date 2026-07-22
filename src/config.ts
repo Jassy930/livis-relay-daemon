@@ -21,6 +21,7 @@ export interface RelayConfig {
     nodeName: string;
     handshakeTimeoutMs: number;
     reconnectMaxMs: number;
+    maxFrameBytes: number;
   };
   connector: {
     socketPath: string;
@@ -47,6 +48,16 @@ export interface RelayConfig {
 }
 
 export const DEFAULT_CONFIG_PATH = "~/.livis-relay/config.json";
+export const DEFAULT_RELAY_MAX_FRAME_BYTES = 1_048_576;
+export const MAX_RELAY_MAX_FRAME_BYTES = 16_777_216;
+
+function relayMaxFrameBytes(value: unknown): number {
+  const parsed = asPositiveInteger(value, "config.relay.maxFrameBytes");
+  if (parsed > MAX_RELAY_MAX_FRAME_BYTES) {
+    throw new Error(`config.relay.maxFrameBytes 不能超过 ${MAX_RELAY_MAX_FRAME_BYTES}`);
+  }
+  return parsed;
+}
 
 function objectAt(parent: Record<string, unknown>, key: string): Record<string, unknown> {
   const value = parent[key];
@@ -111,6 +122,9 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
       nodeName: asNonEmptyString(relay.nodeName, "config.relay.nodeName"),
       handshakeTimeoutMs: asPositiveInteger(relay.handshakeTimeoutMs, "config.relay.handshakeTimeoutMs"),
       reconnectMaxMs: asPositiveInteger(relay.reconnectMaxMs, "config.relay.reconnectMaxMs"),
+      maxFrameBytes: relay.maxFrameBytes === undefined
+        ? DEFAULT_RELAY_MAX_FRAME_BYTES
+        : relayMaxFrameBytes(relay.maxFrameBytes),
     },
     connector: {
       socketPath: expandHome(asNonEmptyString(connector.socketPath, "config.connector.socketPath")),
@@ -187,6 +201,7 @@ export async function initializeConfig(options: {
       nodeName: "我的电脑",
       handshakeTimeoutMs: 15_000,
       reconnectMaxMs: 60_000,
+      maxFrameBytes: DEFAULT_RELAY_MAX_FRAME_BYTES,
     },
     connector: {
       socketPath: resolve(stateDir, "connector.sock"),

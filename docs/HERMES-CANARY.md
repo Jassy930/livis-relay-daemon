@@ -2,13 +2,17 @@
 
 本文记录一期 Hermes bridge 的最小实网验收顺序与已知边界。所有账号、Agent ID、node ID、token 和完整业务消息都不得提交到仓库。
 
+本文是 canary 操作与历史结果，不是服务端规范。各步骤能证明和不能证明的协议事实，以[LiViS 服务端协议证据与支持边界](LIVIS-RELAY-PROTOCOL-BOUNDARY.md)为准。
+
 ## 验收前提
 
 - 使用隔离的 `HERMES_HOME`，不得复用或升级用户的默认 Hermes profile。
 - Hermes runtime、bridge 和 LiViS protocol profile 均位于项目审核的版本区间。
-- daemon 与 Hermes 两侧使用同一个显式 node allowlist；`allowAllNodes` 和 `LIVIS_ALLOW_ALL_USERS` 都必须为 `false`。
+- daemon 与 Hermes 两侧使用同一个且只包含唯一 `node_id` 的显式 allowlist；一期暂将该值视为本次 canary 的设备来源标识。`allowAllNodes` 和 `LIVIS_ALLOW_ALL_USERS` 都必须为 `false`。
 - Hermes 平台配置保持非流式、关闭 tool progress、中间消息、reasoning 和长任务通知。
-- `bun run src/index.ts doctor --online` 全部通过，`bun run src/index.ts status` 同时显示 relay handshake 与 connector ready。
+- `bun run probe:protocol:check` 与 `bun run src/index.ts doctor --online` 全部通过；`status` 显示预期的 wire revision/mode、relay handshake 与 connector ready。
+
+本 canary 只证明单个来源设备的闭环，不证明多设备接入、跨设备会话、设备 ID 轮换或状态迁移；不要在同一 config/state directory 中加入第二个 `node_id` 进行扩展测试。
 
 ## 首次会话顺序
 

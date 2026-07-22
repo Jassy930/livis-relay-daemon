@@ -1,9 +1,9 @@
-import WebSocket from "ws";
+import WebSocket, { type RawData } from "ws";
 import type { RelayConfig } from "../config.ts";
 import type { RelayIdentity } from "../identity.ts";
 import type { Logger } from "../logger.ts";
 import { errorMessage } from "../logger.ts";
-import type { ProtocolProfile } from "../protocol/profile.ts";
+import { runtimeContractSha256, type ProtocolProfile } from "../protocol/profile.ts";
 import {
   buildAckEnvelope,
   buildConnectEnvelope,
@@ -27,12 +27,29 @@ export interface RelayClientHandlers {
   onConnected(): Promise<void>;
 }
 
+type RelayRawData = RawData | string;
+
+export function relayFrameByteLength(data: RelayRawData): number {
+  if (typeof data === "string") return Buffer.byteLength(data, "utf8");
+  if (data instanceof ArrayBuffer) return data.byteLength;
+  if (Array.isArray(data)) return data.reduce((total, part) => total + part.byteLength, 0);
+  return data.byteLength;
+}
+
+function relayFrameText(data: RelayRawData): string {
+  if (typeof data === "string") return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8");
+  if (Array.isArray(data)) return Buffer.concat(data).toString("utf8");
+  return data.toString("utf8");
+}
+
 export class RelayClient {
   private socket: WebSocket | null = null;
   private runPromise: Promise<void> | null = null;
   private abortController = new AbortController();
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private tokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private outboxRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
   private tokenRefreshFailures = 0;
   private lastPongAt = 0;
   private handshakeComplete = false;
@@ -63,6 +80,9 @@ export class RelayClient {
       agentId: this.identity.agentId,
       deviceId: this.identity.deviceId,
       profile: this.profile.id,
+      wireContractRevision: this.profile.wireContractRevision,
+      credentialMode: this.profile.credentialMode,
+      runtimeContractSha256: runtimeContractSha256(this.profile),
     };
   }
 
@@ -80,6 +100,7 @@ export class RelayClient {
     this.abortController.abort(new Error("relay client stopping"));
     this.stopHeartbeat();
     this.stopTokenRefreshTimer();
+    this.stopOutboxRecoveryTimer();
     this.clearResultTimers(true);
     this.socket?.close(1000, "daemon stopping");
     await this.runPromise?.catch(() => undefined);
@@ -124,7 +145,7 @@ export class RelayClient {
     }
     const url = new URL(this.profile.endpoints.relayWebSocketUrl);
     url.searchParams.set("protocol_version", String(this.profile.wireProtocolVersion));
-    const socket = new WebSocket(url);
+    const socket = new WebSocket(url, { maxPayload: this.config.relay.maxFrameBytes });
     this.socket = socket;
     this.handshakeComplete = false;
     this.messageChain = Promise.resolve();
@@ -168,7 +189,17 @@ export class RelayClient {
       this.lastPongAt = Date.now();
     });
     socket.on("message", (data) => {
-      const raw = typeof data === "string" ? data : data.toString();
+      const frameBytes = relayFrameByteLength(data);
+      if (frameBytes > this.config.relay.maxFrameBytes) {
+        this.logger.warn("LiViS 消息被拒绝", {
+          error: "WebSocket frame 超过配置的字节上限",
+          frameBytes,
+          maxFrameBytes: this.config.relay.maxFrameBytes,
+        });
+        socket.close(1009, "frame too large");
+        return;
+      }
+      const raw = relayFrameText(data);
       this.messageChain = this.messageChain
         .then(async () => {
           const envelope = parseRelayEnvelope(raw);
@@ -208,6 +239,7 @@ export class RelayClient {
       clearTimeout(handshakeTimer);
       this.stopHeartbeat();
       this.stopTokenRefreshTimer();
+      this.stopOutboxRecoveryTimer();
       this.clearResultTimers(true);
       this.handshakeComplete = false;
       if (this.socket === socket) {
@@ -238,7 +270,7 @@ export class RelayClient {
       }
       case "cancel_chat": {
         const jobId = envelope.metadata?.job_id;
-        if (typeof jobId !== "string" || jobId === "") {
+        if (typeof jobId !== "string" || jobId.trim() === "") {
           throw new Error("cancel_chat 缺少 job_id");
         }
         await this.handlers.onCancel(jobId);
@@ -261,13 +293,18 @@ export class RelayClient {
           this.logger.warn("ack_send_result 无法关联任何 outbox", { candidates });
           break;
         }
-        const timer = this.resultAckTimers.get(jobId);
-        if (timer) {
-          clearTimeout(timer);
-          this.resultAckTimers.delete(jobId);
+        const delivered = this.store.markOutboxDelivered(jobId);
+        this.scheduleOutboxRecovery();
+        if (delivered?.status === "Delivered") {
+          const timer = this.resultAckTimers.get(jobId);
+          if (timer) {
+            clearTimeout(timer);
+            this.resultAckTimers.delete(jobId);
+          }
+          this.logger.info("LiViS 结果已确认", { jobId });
+        } else {
+          this.logger.warn("ack_send_result 未改变 outbox，可能重复或没有真实投递 attempt", { jobId });
         }
-        this.store.markOutboxDelivered(jobId);
-        this.logger.info("LiViS 结果已确认", { jobId });
         break;
       }
       case "token_expiring":
@@ -317,9 +354,16 @@ export class RelayClient {
   }
 
   private async replayOutbox(): Promise<void> {
-    for (const outbox of this.store.listPendingOutbox()) {
-      await this.deliverResult(outbox.jobId, false);
+    const batchSize = 100;
+    while (this.connected) {
+      const batch = this.store.listPendingOutbox(batchSize);
+      if (batch.length === 0) break;
+      for (const outbox of batch) {
+        await this.deliverResult(outbox.jobId, false);
+      }
+      if (batch.length < batchSize) break;
     }
+    this.scheduleOutboxRecovery();
   }
 
   private async deliverResult(jobId: string, retry: boolean): Promise<void> {
@@ -332,14 +376,22 @@ export class RelayClient {
     if (!outbox) {
       return;
     }
-    this.send(buildResultEnvelope({
-      profile: this.profile,
-      jobId,
-      agentId: this.identity.agentId,
-      deviceId: this.identity.deviceId,
-      resultJson: outbox.resultJson,
-      messageId,
-    }));
+    try {
+      this.send(buildResultEnvelope({
+        profile: this.profile,
+        jobId,
+        agentId: this.identity.agentId,
+        deviceId: this.identity.deviceId,
+        resultJson: outbox.resultJson,
+        messageId,
+      }));
+    } catch (error) {
+      // messageId 必须先持久化再发送；同步 send 失败则原子撤销这次未出进程的
+      // attempt，避免伪 ACK 把从未送出的 Pending 结果结算为 Delivered。
+      this.store.resetOutboxPendingAfterSendFailure(jobId, messageId, retry);
+      this.socket?.close(1011, "result send failure");
+      throw error;
+    }
     const previousTimer = this.resultAckTimers.get(jobId);
     if (previousTimer) clearTimeout(previousTimer);
     const timer = setTimeout(() => {
@@ -352,10 +404,19 @@ export class RelayClient {
           return;
         }
         if (current.retryCount < this.profile.timing.resultMaxRetries) {
-          void this.deliverResult(jobId, true);
+          void this.deliverResult(jobId, true).catch((error) => {
+            this.logger.error("结果 ACK 重试发送失败", { jobId, error: errorMessage(error) });
+            this.socket?.close(1011, "result retry failure");
+          });
         } else {
-          this.store.markOutboxAckFailed(jobId);
-          this.logger.error("LiViS 结果 ACK 重试耗尽", { jobId, retries: current.retryCount });
+          const nextAttemptAt = Date.now() + this.resultRecoveryDelayMs(current.retryCount);
+          this.store.markOutboxAckFailed(jobId, nextAttemptAt);
+          this.scheduleOutboxRecovery();
+          this.logger.error("LiViS 结果 ACK 重试耗尽，将在持久化退避后继续", {
+            jobId,
+            retries: current.retryCount,
+            nextAttemptAt,
+          });
         }
       } catch (error) {
         this.logger.error("结果重试定时器处理失败", { jobId, error: errorMessage(error) });
@@ -366,7 +427,7 @@ export class RelayClient {
 
   private resolveAckJobId(candidates: string[]): string | null {
     for (const candidate of candidates) {
-      if (this.store.get(candidate)) {
+      if (this.store.get(candidate)?.outbox) {
         return candidate;
       }
       const mapped = this.store.findJobIdByOutboxMessageId(candidate);
@@ -402,6 +463,32 @@ export class RelayClient {
     if (this.tokenRefreshTimer) {
       clearTimeout(this.tokenRefreshTimer);
       this.tokenRefreshTimer = null;
+    }
+  }
+
+  private resultRecoveryDelayMs(retryCount: number): number {
+    const exponent = Math.min(Math.max(retryCount, 1), 6);
+    return Math.min(5 * 60_000, this.profile.timing.resultAckTimeoutMs * 2 ** exponent);
+  }
+
+  private scheduleOutboxRecovery(): void {
+    this.stopOutboxRecoveryTimer();
+    if (!this.connected) return;
+    const nextAttemptAt = this.store.nextOutboxAttemptAt();
+    if (nextAttemptAt === null) return;
+    this.outboxRecoveryTimer = setTimeout(() => {
+      this.outboxRecoveryTimer = null;
+      void this.replayOutbox().catch((error) => {
+        this.logger.error("outbox 退避恢复失败", { error: errorMessage(error) });
+        this.socket?.close(1011, "outbox recovery failure");
+      });
+    }, Math.max(0, nextAttemptAt - Date.now()));
+  }
+
+  private stopOutboxRecoveryTimer(): void {
+    if (this.outboxRecoveryTimer) {
+      clearTimeout(this.outboxRecoveryTimer);
+      this.outboxRecoveryTimer = null;
     }
   }
 

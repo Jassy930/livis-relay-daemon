@@ -31,11 +31,16 @@
     "version:check": "bun run scripts/check-versions.ts",
     "docs:check": "bun run scripts/check-doc-links.ts",
     "release:check": "bun run scripts/check-public-release.ts",
+    "wire-contract:append-only:check": "bun run scripts/check-wire-contract-append-only.ts --allow-bootstrap",
+    "probe:protocol:local": "bun run scripts/probe-protocol-local.ts",
+    "probe:protocol:update": "bun run scripts/probe-protocol-local.ts --write",
+    "probe:protocol:check": "bun run scripts/probe-protocol-local.ts --check",
+    "probe:protocol:test": "bun test tests/protocol_probe_artifact.test.ts tests/auth_contract_probe.test.ts tests/relay_wire_probe.test.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "test:hermes": "cd hermes-plugin && uv lock --check && PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider -q",
     "test:coverage": "bun test --coverage",
-    "check": "bun run version:check && bun run docs:check && bun run release:check && bun run typecheck && bun test && bun run test:hermes"
+    "check": "bun run version:check && bun run docs:check && bun run release:check && bun run wire-contract:append-only:check && bun run probe:protocol:check && bun run typecheck && bun test && bun run test:hermes"
   },
   "dependencies": {
     "ws": "^8.18.3"

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { join } from "node:path";
 import type { IdaasClient } from "../src/auth/idaas.ts";
 import type { RelayConfig } from "../src/config.ts";
@@ -6,15 +7,17 @@ import type { RelayIdentity } from "../src/identity.ts";
 import { Logger } from "../src/logger.ts";
 import {
   parseIncomingRelayJob,
+  RELAY_IDENTIFIER_MAX_BYTES,
   serializeResult,
 } from "../src/protocol/livis.ts";
 import type { ProtocolProfile } from "../src/protocol/profile.ts";
 import {
   RelayClient,
+  relayFrameByteLength,
   type RelayClientHandlers,
 } from "../src/relay/client.ts";
 import { SecretStore } from "../src/secrets.ts";
-import { JobStore } from "../src/state/store.ts";
+import { JobStore, PENDING_CANCEL_MAX_ROWS } from "../src/state/store.ts";
 import type { RelayEnvelope } from "../src/types.ts";
 import {
   incomingJob,
@@ -45,6 +48,7 @@ class FakeLivisRelay {
   private readonly queued: CapturedEnvelope[] = [];
   private readonly waiters: EnvelopeWaiter[] = [];
   readonly history: CapturedEnvelope[] = [];
+  readonly closeHistory: Array<{ socket: Bun.ServerWebSocket<FakeSocketData>; code: number }> = [];
   url = "";
 
   async start(): Promise<void> {
@@ -75,7 +79,8 @@ class FakeLivisRelay {
             relay.queued.push(captured);
           }
         },
-        close(socket) {
+        close(socket, code) {
+          relay.closeHistory.push({ socket, code });
           relay.sockets.delete(socket);
         },
       },
@@ -143,6 +148,10 @@ class FakeLivisRelay {
 
   count(type: string): number {
     return this.history.filter((captured) => captured.envelope.type === type).length;
+  }
+
+  closeCode(socket: Bun.ServerWebSocket<FakeSocketData>): number | null {
+    return this.closeHistory.find((entry) => entry.socket === socket)?.code ?? null;
   }
 }
 
@@ -303,6 +312,89 @@ describe("RelayClient fake LiViS end-to-end", () => {
     };
   }
 
+  test("整帧按 UTF-8 字节计数", () => {
+    expect(relayFrameByteLength("你")).toBe(3);
+    expect(relayFrameByteLength([Buffer.from("abc"), Buffer.from("你好")])).toBe(9);
+  });
+
+  test("ws 在解析和 handler 前以 1009 拒绝超出 relay 整帧上限的消息", async () => {
+    config.relay.maxFrameBytes = 512;
+    let incomingCalls = 0;
+    let cancelCalls = 0;
+    const relayClient = createClient({
+      onIncoming: async () => { incomingCalls += 1; },
+      onCancel: async () => { cancelCalls += 1; },
+      onConnected: async () => undefined,
+    });
+    relayClient.start();
+    const socket = await fakeRelay.handshake(relayClient);
+    const oversized = messageEnvelope("oversized-frame");
+    oversized.payload = { ...oversized.payload, padding: "x".repeat(600) };
+    fakeRelay.send(socket, oversized);
+
+    await waitFor(() => fakeRelay.closeCode(socket) !== null, 1_000, "oversized frame close");
+    expect(fakeRelay.closeCode(socket)).toBe(1009);
+    expect(incomingCalls).toBe(0);
+    expect(cancelCalls).toBe(0);
+    expect(store.listRecent()).toHaveLength(0);
+    expect(fakeRelay.count("ack_send_message")).toBe(0);
+  });
+
+  test("超长 send/cancel 标识在 handler 前拒绝且不写 jobs 或 pending_cancels", async () => {
+    let incomingCalls = 0;
+    let cancelCalls = 0;
+    const relayClient = createClient({
+      onIncoming: async () => { incomingCalls += 1; },
+      onCancel: async () => { cancelCalls += 1; },
+      onConnected: async () => undefined,
+    });
+    relayClient.start();
+    const socket = await fakeRelay.handshake(relayClient);
+    const oversizedId = "j".repeat(RELAY_IDENTIFIER_MAX_BYTES + 1);
+    fakeRelay.send(socket, messageEnvelope(oversizedId));
+    fakeRelay.send(socket, cancelEnvelope(oversizedId));
+    await Bun.sleep(30);
+
+    expect(incomingCalls).toBe(0);
+    expect(cancelCalls).toBe(0);
+    expect(store.listRecent()).toHaveLength(0);
+    const database = new Database(join(directory.path, "relay.db"), { readonly: true });
+    const pending = database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM pending_cancels")
+      .get()?.count ?? 0;
+    database.close();
+    expect(pending).toBe(0);
+    expect(fakeRelay.count("ack_send_message")).toBe(0);
+    expect(fakeRelay.count("ack_cancel_chat")).toBe(0);
+  });
+
+  test("pending cancel 满额时拒绝新 intent 且不发送成功 ACK", async () => {
+    const database = new Database(join(directory.path, "relay.db"));
+    const insert = database.query(
+      "INSERT INTO pending_cancels(scope_key,job_id,created_at) VALUES(?,?,?)",
+    );
+    const now = Date.now();
+    const fill = database.transaction(() => {
+      for (let index = 0; index < PENDING_CANCEL_MAX_ROWS; index += 1) {
+        insert.run("account-test:test-agent-id", `pending-${index}`, now);
+      }
+    });
+    fill.immediate();
+    database.close();
+
+    const relayClient = createClient(durableHandlers());
+    relayClient.start();
+    const socket = await fakeRelay.handshake(relayClient);
+    fakeRelay.send(socket, cancelEnvelope("new-overflow-cancel"));
+    await Bun.sleep(30);
+
+    expect(fakeRelay.count("ack_cancel_chat")).toBe(0);
+    const verify = new Database(join(directory.path, "relay.db"), { readonly: true });
+    const count = verify.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM pending_cancels")
+      .get()?.count ?? 0;
+    verify.close();
+    expect(count).toBe(PENDING_CANCEL_MAX_ROWS);
+  });
+
   test("durable commit 完成后才发送 ack_send_message", async () => {
     const allowCommit = deferred<void>();
     const committed = deferred<void>();
@@ -398,6 +490,262 @@ describe("RelayClient fake LiViS end-to-end", () => {
       () => store.require("ref-ack-job").outbox?.status === "Delivered",
       1_000,
       "delayed ref_msg_id ack delivery",
+    );
+  });
+
+  test("send 同步失败后撤销幽灵 attempt，且不接受尚未发出的 ACK", async () => {
+    createPendingResult(store, "sync-send-failure");
+    const relayClient = createClient(durableHandlers());
+    let closed = false;
+    const internals = relayClient as unknown as {
+      handshakeComplete: boolean;
+      socket: { readyState: number; close: () => void };
+      send: (envelope: RelayEnvelope) => void;
+      deliverResult: (jobId: string, retry: boolean) => Promise<void>;
+    };
+    internals.handshakeComplete = true;
+    internals.socket = { readyState: 1, close: () => { closed = true; } };
+    internals.send = () => {
+      throw new Error("synthetic send failure");
+    };
+
+    await expect(internals.deliverResult("sync-send-failure", false)).rejects.toThrow(
+      "synthetic send failure",
+    );
+    const outbox = store.require("sync-send-failure").outbox!;
+    expect(outbox.status).toBe("Pending");
+    expect(outbox.lastMessageId).toBeNull();
+    expect(outbox.deliveredAt).toBeNull();
+    expect(store.markOutboxDelivered("sync-send-failure")).toBeNull();
+    expect(closed).toBeTrue();
+  });
+
+  test("没有真实投递 attempt 的 job_id ACK 不清理当前 ACK timer", async () => {
+    createPendingResult(store, "never-delivered");
+    const relayClient = createClient(durableHandlers());
+    const internals = relayClient as unknown as {
+      handshakeComplete: boolean;
+      resultAckTimers: Map<string, ReturnType<typeof setTimeout>>;
+      handleEnvelope: (envelope: RelayEnvelope) => Promise<void>;
+    };
+    internals.handshakeComplete = true;
+    const timer = setTimeout(() => undefined, 10_000);
+    internals.resultAckTimers.set("never-delivered", timer);
+    try {
+      await internals.handleEnvelope({
+        type: "ack_send_result",
+        metadata: { job_id: "never-delivered" },
+        payload: {},
+      });
+      expect(store.require("never-delivered").outbox?.status).toBe("Pending");
+      expect(internals.resultAckTimers.get("never-delivered")).toBe(timer);
+    } finally {
+      clearTimeout(timer);
+      internals.resultAckTimers.delete("never-delivered");
+    }
+  });
+
+  test("一次 replay 会继续排空超过单批上限的 Pending outbox", async () => {
+    profile = {
+      ...profile,
+      timing: { ...profile.timing, resultAckTimeoutMs: 10_000 },
+    };
+    for (let index = 0; index < 101; index += 1) {
+      createPendingResult(store, `batch-${index}`);
+    }
+    const relayClient = createClient(durableHandlers());
+    const sent: RelayEnvelope[] = [];
+    const internals = relayClient as unknown as {
+      handshakeComplete: boolean;
+      socket: { readyState: number; close: () => void };
+      send: (envelope: RelayEnvelope) => void;
+      replayOutbox: () => Promise<void>;
+      clearResultTimers: (resetPending: boolean) => void;
+    };
+    internals.handshakeComplete = true;
+    internals.socket = { readyState: 1, close: () => undefined };
+    internals.send = (envelope) => sent.push(envelope);
+
+    try {
+      await internals.replayOutbox();
+      expect(sent).toHaveLength(101);
+      expect(store.listPendingOutbox()).toHaveLength(0);
+      expect(store.require("batch-100").outbox?.status).toBe("Delivering");
+    } finally {
+      internals.clearResultTimers(true);
+    }
+  });
+
+  test("重试耗尽后迟到 ACK 可从持久化退避态完成投递", async () => {
+    profile = {
+      ...profile,
+      timing: { ...profile.timing, resultMaxRetries: 1 },
+    };
+    createPendingResult(store, "late-after-failure");
+    const relayClient = createClient(durableHandlers());
+    const internals = relayClient as unknown as {
+      stopOutboxRecoveryTimer: () => void;
+    };
+    relayClient.start();
+    const socket = await fakeRelay.handshake(relayClient);
+
+    const first = await fakeRelay.next("send_result");
+    await fakeRelay.next("send_result");
+    await waitFor(
+      () => store.require("late-after-failure").outbox?.status === "AckFailed",
+      1_000,
+      "outbox persistent backoff",
+    );
+    // 本用例只验证 AckFailed 对迟到 ACK 的结算；在线退避恢复由下一用例覆盖。
+    // 先暂停 recovery timer，避免用 runner 此刻的墙钟时间定义持久化状态。
+    internals.stopOutboxRecoveryTimer();
+    const outbox = store.require("late-after-failure").outbox!;
+    const nextAttemptAt = outbox.nextAttemptAt;
+    expect(nextAttemptAt).toBeNumber();
+    expect(nextAttemptAt!).toBeGreaterThan(outbox.updatedAt);
+
+    fakeRelay.send(socket, {
+      type: "ack_send_result",
+      metadata: {},
+      payload: { ref_msg_id: first.envelope.metadata?.msg_id },
+    });
+    await waitFor(
+      () => store.require("late-after-failure").outbox?.status === "Delivered",
+      1_000,
+      "late ACK after retry exhaustion",
+    );
+    await Bun.sleep(20);
+    expect(fakeRelay.count("send_result")).toBe(2);
+  });
+
+  test("AckFailed 退避到期后在当前连接自动开启新的重试周期", async () => {
+    profile = {
+      ...profile,
+      timing: { ...profile.timing, resultMaxRetries: 1 },
+    };
+    createPendingResult(store, "online-recovery");
+    const relayClient = createClient(durableHandlers());
+    relayClient.start();
+    const socket = await fakeRelay.handshake(relayClient);
+
+    const first = await fakeRelay.next("send_result");
+    await fakeRelay.next("send_result");
+    await waitFor(
+      () => store.require("online-recovery").outbox?.status === "AckFailed",
+      1_000,
+      "online outbox backoff",
+    );
+    const recovered = await fakeRelay.next("send_result");
+    expect(recovered.envelope.metadata?.job_id).toBe("online-recovery");
+    expect(recovered.envelope.payload?.data).toBe(first.envelope.payload?.data);
+    expect(recovered.envelope.metadata?.msg_id).not.toBe(first.envelope.metadata?.msg_id);
+    expect(store.require("online-recovery").outbox?.retryCount).toBe(0);
+
+    fakeRelay.send(socket, {
+      type: "ack_send_result",
+      metadata: { job_id: "online-recovery" },
+      payload: {},
+    });
+    await waitFor(
+      () => store.require("online-recovery").outbox?.status === "Delivered",
+      1_000,
+      "online recovered result ACK",
+    );
+  });
+
+  test("断线跨过退避期后，重连会恢复 AckFailed 结果", async () => {
+    profile = {
+      ...profile,
+      timing: { ...profile.timing, resultMaxRetries: 1 },
+    };
+    createPendingResult(store, "reconnect-failed");
+    const relayClient = createClient(durableHandlers());
+    relayClient.start();
+    const firstSocket = await fakeRelay.handshake(relayClient);
+
+    const first = await fakeRelay.next("send_result");
+    await fakeRelay.next("send_result");
+    await waitFor(
+      () => store.require("reconnect-failed").outbox?.status === "AckFailed",
+      1_000,
+      "reconnect outbox backoff",
+    );
+    await fakeRelay.disconnect(firstSocket);
+
+    const secondSocket = await fakeRelay.handshake(relayClient, 3_000);
+    const replayed = await fakeRelay.next("send_result");
+    expect(replayed.envelope.metadata?.job_id).toBe("reconnect-failed");
+    expect(replayed.envelope.payload?.data).toBe(first.envelope.payload?.data);
+    expect(replayed.envelope.metadata?.msg_id).not.toBe(first.envelope.metadata?.msg_id);
+
+    fakeRelay.send(secondSocket, {
+      type: "ack_send_result",
+      metadata: { job_id: "reconnect-failed" },
+      payload: {},
+    });
+    await waitFor(
+      () => store.require("reconnect-failed").outbox?.status === "Delivered",
+      1_000,
+      "reconnected failed result ACK",
+    );
+  });
+
+  test("退避恢复发送失败会关闭旧连接，并在重连后继续", async () => {
+    profile = {
+      ...profile,
+      timing: { ...profile.timing, resultMaxRetries: 0 },
+    };
+    createPendingResult(store, "recovery-send-failure");
+    const relayClient = createClient(durableHandlers());
+    const internals = relayClient as unknown as {
+      send: (envelope: RelayEnvelope) => void;
+    };
+    const originalSend = internals.send.bind(relayClient);
+    let failRecoveryOnce = false;
+    let ghostMessageId: string | null = null;
+    internals.send = (envelope) => {
+      if (failRecoveryOnce && envelope.type === "send_result") {
+        failRecoveryOnce = false;
+        ghostMessageId = envelope.metadata?.msg_id ?? null;
+        throw new Error("synthetic recovery send failure");
+      }
+      originalSend(envelope);
+    };
+
+    relayClient.start();
+    await fakeRelay.handshake(relayClient);
+    const first = await fakeRelay.next("send_result");
+    await waitFor(
+      () => store.require("recovery-send-failure").outbox?.status === "AckFailed",
+      1_000,
+      "recovery failure backoff",
+    );
+    const failed = store.require("recovery-send-failure").outbox!;
+    failRecoveryOnce = true;
+
+    await waitFor(
+      () => ghostMessageId !== null && !relayClient.connected,
+      1_000,
+      "recovery send compensation",
+    );
+    const compensated = store.require("recovery-send-failure").outbox!;
+    expect(compensated.status).toBe("Pending");
+    expect(compensated.lastMessageId).toBe(first.envelope.metadata?.msg_id ?? null);
+    expect(compensated.deliveredAt).toBe(failed.deliveredAt);
+    expect(store.findJobIdByOutboxMessageId(ghostMessageId!)).toBeNull();
+
+    const secondSocket = await fakeRelay.handshake(relayClient, 3_000);
+    const replayed = await fakeRelay.next("send_result", 3_000);
+    expect(replayed.envelope.metadata?.job_id).toBe("recovery-send-failure");
+    fakeRelay.send(secondSocket, {
+      type: "ack_send_result",
+      metadata: { job_id: "recovery-send-failure" },
+      payload: {},
+    });
+    await waitFor(
+      () => store.require("recovery-send-failure").outbox?.status === "Delivered",
+      1_000,
+      "recovery after reconnect",
     );
   });
 

@@ -1,12 +1,13 @@
 {
   "schemaVersion": 1,
   "profile": "./protocol-profiles/livis-authorized.example.json",
-  "profileSha256": "33eb80fdff60cff69ea3b3858bb9e586aa77cabb2f70616d2e4daee362768ff4",
+  "profileSha256": "2645d8c52c682f65f1932b899b320e85cbfed2a8d102ac4a7ef5b7ecae24e160",
   "stateDir": "~/.livis-relay",
   "relay": {
     "nodeName": "我的电脑",
     "handshakeTimeoutMs": 15000,
-    "reconnectMaxMs": 60000
+    "reconnectMaxMs": 60000,
+    "maxFrameBytes": 1048576
   },
   "connector": {
     "socketPath": "~/.livis-relay/connector.sock",

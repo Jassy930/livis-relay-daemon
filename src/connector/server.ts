@@ -28,6 +28,8 @@ interface ConnectorSocketData {
   backend: "hermes" | null;
   ready: boolean;
   lastPongAt: number;
+  generation: number;
+  disconnectHandled: boolean;
 }
 
 export interface ConnectorServerHandlers {
@@ -106,6 +108,9 @@ function parseConnectorMessage(raw: string): ConnectorInboundMessage {
 export class ConnectorServer {
   private server: Bun.Server<ConnectorSocketData> | null = null;
   private activeSocket: Bun.ServerWebSocket<ConnectorSocketData> | null = null;
+  private activeGeneration = 0;
+  private nextGeneration = 0;
+  private transitionChain: Promise<void> = Promise.resolve();
   private readonly helloTimers = new Map<Bun.ServerWebSocket<ConnectorSocketData>, ReturnType<typeof setTimeout>>();
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -120,11 +125,11 @@ export class ConnectorServer {
   }
 
   get connectorId(): string | null {
-    return this.activeSocket?.data.connectorId ?? null;
+    return this.currentSocket()?.data.connectorId ?? null;
   }
 
   get ready(): boolean {
-    return this.activeSocket?.data.ready === true;
+    return this.currentSocket() !== null;
   }
 
   start(): void {
@@ -172,6 +177,8 @@ export class ConnectorServer {
             backend: null,
             ready: false,
             lastPongAt: Date.now(),
+            generation: 0,
+            disconnectHandled: false,
           },
         });
         return upgraded ? undefined : new Response("Upgrade Failed", { status: 400 });
@@ -196,7 +203,7 @@ export class ConnectorServer {
             socket.close(1009, "frame too large");
             return;
           }
-          void this.handleMessage(socket, raw).catch((error) => {
+          void this.enqueueTransition(() => this.handleMessage(socket, raw)).catch((error) => {
             logger.warn("connector 消息处理失败", { error: errorMessage(error) });
             this.send(socket, { type: "error", code: "invalid_message", message: errorMessage(error) });
           });
@@ -205,16 +212,22 @@ export class ConnectorServer {
           const timer = this.helloTimers.get(socket);
           if (timer) clearTimeout(timer);
           this.helloTimers.delete(socket);
-          const connectorId = socket.data.connectorId;
-          const wasActive = this.activeSocket === socket;
-          if (wasActive) {
-            this.activeSocket = null;
-          }
-          if (connectorId && wasActive) {
-            void handlers.onDisconnected(connectorId).catch((error) => {
-              logger.error("connector 断开清理失败", { connectorId, error: errorMessage(error) });
+          void this.enqueueTransition(async () => {
+            if (this.isActiveSocket(socket)) {
+              this.fenceSocket(socket);
+            } else if (socket.data.generation === 0) {
+              return;
+            }
+            // takeover 可能已 fence generation，但首次 durable settlement
+            // 失败；迟到 close 仍应重试，而不是因“不再 active”直接跳过。
+            await this.settleDisconnected(socket);
+          }).catch((error) => {
+            logger.error("connector 断开清理失败", {
+              connectorId: socket.data.connectorId,
+              generation: socket.data.generation,
+              error: errorMessage(error),
             });
-          }
+          });
         },
       },
     });
@@ -233,8 +246,11 @@ export class ConnectorServer {
 
   stop(): void {
     if (this.activeSocket) {
-      this.activeSocket.close(1001, "daemon stopping");
+      const socket = this.activeSocket;
       this.activeSocket = null;
+      this.activeGeneration = 0;
+      socket.data.ready = false;
+      socket.close(1001, "daemon stopping");
     }
     this.server?.stop(true);
     this.server = null;
@@ -248,7 +264,8 @@ export class ConnectorServer {
   }
 
   sendJob(job: StoredJob): boolean {
-    if (!this.activeSocket?.data.ready || !job.leaseId) {
+    const socket = this.currentSocket();
+    if (!socket || !job.leaseId) {
       return false;
     }
     const message: ConnectorJobMessage = {
@@ -273,11 +290,12 @@ export class ConnectorServer {
         },
       },
     };
-    return this.send(this.activeSocket, message);
+    return this.send(socket, message);
   }
 
   sendCancel(job: StoredJob): boolean {
-    if (!this.activeSocket?.data.ready || !job.leaseId) {
+    const socket = this.currentSocket();
+    if (!socket || !job.leaseId) {
       return false;
     }
     const message: ConnectorCancelMessage = {
@@ -286,18 +304,20 @@ export class ConnectorServer {
       jobId: job.jobId,
       leaseId: job.leaseId,
     };
-    return this.send(this.activeSocket, message);
+    return this.send(socket, message);
   }
 
   acknowledgeResult(jobId: string, leaseId: string): void {
-    if (this.activeSocket?.data.ready) {
-      this.send(this.activeSocket, { type: "result_stored", jobId, leaseId });
+    const socket = this.currentSocket();
+    if (socket) {
+      this.send(socket, { type: "result_stored", jobId, leaseId });
     }
   }
 
   rejectJobMessage(jobId: string, code: string, message: string): void {
-    if (this.activeSocket?.data.ready) {
-      this.send(this.activeSocket, { type: "error", code, message, jobId });
+    const socket = this.currentSocket();
+    if (socket) {
+      this.send(socket, { type: "error", code, message, jobId });
     }
   }
 
@@ -310,89 +330,11 @@ export class ConnectorServer {
   private async handleMessage(socket: Bun.ServerWebSocket<ConnectorSocketData>, raw: string): Promise<void> {
     const message = parseConnectorMessage(raw);
     if (message.type === "hello") {
-      if (socket.data.ready) {
-        throw new Error("重复 hello");
-      }
-      if (this.activeSocket && this.activeSocket !== socket) {
-        // Hermes 重启后旧 socket 可能还没被心跳超时（最长 45 秒）回收。
-        // 旧连接已错过一个完整心跳周期时按失活处理，把位置让给新连接。
-        if (Date.now() - this.activeSocket.data.lastPongAt > HEARTBEAT_INTERVAL_MS * 2) {
-          this.logger.warn("驱逐失活的旧 connector，接受新 hello", {
-            staleConnectorId: this.activeSocket.data.connectorId,
-          });
-          const staleSocket = this.activeSocket;
-          this.activeSocket = null;
-          staleSocket.close(1001, "replaced by new connector");
-        } else {
-          this.send(socket, { type: "error", code: "connector_conflict", message: "已有 Hermes connector 在线" });
-          socket.close(1008, "connector conflict");
-          return;
-        }
-      }
-      if (message.implementation.name !== this.options.bridgeImplementation) {
-        this.send(socket, {
-          type: "error",
-          code: "bridge_implementation_unsupported",
-          message: `connector implementation 必须是 ${this.options.bridgeImplementation}`,
-        });
-        socket.close(1008, "unsupported bridge implementation");
-        return;
-      }
-      const bridgeVersion = parseSemverTriplet(message.implementation.version);
-      const bridgeMinimum = parseSemverTriplet(this.options.bridgeMinimumVersion);
-      const bridgeMaximum = parseSemverTriplet(this.options.bridgeMaximumExclusiveVersion);
-      if (
-        !bridgeVersion || !bridgeMinimum || !bridgeMaximum ||
-        !versionAtLeast(bridgeVersion, bridgeMinimum) ||
-        !versionLessThan(bridgeVersion, bridgeMaximum)
-      ) {
-        this.send(socket, {
-          type: "error",
-          code: "bridge_version_unsupported",
-          message: `bridge ${message.implementation.version} 不在已审核范围 [${this.options.bridgeMinimumVersion}, ${this.options.bridgeMaximumExclusiveVersion})`,
-        });
-        socket.close(1008, "unsupported bridge version");
-        return;
-      }
-      const runtimeVersion = parseSemverTriplet(message.implementation.runtimeVersion ?? "");
-      const minimumVersion = parseSemverTriplet(this.options.hermesMinimumVersion);
-      const maximumVersion = parseSemverTriplet(this.options.hermesMaximumExclusiveVersion);
-      if (
-        !runtimeVersion || !minimumVersion || !maximumVersion ||
-        !versionAtLeast(runtimeVersion, minimumVersion) ||
-        !versionLessThan(runtimeVersion, maximumVersion)
-      ) {
-        this.send(socket, {
-          type: "error",
-          code: "hermes_version_unsupported",
-          message: `Hermes runtime ${message.implementation.runtimeVersion ?? "unknown"} 不在已审核范围 [${this.options.hermesMinimumVersion}, ${this.options.hermesMaximumExclusiveVersion})`,
-        });
-        socket.close(1008, "unsupported Hermes version");
-        return;
-      }
-      socket.data.connectorId = message.connectorId;
-      socket.data.backend = message.backend;
-      socket.data.ready = true;
-      this.activeSocket = socket;
-      const timer = this.helloTimers.get(socket);
-      if (timer) clearTimeout(timer);
-      this.helloTimers.delete(socket);
-      this.send(socket, {
-        type: "hello_ack",
-        protocolVersion: CONNECTOR_PROTOCOL_VERSION,
-        connectorId: message.connectorId,
-        daemonVersion: this.options.daemonVersion,
-        resultStoreTimeoutMs: this.options.resultStoreTimeoutMs,
-      });
-      await this.handlers.onReady(message);
-      this.logger.info("Hermes connector 已就绪", {
-        connectorId: message.connectorId,
-        implementation: message.implementation,
-      });
+      await this.acceptHello(socket, message);
       return;
     }
-    if (!socket.data.ready || !socket.data.connectorId) {
-      throw new Error("connector 尚未完成 hello");
+    if (!this.isActiveSocket(socket) || !socket.data.connectorId) {
+      throw new Error("connector generation 已失效");
     }
     switch (message.type) {
       case "accepted":
@@ -413,6 +355,135 @@ export class ConnectorServer {
       default:
         throw new Error(`未处理 connector 消息：${(message as { type: string }).type}`);
     }
+  }
+
+  private async acceptHello(
+    socket: Bun.ServerWebSocket<ConnectorSocketData>,
+    message: ConnectorHello,
+  ): Promise<void> {
+    if (socket.data.ready || socket.data.generation !== 0) {
+      throw new Error("重复 hello");
+    }
+    if (message.implementation.name !== this.options.bridgeImplementation) {
+      this.send(socket, {
+        type: "error",
+        code: "bridge_implementation_unsupported",
+        message: `connector implementation 必须是 ${this.options.bridgeImplementation}`,
+      });
+      socket.close(1008, "unsupported bridge implementation");
+      return;
+    }
+    const bridgeVersion = parseSemverTriplet(message.implementation.version);
+    const bridgeMinimum = parseSemverTriplet(this.options.bridgeMinimumVersion);
+    const bridgeMaximum = parseSemverTriplet(this.options.bridgeMaximumExclusiveVersion);
+    if (
+      !bridgeVersion || !bridgeMinimum || !bridgeMaximum ||
+      !versionAtLeast(bridgeVersion, bridgeMinimum) ||
+      !versionLessThan(bridgeVersion, bridgeMaximum)
+    ) {
+      this.send(socket, {
+        type: "error",
+        code: "bridge_version_unsupported",
+        message: `bridge ${message.implementation.version} 不在已审核范围 [${this.options.bridgeMinimumVersion}, ${this.options.bridgeMaximumExclusiveVersion})`,
+      });
+      socket.close(1008, "unsupported bridge version");
+      return;
+    }
+    const runtimeVersion = parseSemverTriplet(message.implementation.runtimeVersion ?? "");
+    const minimumVersion = parseSemverTriplet(this.options.hermesMinimumVersion);
+    const maximumVersion = parseSemverTriplet(this.options.hermesMaximumExclusiveVersion);
+    if (
+      !runtimeVersion || !minimumVersion || !maximumVersion ||
+      !versionAtLeast(runtimeVersion, minimumVersion) ||
+      !versionLessThan(runtimeVersion, maximumVersion)
+    ) {
+      this.send(socket, {
+        type: "error",
+        code: "hermes_version_unsupported",
+        message: `Hermes runtime ${message.implementation.runtimeVersion ?? "unknown"} 不在已审核范围 [${this.options.hermesMinimumVersion}, ${this.options.hermesMaximumExclusiveVersion})`,
+      });
+      socket.close(1008, "unsupported Hermes version");
+      return;
+    }
+
+    const activeSocket = this.currentSocket();
+    if (activeSocket && activeSocket !== socket) {
+      // Hermes 重启后旧 socket 可能还没被心跳超时（最长 45 秒）回收。
+      // takeover 必须先 fence 旧 generation，并完成所有 active lease 的
+      // durable 结算，再暴露新 generation；connectorId 即使复用也不能越界。
+      if (Date.now() - activeSocket.data.lastPongAt > HEARTBEAT_INTERVAL_MS * 2) {
+        this.logger.warn("驱逐失活的旧 connector，接受新 hello", {
+          staleConnectorId: activeSocket.data.connectorId,
+          staleGeneration: activeSocket.data.generation,
+        });
+        this.fenceSocket(activeSocket);
+        activeSocket.close(1001, "replaced by new connector");
+        await this.settleDisconnected(activeSocket);
+      } else {
+        this.send(socket, { type: "error", code: "connector_conflict", message: "已有 Hermes connector 在线" });
+        socket.close(1008, "connector conflict");
+        return;
+      }
+    }
+
+    const generation = ++this.nextGeneration;
+    socket.data.connectorId = message.connectorId;
+    socket.data.backend = message.backend;
+    socket.data.generation = generation;
+    socket.data.ready = true;
+    this.activeSocket = socket;
+    this.activeGeneration = generation;
+    const timer = this.helloTimers.get(socket);
+    if (timer) clearTimeout(timer);
+    this.helloTimers.delete(socket);
+    this.send(socket, {
+      type: "hello_ack",
+      protocolVersion: CONNECTOR_PROTOCOL_VERSION,
+      connectorId: message.connectorId,
+      daemonVersion: this.options.daemonVersion,
+      resultStoreTimeoutMs: this.options.resultStoreTimeoutMs,
+    });
+    await this.handlers.onReady(message);
+    this.logger.info("Hermes connector 已就绪", {
+      connectorId: message.connectorId,
+      generation,
+      implementation: message.implementation,
+    });
+  }
+
+  private currentSocket(): Bun.ServerWebSocket<ConnectorSocketData> | null {
+    const socket = this.activeSocket;
+    return socket && this.isActiveSocket(socket) ? socket : null;
+  }
+
+  private isActiveSocket(socket: Bun.ServerWebSocket<ConnectorSocketData>): boolean {
+    return this.activeSocket === socket &&
+      socket.data.ready &&
+      socket.data.generation !== 0 &&
+      socket.data.generation === this.activeGeneration;
+  }
+
+  private fenceSocket(socket: Bun.ServerWebSocket<ConnectorSocketData>): void {
+    if (!this.isActiveSocket(socket)) return;
+    socket.data.ready = false;
+    this.activeSocket = null;
+    this.activeGeneration = 0;
+  }
+
+  private async settleDisconnected(socket: Bun.ServerWebSocket<ConnectorSocketData>): Promise<void> {
+    if (socket.data.disconnectHandled) return;
+    if (socket.data.connectorId) {
+      await this.handlers.onDisconnected(socket.data.connectorId);
+    }
+    // 只有 durable handler 成功后才能记为已结算；否则 takeover/close 的
+    // 后续路径必须仍可重试同一 generation。
+    socket.data.disconnectHandled = true;
+  }
+
+  private enqueueTransition(operation: () => Promise<void>): Promise<void> {
+    const queued = this.transitionChain.then(operation);
+    this.transitionChain = queued.catch(() => undefined);
+    return queued;
   }
 
   private send(socket: Bun.ServerWebSocket<ConnectorSocketData>, message: ConnectorOutboundMessage): boolean {

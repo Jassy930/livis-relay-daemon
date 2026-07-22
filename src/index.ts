@@ -1,14 +1,27 @@
 #!/usr/bin/env bun
 
-import { readdir } from "node:fs/promises";
+import { readdir, realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { loadRelayConfig, initializeConfig, DEFAULT_CONFIG_PATH } from "./config.ts";
 import { RelayDaemon, DAEMON_VERSION } from "./daemon.ts";
 import { IdaasClient } from "./auth/idaas.ts";
 import { IdentityStore } from "./identity.ts";
 import { Logger, errorMessage } from "./logger.ts";
-import { loadProtocolProfile, parseProtocolProfile, resolveProfilePath, type ProtocolProfile } from "./protocol/profile.ts";
+import {
+  loadProtocolProfile,
+  parseProtocolProfile,
+  parseProtocolProfileCatalogEntry,
+  resolveProfilePath,
+  type ProtocolProfile,
+} from "./protocol/profile.ts";
 import { SecretStore } from "./secrets.ts";
+import {
+  ProfileOperationGuard,
+  rethrowAfterProfileOperationCleanup,
+  rethrowAfterProfileOperationGuardRelease,
+  withProfileOperationGuardRelease,
+  type ProfileOperation,
+} from "./state/offline-guard.ts";
 import { JobStore } from "./state/store.ts";
 import { UpstreamChecker, buildCandidateProfile } from "./upstream/checker.ts";
 import { activateReviewedProfile, rollbackProfileConfig } from "./upstream/activation.ts";
@@ -17,6 +30,12 @@ import {
   saveSupportedProof,
   type SupportedUpstreamProof,
 } from "./upstream/proof.ts";
+import {
+  applyProtocolProfileV2Migration,
+  planProtocolProfileV2Migration,
+  protocolProfileMigrationPlanSummary,
+  rollbackProtocolProfileMigration,
+} from "./upstream/profile-migration.ts";
 import {
   atomicWritePrivate,
   atomicWritePrivateBytes,
@@ -32,7 +51,15 @@ const BUILTIN_PROFILE_DIRECTORY = join(PROJECT_ROOT, "protocol-profiles");
 
 function optionValue(args: string[], option: string): string | undefined {
   const index = args.indexOf(option);
-  return index >= 0 ? args[index + 1] : undefined;
+  if (index < 0) return undefined;
+  if (args.indexOf(option, index + 1) >= 0) {
+    throw new Error(`${option} 不能重复传入`);
+  }
+  const value = args[index + 1];
+  if (!value || value.startsWith("--")) {
+    throw new Error(`${option} 必须提供非空值`);
+  }
+  return value;
 }
 
 function hasFlag(args: string[], flag: string): boolean {
@@ -47,6 +74,30 @@ async function loadContext(configPath?: string) {
   const identityStore = new IdentityStore(loaded.config.stateDir, profile);
   const identity = await identityStore.load();
   return { ...loaded, profile, secrets, secretValues, identityStore, identity };
+}
+
+async function loadProfileOperationContext(
+  args: string[],
+  operation: ProfileOperation,
+): Promise<{
+  context: Awaited<ReturnType<typeof loadContext>>;
+  guard: ProfileOperationGuard;
+}> {
+  const initial = await loadRelayConfig(optionValue(args, "--config"));
+  const guard = await ProfileOperationGuard.acquire(initial.config.stateDir, operation);
+  try {
+    const context = await loadContext(initial.path);
+    if (await realpath(context.config.stateDir) !== dirname(guard.path)) {
+      throw new Error("config.stateDir 在 profile operation guard 获取期间发生变化");
+    }
+    return { context, guard };
+  } catch (error) {
+    return rethrowAfterProfileOperationGuardRelease(
+      guard,
+      `加载 ${operation} 上下文`,
+      error,
+    );
+  }
 }
 
 interface ProfileCatalogEntry {
@@ -67,7 +118,8 @@ async function loadProfileCatalog(directories: string[]): Promise<ProfileCatalog
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
       const path = join(directory, entry.name);
-      const profile = parseProtocolProfile(await Bun.file(path).text(), path);
+      const profile = parseProtocolProfileCatalogEntry(await Bun.file(path).text(), path);
+      if (!profile) continue;
       const existing = profiles.get(profile.id);
       if (existing && JSON.stringify(existing.profile) !== JSON.stringify(profile)) {
         throw new Error(`profile.id 冲突且内容不同：${profile.id}`);
@@ -79,7 +131,7 @@ async function loadProfileCatalog(directories: string[]): Promise<ProfileCatalog
 }
 
 async function commandInit(args: string[]): Promise<void> {
-  const configPath = optionValue(args, "--config");
+  const configPath = optionValue(args, "--config") ?? process.env.LIVIS_RELAY_CONFIG;
   const profileSourcePath = optionValue(args, "--profile");
   if (!profileSourcePath) {
     throw new Error("公开发行版不附带 live profile；用法：init --profile /绝对路径/authorized-profile.json");
@@ -116,6 +168,7 @@ async function commandConnectorToken(args: string[]): Promise<void> {
 
 async function refreshOrRequireSupportedProof(
   context: Awaited<ReturnType<typeof loadContext>>,
+  guard: ProfileOperationGuard,
 ): Promise<SupportedUpstreamProof> {
   let snapshot;
   try {
@@ -140,29 +193,31 @@ async function refreshOrRequireSupportedProof(
     profile: context.profile,
     profileSha256: context.config.profileSha256,
     snapshot,
-  })).proof;
+  }, guard)).proof;
 }
 
 async function commandLogin(args: string[]): Promise<void> {
-  const context = await loadContext(optionValue(args, "--config"));
-  if (!context.config.security.acknowledgeUnofficialProtocol) {
-    throw new Error("登录前必须确认第三方兼容协议边界");
-  }
-  await refreshOrRequireSupportedProof(context);
-  const auth = new IdaasClient(context.profile, context.secrets);
-  const deviceCode = await auth.requestDeviceCode(hasFlag(args, "--force"));
-  process.stdout.write(`请在浏览器完成登录：\n${deviceCode.verification_uri_complete}\n`);
-  if (!hasFlag(args, "--no-open") && process.platform === "darwin") {
-    const child = Bun.spawn(["open", deviceCode.verification_uri_complete], {
-      stdout: "ignore",
-      stderr: "ignore",
+  const { context, guard } = await loadProfileOperationContext(args, "login");
+  await withProfileOperationGuardRelease(guard, "login", async () => {
+    if (!context.config.security.acknowledgeUnofficialProtocol) {
+      throw new Error("登录前必须确认第三方兼容协议边界");
+    }
+    await refreshOrRequireSupportedProof(context, guard);
+    const auth = new IdaasClient(context.profile, context.secrets);
+    const deviceCode = await auth.requestDeviceCode(hasFlag(args, "--force"));
+    process.stdout.write(`请在浏览器完成登录：\n${deviceCode.verification_uri_complete}\n`);
+    if (!hasFlag(args, "--no-open") && process.platform === "darwin") {
+      const child = Bun.spawn(["open", deviceCode.verification_uri_complete], {
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      child.unref();
+    }
+    await auth.pollForToken(deviceCode, {
+      onPending: () => process.stdout.write("."),
     });
-    child.unref();
-  }
-  await auth.pollForToken(deviceCode, {
-    onPending: () => process.stdout.write("."),
+    process.stdout.write(`\n登录成功。LiViS Agent ID：${context.identity.agentId}\n`);
   });
-  process.stdout.write(`\n登录成功。LiViS Agent ID：${context.identity.agentId}\n`);
 }
 
 async function commandLogout(args: string[]): Promise<void> {
@@ -172,23 +227,48 @@ async function commandLogout(args: string[]): Promise<void> {
 }
 
 async function commandServe(args: string[]): Promise<void> {
-  const context = await loadContext(optionValue(args, "--config"));
-  const upstreamProof = await refreshOrRequireSupportedProof(context);
-  const daemon = RelayDaemon.create({
-    config: context.config,
-    profile: context.profile,
-    identity: context.identity,
-    secrets: context.secrets,
-    secretValues: context.secretValues,
-    upstreamProofExpiresAt: Date.parse(upstreamProof.expiresAt),
-  });
-  daemon.start();
-  await new Promise<void>((resolvePromise) => {
+  const { context, guard } = await loadProfileOperationContext(args, "serve-start");
+  let daemon: RelayDaemon | null = null;
+  try {
+    const upstreamProof = await refreshOrRequireSupportedProof(context, guard);
+    daemon = RelayDaemon.create({
+      config: context.config,
+      profile: context.profile,
+      identity: context.identity,
+      secrets: context.secrets,
+      secretValues: context.secretValues,
+      upstreamProofExpiresAt: Date.parse(upstreamProof.expiresAt),
+    });
+    daemon.start();
+  } catch (primaryError) {
+    return rethrowAfterProfileOperationCleanup(
+      "serve 启动",
+      primaryError,
+      [
+        ...(daemon
+          ? [{ label: "daemon stop", run: () => daemon!.stop() }]
+          : []),
+        { label: "profile operation guard release", run: () => guard.release() },
+      ],
+    );
+  }
+  if (!daemon) throw new Error("daemon 启动状态异常");
+  const runningDaemon = daemon;
+  try {
+    await guard.release();
+  } catch (primaryError) {
+    return rethrowAfterProfileOperationCleanup(
+      "serve 启动阶段释放 profile operation guard",
+      primaryError,
+      [{ label: "daemon stop", run: () => runningDaemon.stop() }],
+    );
+  }
+  await new Promise<void>((resolvePromise, rejectPromise) => {
     let stopping = false;
     const stop = () => {
       if (stopping) return;
       stopping = true;
-      void daemon.stop().finally(resolvePromise);
+      void runningDaemon.stop().then(resolvePromise, rejectPromise);
     };
     process.once("SIGINT", stop);
     process.once("SIGTERM", stop);
@@ -196,49 +276,51 @@ async function commandServe(args: string[]): Promise<void> {
 }
 
 async function commandUpstreamCheck(args: string[]): Promise<void> {
-  const context = await loadContext(optionValue(args, "--config"));
-  const profileDirectory = dirname(resolveProfilePath(context.config.profile, context.path));
-  const catalog = await loadProfileCatalog([profileDirectory, BUILTIN_PROFILE_DIRECTORY]);
-  const artifactDirectory = join(context.config.stateDir, "upstream-artifacts", "sha256");
-  const snapshot = await new UpstreamChecker({
-    artifactSink: async (_kind, _url, bytes) => {
-      const path = join(artifactDirectory, sha256(bytes));
-      if (!await Bun.file(path).exists()) await atomicWritePrivateBytes(path, bytes);
-      return path;
-    },
-  }).check(context.profile, catalog.map((entry) => entry.profile));
-  const candidateDirectory = join(context.config.stateDir, "upstream-candidates");
-  const stamp = snapshot.checkedAt.replace(/[:.]/g, "-");
-  const snapshotPath = join(candidateDirectory, `${stamp}-snapshot.json`);
-  await atomicWritePrivate(snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
-  const candidateProfile = buildCandidateProfile(context.profile, snapshot);
-  const candidateProfilePath = candidateProfile
-    ? join(candidateDirectory, `${stamp}-profile-draft.json`)
-    : null;
-  if (candidateProfile && candidateProfilePath) {
-    await atomicWritePrivate(candidateProfilePath, `${JSON.stringify(candidateProfile, null, 2)}\n`);
-  }
-  const reviewedProfilePath = snapshot.matchedProfileId
-    ? catalog.find((entry) => entry.profile.id === snapshot.matchedProfileId)?.path ?? null
-    : null;
-  const supportedProof = snapshot.compatibility === "supported"
-    ? await saveSupportedProof({
-      stateDir: context.config.stateDir,
-      profile: context.profile,
-      profileSha256: context.config.profileSha256,
-      snapshot,
-    })
-    : null;
-  process.stdout.write(`${JSON.stringify({
-    ...snapshot,
-    snapshotPath,
-    candidateProfilePath,
-    reviewedProfilePath,
-    supportedProofPath: supportedProof?.path ?? null,
-  }, null, 2)}\n`);
-  if (snapshot.compatibility !== "supported") {
-    process.exitCode = 2;
-  }
+  const { context, guard } = await loadProfileOperationContext(args, "upstream-check");
+  await withProfileOperationGuardRelease(guard, "upstream check", async () => {
+    const profileDirectory = dirname(resolveProfilePath(context.config.profile, context.path));
+    const catalog = await loadProfileCatalog([profileDirectory, BUILTIN_PROFILE_DIRECTORY]);
+    const artifactDirectory = join(context.config.stateDir, "upstream-artifacts", "sha256");
+    const snapshot = await new UpstreamChecker({
+      artifactSink: async (_kind, _url, bytes) => {
+        const path = join(artifactDirectory, sha256(bytes));
+        if (!await Bun.file(path).exists()) await atomicWritePrivateBytes(path, bytes);
+        return path;
+      },
+    }).check(context.profile, catalog.map((entry) => entry.profile));
+    const candidateDirectory = join(context.config.stateDir, "upstream-candidates");
+    const stamp = snapshot.checkedAt.replace(/[:.]/g, "-");
+    const snapshotPath = join(candidateDirectory, `${stamp}-snapshot.json`);
+    await atomicWritePrivate(snapshotPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+    const candidateProfile = buildCandidateProfile(context.profile, snapshot);
+    const candidateProfilePath = candidateProfile
+      ? join(candidateDirectory, `${stamp}-profile-draft.json`)
+      : null;
+    if (candidateProfile && candidateProfilePath) {
+      await atomicWritePrivate(candidateProfilePath, `${JSON.stringify(candidateProfile, null, 2)}\n`);
+    }
+    const reviewedProfilePath = snapshot.matchedProfileId
+      ? catalog.find((entry) => entry.profile.id === snapshot.matchedProfileId)?.path ?? null
+      : null;
+    const supportedProof = snapshot.compatibility === "supported"
+      ? await saveSupportedProof({
+        stateDir: context.config.stateDir,
+        profile: context.profile,
+        profileSha256: context.config.profileSha256,
+        snapshot,
+      }, guard)
+      : null;
+    process.stdout.write(`${JSON.stringify({
+      ...snapshot,
+      snapshotPath,
+      candidateProfilePath,
+      reviewedProfilePath,
+      supportedProofPath: supportedProof?.path ?? null,
+    }, null, 2)}\n`);
+    if (snapshot.compatibility !== "supported") {
+      process.exitCode = 2;
+    }
+  });
 }
 
 async function commandUpstreamActivate(args: string[]): Promise<void> {
@@ -248,33 +330,35 @@ async function commandUpstreamActivate(args: string[]): Promise<void> {
   const candidatePathRaw = optionValue(args, "--profile");
   if (!candidatePathRaw) throw new Error("用法：upstream activate --profile PATH --acknowledge-reviewed-profile");
   const candidatePath = expandHome(candidatePathRaw);
-  const context = await loadContext(optionValue(args, "--config"));
-  const candidateProfile = parseProtocolProfile(await Bun.file(candidatePath).text(), candidatePath);
-  const liveSnapshot = await new UpstreamChecker().check(candidateProfile, [candidateProfile]);
-  const activated = await activateReviewedProfile({
-    configPath: context.path,
-    config: context.config,
-    activeProfile: context.profile,
-    candidateProfile,
-    candidateSourcePath: candidatePath,
-    identity: context.identity,
-    liveSnapshot,
+  const { context, guard } = await loadProfileOperationContext(args, "upstream-activate");
+  await withProfileOperationGuardRelease(guard, "upstream activate", async () => {
+    const candidateProfile = parseProtocolProfile(await Bun.file(candidatePath).text(), candidatePath);
+    const liveSnapshot = await new UpstreamChecker().check(candidateProfile, [candidateProfile]);
+    const activated = await activateReviewedProfile({
+      configPath: context.path,
+      config: context.config,
+      activeProfile: context.profile,
+      candidateProfile,
+      candidateSourcePath: candidatePath,
+      identity: context.identity,
+      liveSnapshot,
+    });
+    const supportedProof = await saveSupportedProof({
+      stateDir: context.config.stateDir,
+      profile: candidateProfile,
+      profileSha256: activated.receipt.activated.profileSha256,
+      snapshot: liveSnapshot,
+    }, guard);
+    process.stdout.write(`${JSON.stringify({
+      ok: true,
+      activatedProfile: activated.receipt.activated,
+      previousProfile: activated.receipt.previous,
+      backupConfigPath: activated.receipt.backupConfigPath,
+      receiptPath: activated.receiptPath,
+      supportedProofPath: supportedProof.path,
+      restartRequired: true,
+    }, null, 2)}\n`);
   });
-  const supportedProof = await saveSupportedProof({
-    stateDir: context.config.stateDir,
-    profile: candidateProfile,
-    profileSha256: activated.receipt.activated.profileSha256,
-    snapshot: liveSnapshot,
-  });
-  process.stdout.write(`${JSON.stringify({
-    ok: true,
-    activatedProfile: activated.receipt.activated,
-    previousProfile: activated.receipt.previous,
-    backupConfigPath: activated.receipt.backupConfigPath,
-    receiptPath: activated.receiptPath,
-    supportedProofPath: supportedProof.path,
-    restartRequired: true,
-  }, null, 2)}\n`);
 }
 
 async function commandUpstreamRollback(args: string[]): Promise<void> {
@@ -283,13 +367,66 @@ async function commandUpstreamRollback(args: string[]): Promise<void> {
   }
   const backupPath = optionValue(args, "--backup");
   if (!backupPath) throw new Error("用法：upstream rollback --backup PATH --acknowledge-rollback");
-  const context = await loadContext(optionValue(args, "--config"));
-  const result = await rollbackProfileConfig({
-    configPath: context.path,
-    currentConfig: context.config,
-    backupConfigPath: expandHome(backupPath),
+  const { context, guard } = await loadProfileOperationContext(args, "upstream-rollback");
+  try {
+    const result = await rollbackProfileConfig({
+      configPath: context.path,
+      currentConfig: context.config,
+      backupConfigPath: expandHome(backupPath),
+    });
+    process.stdout.write(`${JSON.stringify({ ok: true, ...result }, null, 2)}\n`);
+  } finally {
+    await guard.release();
+  }
+}
+
+async function commandProfileMigrateV2(args: string[]): Promise<void> {
+  const dryRun = hasFlag(args, "--dry-run");
+  const apply = hasFlag(args, "--apply");
+  if (dryRun === apply) {
+    throw new Error("profile migrate-v2 必须且只能选择 --dry-run 或 --apply");
+  }
+  const wireContractRevision = optionValue(args, "--wire-contract-revision");
+  const credentialMode = optionValue(args, "--credential-mode");
+  if (!wireContractRevision || !credentialMode) {
+    throw new Error("必须显式传入 --wire-contract-revision 和 --credential-mode");
+  }
+  const plan = await planProtocolProfileV2Migration({
+    configPath: optionValue(args, "--config") ?? process.env.LIVIS_RELAY_CONFIG ?? DEFAULT_CONFIG_PATH,
+    wireContractRevision,
+    credentialMode,
+    forbiddenStateRoot: PROJECT_ROOT,
   });
-  process.stdout.write(`${JSON.stringify({ ok: true, ...result }, null, 2)}\n`);
+  if (dryRun) {
+    process.stdout.write(`${JSON.stringify({
+      ...protocolProfileMigrationPlanSummary(plan),
+      dryRun: true,
+      writes: [],
+    }, null, 2)}\n`);
+    return;
+  }
+  const result = await applyProtocolProfileV2Migration(plan, {
+    acknowledgeReviewedWireContract: hasFlag(args, "--acknowledge-reviewed-wire-contract"),
+    acknowledgeDaemonAndHermesStopped: hasFlag(args, "--acknowledge-daemon-and-hermes-stopped"),
+  });
+  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+}
+
+async function commandProfileRollbackMigration(args: string[]): Promise<void> {
+  if (!hasFlag(args, "--apply")) {
+    throw new Error("profile rollback-migration 是写操作，必须显式传入 --apply");
+  }
+  const receiptPath = optionValue(args, "--receipt");
+  if (!receiptPath) {
+    throw new Error("用法：profile rollback-migration --receipt PATH --apply --acknowledge-daemon-and-hermes-stopped");
+  }
+  const result = await rollbackProtocolProfileMigration({
+    configPath: optionValue(args, "--config") ?? process.env.LIVIS_RELAY_CONFIG ?? DEFAULT_CONFIG_PATH,
+    receiptPath,
+    acknowledgeDaemonAndHermesStopped: hasFlag(args, "--acknowledge-daemon-and-hermes-stopped"),
+    forbiddenStateRoot: PROJECT_ROOT,
+  });
+  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
 async function commandDoctor(args: string[]): Promise<void> {
@@ -410,6 +547,9 @@ function printHelp(): void {
   process.stdout.write("  upstream check [--config PATH]\n");
   process.stdout.write("  upstream activate --profile PATH --acknowledge-reviewed-profile [--config PATH]\n");
   process.stdout.write("  upstream rollback --backup PATH --acknowledge-rollback [--config PATH]\n");
+  process.stdout.write("  profile migrate-v2 --dry-run --wire-contract-revision REVISION --credential-mode MODE [--config PATH]\n");
+  process.stdout.write("  profile migrate-v2 --apply --wire-contract-revision REVISION --credential-mode MODE --acknowledge-reviewed-wire-contract --acknowledge-daemon-and-hermes-stopped [--config PATH]\n");
+  process.stdout.write("  profile rollback-migration --receipt PATH --apply --acknowledge-daemon-and-hermes-stopped [--config PATH]\n");
   process.stdout.write("  connector-token [--config PATH]\n");
   process.stdout.write("  session release <sessionKey> [--config PATH]\n");
 }
@@ -441,6 +581,11 @@ async function main(): Promise<void> {
       else if (subcommand === "activate") await commandUpstreamActivate(args);
       else if (subcommand === "rollback") await commandUpstreamRollback(args);
       else throw new Error("只支持 upstream check / upstream activate / upstream rollback");
+      break;
+    case "profile":
+      if (subcommand === "migrate-v2") await commandProfileMigrateV2(args);
+      else if (subcommand === "rollback-migration") await commandProfileRollbackMigration(args);
+      else throw new Error("只支持 profile migrate-v2 / profile rollback-migration");
       break;
     case "connector-token":
       await commandConnectorToken(args);

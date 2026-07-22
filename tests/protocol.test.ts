@@ -5,6 +5,9 @@ import {
   buildResultEnvelope,
   parseIncomingRelayJob,
   parseRelayEnvelope,
+  RELAY_IDENTIFIER_MAX_BYTES,
+  RELAY_MESSAGE_TYPE_MAX_BYTES,
+  RELAY_NODE_TYPE_MAX_BYTES,
   resultAckCandidates,
   serializeResult,
 } from "../src/protocol/livis.ts";
@@ -80,5 +83,51 @@ describe("LiViS wire protocol", () => {
   test("拒绝非对象 envelope", () => {
     expect(() => parseRelayEnvelope("[]")).toThrow("JSON 对象");
     expect(() => parseRelayEnvelope('{"payload":{}}')).toThrow("message.type");
+  });
+
+  test("按 UTF-8 字节限制外部 type、job/msg/node 与 ACK 标识", () => {
+    expect(parseRelayEnvelope(JSON.stringify({
+      type: "t".repeat(RELAY_MESSAGE_TYPE_MAX_BYTES),
+    })).type).toHaveLength(RELAY_MESSAGE_TYPE_MAX_BYTES);
+
+    const oversizedType = `sentinel-${"t".repeat(RELAY_MESSAGE_TYPE_MAX_BYTES)}`;
+    expect(() => parseRelayEnvelope(JSON.stringify({ type: oversizedType }))).toThrow("字节上限");
+    try {
+      parseRelayEnvelope(JSON.stringify({ type: oversizedType }));
+    } catch (error) {
+      expect((error as Error).message).not.toContain("sentinel");
+    }
+
+    for (const envelope of [
+      { type: "cancel_chat", metadata: { job_id: "j".repeat(RELAY_IDENTIFIER_MAX_BYTES + 1) } },
+      { type: "ack_send_result", metadata: { msg_id: "m".repeat(RELAY_IDENTIFIER_MAX_BYTES + 1) } },
+      { type: "ack_send_result", payload: { ref_msg_id: "r".repeat(RELAY_IDENTIFIER_MAX_BYTES + 1) } },
+      { type: "send_message", payload: { from_node_id: "节".repeat(86) } },
+      { type: "send_message", payload: { from_node_type: "n".repeat(RELAY_NODE_TYPE_MAX_BYTES + 1) } },
+    ]) {
+      expect(() => parseRelayEnvelope(JSON.stringify(envelope))).toThrow("字节上限");
+    }
+  });
+
+  test("直接解析 job 也不会绕过标识边界或在错误中回显业务 type", () => {
+    const oversizedJob = {
+      type: "send_message",
+      metadata: { job_id: "j".repeat(RELAY_IDENTIFIER_MAX_BYTES + 1) },
+      payload: { from_node_id: "node", data: { type: "exec", content: "hello" } },
+    };
+    expect(() => parseIncomingRelayJob(oversizedJob, 100)).toThrow("字节上限");
+
+    const externalType = `sentinel-${"x".repeat(RELAY_MESSAGE_TYPE_MAX_BYTES)}`;
+    try {
+      parseIncomingRelayJob({
+        ...oversizedJob,
+        metadata: { job_id: "job" },
+        payload: { from_node_id: "node", data: { type: externalType, content: "hello" } },
+      }, 100);
+      throw new Error("expected parseIncomingRelayJob to reject");
+    } catch (error) {
+      expect((error as Error).message).toContain("字节上限");
+      expect((error as Error).message).not.toContain("sentinel");
+    }
   });
 });
