@@ -13,29 +13,35 @@ from datetime import datetime, timezone
 import importlib.metadata
 import json
 import logging
+import math
 import os
 import platform as platform_module
 import random
 import socket
 from typing import Any, Dict, Optional
 
-from gateway.config import Platform
+from gateway.config import HomeChannel, Platform
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
     ProcessingOutcome,
     SendResult,
+    coerce_plaintext_gateway_command,
 )
 
 logger = logging.getLogger(__name__)
 
 CONNECTOR_PROTOCOL_VERSION = 1
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.1.1"
 MAX_FRAME_BYTES = 1024 * 1024
 RETRY_INITIAL_SECONDS = 1.0
 RETRY_MAX_SECONDS = 30.0
 DEFAULT_RESULT_STORE_TIMEOUT_SECONDS = 5.0
+REMOTE_COMMAND_REJECTED = "LiViS 远程渠道不允许执行 Hermes 命令"
+ACTIVE_SESSION_REJECTED = "Hermes session 正在执行，LiViS 新输入已拒绝"
+BLOCKING_APPROVAL_REJECTED = "Hermes session 正在等待审批，LiViS 输入已拒绝"
+SAFETY_STATE_UNAVAILABLE = "Hermes 安全状态不可验证，LiViS 输入已拒绝"
 
 
 class LocalRelayUnavailable(RuntimeError):
@@ -69,6 +75,47 @@ def _hermes_version() -> str:
     return "unknown"
 
 
+def _event_timestamp(value: Any) -> datetime:
+    """将不可信 job 毫秒时间戳归一化为可构造的 UTC 时间。"""
+    try:
+        timestamp_ms = float(value)
+        if not math.isfinite(timestamp_ms):
+            raise ValueError("job timestamp must be finite")
+        return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return datetime.now(tz=timezone.utc)
+
+
+def _configured_home_channel() -> str | None:
+    """返回本地固定的 LiViS home channel；无效配置一律失败关闭。"""
+    value = os.getenv("LIVIS_HOME_CHANNEL", "").strip()
+    if not value.startswith("livis:"):
+        return None
+    agent_id = value.removeprefix("livis:")
+    if not agent_id or len(value.encode("utf-8")) > 256:
+        return None
+    if any(character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        return None
+    return value
+
+
+def _home_channel_matches(config, expected: str, *, allow_missing: bool) -> bool:
+    home = getattr(config, "home_channel", None)
+    if home is None:
+        return allow_missing
+    platform = getattr(getattr(home, "platform", None), "value", None)
+    chat_id = str(getattr(home, "chat_id", ""))
+    thread_id = getattr(home, "thread_id", None)
+    return platform == "livis" and chat_id == expected and not thread_id
+
+
+def _has_blocking_approval(session_key: str) -> bool:
+    """延迟导入 Hermes 审批状态；导入或读取异常由调用方失败关闭。"""
+    from tools.approval import has_blocking_approval
+
+    return bool(has_blocking_approval(session_key))
+
+
 async def _unix_connect(path: str, token: str):
     """Connect through the public websockets Unix-socket client API."""
     import websockets
@@ -96,6 +143,17 @@ class LivisBridgeAdapter(BasePlatformAdapter):
 
     def __init__(self, config, **_kwargs):
         super().__init__(config=config, platform=Platform("livis"))
+        self.home_channel = _configured_home_channel()
+        existing_home = getattr(config, "home_channel", None)
+        if self.home_channel and existing_home is None:
+            config.home_channel = HomeChannel(
+                platform=self.platform,
+                chat_id=self.home_channel,
+                name="LiViS",
+            )
+        # 该 connector 没有主动推送 job；禁止 Hermes 在启停时向 home channel
+        # 发送无法关联 lease 的通知。
+        config.gateway_restart_notification = False
         extra = getattr(config, "extra", {}) or {}
         self.socket_path = str(
             os.getenv("LIVIS_RELAY_SOCKET") or extra.get("socket_path", "")
@@ -119,6 +177,11 @@ class LivisBridgeAdapter(BasePlatformAdapter):
         self._source_by_job: Dict[str, Any] = {}
         self._final_by_job: Dict[str, str] = {}
         self._cancelled_jobs: set[str] = set()
+        self._rejected_job_leases: Dict[str, str] = {}
+        self._rejection_cancelled_jobs: set[str] = set()
+        self._offered_job_leases: Dict[str, str] = {}
+        self._offered_job_cancels: set[str] = set()
+        self._admitted_sessions: set[str] = set()
         self._background_dispatches: set[asyncio.Task] = set()
 
     @property
@@ -126,10 +189,10 @@ class LivisBridgeAdapter(BasePlatformAdapter):
         return "LiViS Relay"
 
     async def connect(self) -> bool:
-        if not check_requirements():
+        if not _runtime_config_valid(self.config):
             self._set_fatal_error(
                 "phase1_config_invalid",
-                "LiViS relay requires socket, token, allowlist and read-only acknowledgement",
+                "LiViS relay requires socket, token, allowlist, local home channel and read-only acknowledgement",
                 retryable=False,
             )
             return False
@@ -169,6 +232,11 @@ class LivisBridgeAdapter(BasePlatformAdapter):
             if not waiter.done():
                 waiter.set_exception(LocalRelayUnavailable("livis-relayd disconnected"))
         self._result_waiters.clear()
+        self._rejected_job_leases.clear()
+        self._rejection_cancelled_jobs.clear()
+        self._offered_job_leases.clear()
+        self._offered_job_cancels.clear()
+        self._admitted_sessions.clear()
         self._mark_disconnected()
 
     async def send(
@@ -329,7 +397,14 @@ class LivisBridgeAdapter(BasePlatformAdapter):
             self._ready_event.set()
             return
         if message_type == "job":
-            task = asyncio.create_task(self._handle_job(message["job"]))
+            job = message["job"]
+            job_websocket = self._ws
+            if job_websocket is None:
+                raise LocalRelayUnavailable("livis-relayd IPC is disconnected")
+            self._reserve_job_offer(job)
+            task = asyncio.create_task(
+                self._handle_job(job, websocket=job_websocket)
+            )
             self._background_dispatches.add(task)
             task.add_done_callback(self._background_dispatches.discard)
             return
@@ -337,9 +412,13 @@ class LivisBridgeAdapter(BasePlatformAdapter):
             await self._handle_cancel(message)
             return
         if message_type == "result_stored":
-            waiter = self._result_waiters.get(str(message.get("jobId", "")))
+            job_id = str(message.get("jobId", ""))
+            lease_id = str(message.get("leaseId", ""))
+            if self._rejected_job_leases.get(job_id) == lease_id:
+                self._rejected_job_leases.pop(job_id, None)
+            waiter = self._result_waiters.get(job_id)
             if waiter and not waiter.done():
-                waiter.set_result(str(message.get("leaseId", "")))
+                waiter.set_result(lease_id)
             return
         if message_type == "error":
             job_id = str(message.get("jobId", ""))
@@ -354,9 +433,14 @@ class LivisBridgeAdapter(BasePlatformAdapter):
         if message_type == "ping":
             await self._send_local({"type": "pong", "timestamp": message.get("timestamp")})
 
-    async def _handle_job(self, job: dict) -> None:
+    async def _handle_job(self, job: dict, *, websocket=None) -> None:
+        job_websocket = websocket if websocket is not None else self._ws
         job_id = str(job["jobId"])
         lease_id = str(job["leaseId"])
+        self._reserve_job_offer(job)
+        if job_id in self._offered_job_cancels:
+            self._release_job_offer(job_id, lease_id)
+            return
         chat_id = str(job["chatId"])
         message_id = str(job.get("messageId") or job_id)
         user = job.get("user") or {}
@@ -369,38 +453,151 @@ class LivisBridgeAdapter(BasePlatformAdapter):
             user_name=str(user.get("displayName") or "LiViS user"),
             message_id=job_id,
         )
-        self._job_by_message_id[job_id] = job_id
-        self._job_by_message_id[message_id] = job_id
-        self._active_job_by_chat[chat_id] = job_id
-        self._lease_by_job[job_id] = lease_id
-        self._source_by_job[job_id] = source
-        await self._send_local({"type": "accepted", "jobId": job_id, "leaseId": lease_id})
-        try:
-            await self.handle_message(
-                MessageEvent(
-                    text=str(job["text"]),
-                    message_type=MessageType.TEXT,
-                    source=source,
-                    message_id=job_id,
-                    raw_message=job,
-                    timestamp=datetime.fromtimestamp(
-                        float(job.get("timestamp", 0)) / 1000,
-                        tz=timezone.utc,
-                    ) if job.get("timestamp") else datetime.now(tz=timezone.utc),
+        event = MessageEvent(
+            text=str(job["text"]),
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=job_id,
+            raw_message=job,
+            timestamp=_event_timestamp(job.get("timestamp")),
+        )
+        rejection, session_key = self._remote_input_admission(event)
+        if rejection is not None:
+            # 该 tombstone 必须在首次 await 前存在，使并发 cancel 能证明
+            # Hermes 尚未开始执行，并避免误派内部 /stop。
+            self._rejected_job_leases[job_id] = lease_id
+            self._release_job_offer(job_id, lease_id)
+            try:
+                await self._persist_rejection(
+                    job_id,
+                    lease_id,
+                    rejection,
+                    websocket=job_websocket,
                 )
-            )
-        except Exception as exc:
-            await self._send_local({
-                "type": "failed",
-                "jobId": job_id,
-                "leaseId": lease_id,
-                "error": f"Hermes dispatch failed: {exc}",
-                "retryable": False,
-            })
+            except ResultSupersededByCancel:
+                if job_id not in self._rejection_cancelled_jobs:
+                    await self._send_local({
+                        "type": "cancelled",
+                        "jobId": job_id,
+                        "leaseId": lease_id,
+                    }, websocket=job_websocket)
+            except LocalRelayUnavailable as exc:
+                logger.warning("LiViS 输入拒绝结果未获得 durable ACK：%s", exc)
+                if job_websocket is not None:
+                    try:
+                        await job_websocket.close()
+                    except Exception:
+                        logger.debug("关闭未确认拒绝结果的 connector 失败", exc_info=True)
+            finally:
+                if self._rejected_job_leases.get(job_id) == lease_id:
+                    self._rejected_job_leases.pop(job_id, None)
+                self._rejection_cancelled_jobs.discard(job_id)
+            return
+
+        if session_key is None:
+            raise RuntimeError("Hermes input admission did not return a session key")
+        # 单线程事件循环中，从 admission 返回到写 reservation 之间没有 await；
+        # 该 reservation 关闭 accepted 与 Hermes _active_sessions 建立之间的窗口。
+        self._admitted_sessions.add(session_key)
+        try:
+            self._job_by_message_id[job_id] = job_id
+            self._job_by_message_id[message_id] = job_id
+            self._active_job_by_chat[chat_id] = job_id
+            self._lease_by_job[job_id] = lease_id
+            self._source_by_job[job_id] = source
+            try:
+                await self._send_local(
+                    {"type": "accepted", "jobId": job_id, "leaseId": lease_id},
+                    websocket=job_websocket,
+                )
+            except Exception:
+                self._release_job_maps(job_id)
+                self._release_job_offer(job_id, lease_id)
+                raise
+            if job_id in self._offered_job_cancels:
+                self._release_job_maps(job_id)
+                self._release_job_offer(job_id, lease_id)
+                return
+            self._release_job_offer(job_id, lease_id)
+            try:
+                await self.handle_message(event)
+            except Exception as exc:
+                await self._send_local({
+                    "type": "failed",
+                    "jobId": job_id,
+                    "leaseId": lease_id,
+                    "error": f"Hermes dispatch failed: {exc}",
+                    "retryable": False,
+                }, websocket=job_websocket)
+        finally:
+            self._admitted_sessions.discard(session_key)
+
+    def _remote_input_admission(self, event: MessageEvent) -> tuple[str | None, str | None]:
+        """在 Hermes dispatcher、job 映射和 accepted 之前关闭控制入口。"""
+        try:
+            coerce_plaintext_gateway_command(event)
+        except Exception:
+            logger.warning("Hermes 远程命令归一化状态不可读", exc_info=True)
+            return SAFETY_STATE_UNAVAILABLE, None
+
+        if str(event.text or "").strip().startswith("/"):
+            return REMOTE_COMMAND_REJECTED, None
+
+        try:
+            source = event.source
+            if self.home_channel is None or str(getattr(source, "chat_id", "")) != self.home_channel:
+                return SAFETY_STATE_UNAVAILABLE, None
+
+            handler = self._message_handler
+            runner = getattr(handler, "__self__", None)
+            session_key_for_source = getattr(runner, "_session_key_for_source", None)
+            if runner is None or not callable(session_key_for_source):
+                return SAFETY_STATE_UNAVAILABLE, None
+            session_key = session_key_for_source(source)
+            if not isinstance(session_key, str) or not session_key:
+                return SAFETY_STATE_UNAVAILABLE, None
+
+            heal_stale_session_lock = getattr(self, "_heal_stale_session_lock", None)
+            if not callable(heal_stale_session_lock):
+                return SAFETY_STATE_UNAVAILABLE, None
+            heal_stale_session_lock(session_key)
+
+            active_sessions = getattr(self, "_active_sessions", None)
+            if not isinstance(active_sessions, dict):
+                return SAFETY_STATE_UNAVAILABLE, None
+            if session_key in active_sessions or session_key in self._admitted_sessions:
+                return ACTIVE_SESSION_REJECTED, None
+            if _has_blocking_approval(session_key):
+                return BLOCKING_APPROVAL_REJECTED, None
+        except Exception:
+            logger.warning("Hermes session/审批安全状态不可读", exc_info=True)
+            return SAFETY_STATE_UNAVAILABLE, None
+        return None, session_key
+
+    def _reserve_job_offer(self, job: dict) -> None:
+        job_id = str(job["jobId"])
+        lease_id = str(job["leaseId"])
+        existing = self._offered_job_leases.get(job_id)
+        if existing is not None and existing != lease_id:
+            raise ValueError("daemon reused a pending jobId with a different lease")
+        self._offered_job_leases[job_id] = lease_id
+
+    def _release_job_offer(self, job_id: str, lease_id: str) -> None:
+        if self._offered_job_leases.get(job_id) == lease_id:
+            self._offered_job_leases.pop(job_id, None)
+        self._offered_job_cancels.discard(job_id)
 
     async def _handle_cancel(self, message: dict) -> None:
         job_id = str(message.get("jobId", ""))
         lease_id = str(message.get("leaseId", ""))
+        if self._rejected_job_leases.get(job_id) == lease_id:
+            self._rejection_cancelled_jobs.add(job_id)
+            await self._send_local({"type": "cancelled", "jobId": job_id, "leaseId": lease_id})
+            return
+        if self._offered_job_leases.get(job_id) == lease_id:
+            self._offered_job_cancels.add(job_id)
+            await self._send_local({"type": "cancelled", "jobId": job_id, "leaseId": lease_id})
+            return
         if self._lease_by_job.get(job_id) != lease_id:
             return
         source = self._source_by_job.get(job_id)
@@ -421,6 +618,51 @@ class LivisBridgeAdapter(BasePlatformAdapter):
         # CancelUnknown and quarantines the session until an operator verifies
         # that non-cooperative tool threads have exited.
         await self._send_local({"type": "cancelled", "jobId": job_id, "leaseId": lease_id})
+
+    async def _persist_rejection(
+        self,
+        job_id: str,
+        lease_id: str,
+        error: str,
+        *,
+        websocket,
+    ) -> None:
+        if (
+            not self._ready_event.is_set()
+            or websocket is None
+            or self._ws is not websocket
+        ):
+            raise LocalRelayUnavailable("livis-relayd connector isn't ready")
+        loop = asyncio.get_running_loop()
+        waiter = self._result_waiters.get(job_id)
+        if waiter is None or waiter.done():
+            waiter = loop.create_future()
+            self._result_waiters[job_id] = waiter
+        async with self._send_lock:
+            if self._ws is not websocket:
+                raise LocalRelayUnavailable("livis-relayd connector generation changed")
+            await self._send_local({
+                "type": "failed",
+                "jobId": job_id,
+                "leaseId": lease_id,
+                "error": error,
+                "retryable": False,
+            }, websocket=websocket)
+        try:
+            acknowledged_lease = await asyncio.wait_for(
+                asyncio.shield(waiter), timeout=self._result_store_timeout
+            )
+        except asyncio.TimeoutError as exc:
+            raise LocalRelayUnavailable(
+                "livis-relayd didn't acknowledge durable rejection storage"
+            ) from exc
+        finally:
+            if self._result_waiters.get(job_id) is waiter:
+                self._result_waiters.pop(job_id, None)
+            if not waiter.done():
+                waiter.cancel()
+        if acknowledged_lease != lease_id:
+            raise LocalRelayUnavailable("livis-relayd acknowledged a different rejection lease")
 
     async def _persist_result(self, job_id: str, lease_id: str, content: str) -> None:
         if not self._ready_event.is_set() or self._ws is None:
@@ -444,18 +686,21 @@ class LivisBridgeAdapter(BasePlatformAdapter):
         except asyncio.TimeoutError as exc:
             raise LocalRelayUnavailable("livis-relayd didn't acknowledge durable result storage") from exc
         finally:
-            if waiter.done():
+            if self._result_waiters.get(job_id) is waiter:
                 self._result_waiters.pop(job_id, None)
+            if not waiter.done():
+                waiter.cancel()
         if acknowledged_lease != lease_id:
             raise LocalRelayUnavailable("livis-relayd acknowledged a different execution lease")
 
-    async def _send_local(self, message: dict) -> None:
-        if self._ws is None:
+    async def _send_local(self, message: dict, *, websocket=None) -> None:
+        target_websocket = websocket if websocket is not None else self._ws
+        if target_websocket is None:
             raise LocalRelayUnavailable("livis-relayd IPC is disconnected")
         encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
         if len(encoded.encode("utf-8")) > MAX_FRAME_BYTES:
             raise ValueError("connector frame too large")
-        await self._ws.send(encoded)
+        await target_websocket.send(encoded)
 
     async def _interrupt_all_active(self, reason: str) -> None:
         active = list(self._source_by_job.items())
@@ -519,6 +764,8 @@ def check_requirements() -> bool:
         return False
     if not _truthy(os.getenv("LIVIS_PHASE1_READ_ONLY_ACK")):
         return False
+    if _configured_home_channel() is None:
+        return False
     try:
         import websockets  # noqa: F401
     except ImportError:
@@ -529,7 +776,24 @@ def check_requirements() -> bool:
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     socket_path = os.getenv("LIVIS_RELAY_SOCKET") or extra.get("socket_path", "")
-    return bool(socket_path and os.path.isabs(socket_path) and check_requirements())
+    expected_home = _configured_home_channel()
+    return bool(
+        socket_path
+        and os.path.isabs(socket_path)
+        and expected_home
+        and check_requirements()
+        and _home_channel_matches(config, expected_home, allow_missing=True)
+    )
+
+
+def _runtime_config_valid(config) -> bool:
+    expected_home = _configured_home_channel()
+    return bool(
+        expected_home
+        and validate_config(config)
+        and _home_channel_matches(config, expected_home, allow_missing=False)
+        and getattr(config, "gateway_restart_notification", None) is False
+    )
 
 
 def is_connected(config) -> bool:
@@ -557,6 +821,7 @@ def register(ctx) -> None:
             "LIVIS_RELAY_TOKEN",
             "LIVIS_ALLOWED_USERS",
             "LIVIS_PHASE1_READ_ONLY_ACK",
+            "LIVIS_HOME_CHANNEL",
         ],
         install_hint="Install websockets with uv and start livis-relayd first",
         env_enablement_fn=_env_enablement,

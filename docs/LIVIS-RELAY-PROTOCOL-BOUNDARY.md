@@ -86,7 +86,7 @@ daemon commit
 | 记录 | 最高等级 | 实际证明 | 明确不证明 | 当前状态 |
 |---|---|---|---|---|
 | #14 | 高层 S4 人工摘要 | 旧版本 Device Flow、握手、单设备纯文本、Hermes final 与 outbox Delivered | 原始字段必填性、在线刷新、取消、重连、常驻运行 | 已合并；旧基线 |
-| #17 | 局部 S4 | macOS LaunchAgent、online doctor、Relay handshake、connector ready | 同一常驻 job 的消息与结果闭环 | Draft / DIRTY；旧 head CI |
+| #17 | 局部 S4 | macOS LaunchAgent、online doctor、Relay handshake、connector ready | 同一常驻 job 的消息与结果闭环 | 已关闭；部署边界由 #43 替代，旧证据仍不构成消息闭环 |
 | #23 | S3 + S2 | 官方客户端静态字段与 access-token-only fake Relay | 真实 Relay 省略 refresh token | Draft / DIRTY；旧 head CI |
 | #24 | S3 + S2 | 在线刷新 generation/退避的代码和 fake Relay | 真实 `token_expiring/token_refreshed` 与重连 | Draft / DIRTY；旧 head CI |
 | #28 | LiViS 侧 S2 | 真实 Hermes 0.18.2 runtime 配合 fake UDS 的局部生命周期 | LiViS IDaaS / Relay、真实模型和完整 profile | Draft / DIRTY；旧 head CI |
@@ -118,7 +118,7 @@ sequenceDiagram
 
 - Device Flow 在真实 IDaaS 上完成；`authorization_pending` 实际返回 HTTP 428，daemon 按 OAuth `error` 继续轮询；
 - 旧代码路径完成 Relay 握手；公开记录没有单独保存 refresh grant 或 `connect` 原始字段 receipt；
-- `/sethome` 与后续普通纯文本 job 均进入 `Succeeded`；
+- 当时的远程 `/sethome` 与后续普通纯文本 job 均进入 `Succeeded`；当前 bridge 已改为本地 `LIVIS_HOME_CHANNEL` 并在 `accepted` 前拒绝远程 `/sethome`，旧步骤只属于历史证据；
 - 普通文本由真实 Hermes 模型处理，结果进入 durable outbox；
 - daemon 收到真实 `ack_send_result`，outbox 进入 `Delivered`；
 - SQLite integrity、supported proof、Relay handshake、connector ready 与唯一双侧 allowlist 同时通过。

@@ -191,9 +191,25 @@ LIVIS_RELAY_SOCKET=${HOME}/.livis-relay/connector.sock
 LIVIS_RELAY_TOKEN=<使用 connector-token 命令读取>
 LIVIS_ALLOWED_USERS=<与 security.allowedNodeIds 完全相同的唯一 node_id>
 LIVIS_PHASE1_READ_ONLY_ACK=true
+LIVIS_HOME_CHANNEL=livis:<同一 state directory 的 identity.json.agentId>
 ```
 
-启动前读回 daemon 与 Hermes 两处 allowlist，确认它们完全相同且都只有一个值。`LIVIS_ALLOWED_USERS` 的逗号列表语法不代表一期允许配置多个设备。Hermes 0.15.1 的 `.env` 加载只展开 `${HOME}` 形式；裸 `$HOME` 会被当成字面路径，因此 socket 必须写成上述形式或经读回的绝对路径。
+`LIVIS_HOME_CHANNEL` 只能在本机配置，且必须精确绑定当前 daemon identity。可在写入专用 profile `.env` 前读回：
+
+```bash
+LIVIS_STATE_DIR="$HOME/.livis-relay"
+LIVIS_AGENT_ID="$(bun -e '
+const identity = await Bun.file(process.argv[1]).json();
+if (typeof identity.agentId !== "string" || identity.agentId.length === 0) process.exit(1);
+process.stdout.write(identity.agentId);
+' "$LIVIS_STATE_DIR/identity.json")" || exit 1
+LIVIS_HOME_CHANNEL="livis:$LIVIS_AGENT_ID"
+test "$LIVIS_HOME_CHANNEL" = "livis:$LIVIS_AGENT_ID" || exit 1
+```
+
+不要将真实 ID 提交到仓库，也不要从 LiViS 发送 `/sethome`。bridge 会在 job 映射和 `accepted` 之前拒绝该命令；远程值不能成为本地 profile 配置来源。
+
+启动前读回 daemon 与 Hermes 两处 allowlist，确认它们完全相同且都只有一个值；同时确认 `.env` 中的 `LIVIS_HOME_CHANNEL` 与上述本地计算结果逐字一致。`LIVIS_ALLOWED_USERS` 的逗号列表语法不代表一期允许配置多个设备。Hermes 0.15.1 的 `.env` 加载只展开 `${HOME}` 形式；裸 `$HOME` 会被当成字面路径，因此 socket 必须写成上述形式或经读回的绝对路径。
 
 读取 connector token：
 
@@ -206,6 +222,8 @@ Hermes 显示配置必须关闭 streaming、tool progress 和 interim assistant 
 Hermes 0.15.1 建议为 LiViS 使用独立 profile，并在该 profile 的 `config.yaml` 中显式固定：
 
 ```yaml
+livis:
+  gateway_restart_notification: false
 platform_toolsets:
   livis:
     - no_mcp
@@ -226,7 +244,9 @@ gateway:
   strict: true
 ```
 
-`tool_progress` 的关闭值是字符串 `"off"`，不是 `none` 或 YAML 布尔值；必须保留引号。`no_mcp` 让该平台即使以后配置了全局 MCP，也仍保持零工具面。所有 `hermes plugins` / `hermes gateway` 命令都必须带该 profile 的 `HERMES_HOME`，普通命令会误操作默认 profile。
+`gateway_restart_notification=false` 防止 Hermes 在没有 active LiViS job/lease 时向本地 home channel 主动发送启停通知；adapter 运行时也会强制该值。`tool_progress` 的关闭值是字符串 `"off"`，不是 `none` 或 YAML 布尔值；必须保留引号。`no_mcp` 让该平台即使以后配置了全局 MCP，也仍保持零工具面。所有 `hermes plugins` / `hermes gateway` 命令都必须带该 profile 的 `HERMES_HOME`，普通命令会误操作默认 profile。
+
+一期 LiViS 只承载普通模型输入，不承载 Hermes 控制或审批。所有远程斜杠命令、Hermes 会归一化的自然语言重启别名、active session 期间的新输入、blocking approval 期间的任何答复，以及无法验证 session/approval 状态的输入都会在 `accepted` 前失败关闭。不要把 `yes`、`always` 或普通文本当作远程审批通道；daemon cancel 所需的内部 `/stop` 使用独立 connector 控制路径。
 
 该目录不是 wheel，也不能直接通过 monorepo 根执行 `hermes plugins install owner/repo`；开发、升级和卸载边界见 [`hermes-plugin/README.md`](../hermes-plugin/README.md)。
 
@@ -1031,7 +1051,7 @@ Hermes 的 stdout/stderr 路径以 runtime 生成的 plist 为准，先用 `plut
 1. 按 Hermes → Relay 顺序停止两个 LaunchAgent，并确认 label 均不再运行。
 2. 完整备份 state directory；JobStore v3 场景必须包含 `relay.db`、WAL 和 SHM。备份前不要运行会打开数据库的新版 `serve`、`doctor` 或 `session release`。
 3. 在稳定 checkout 中获取并切换到精确已审阅提交，确认工作树干净，执行 `bun install --frozen-lockfile` 与 `bun run check`。
-4. 按第 6 节把当前提交中的 bridge 三个文件重新安装到隔离 Hermes profile；不要从 LiViS 通道执行 `/update`，也不要在其他 Gateway 运行期间执行未经评审的全局 Hermes 更新。
+4. 按第 6 节把当前提交中的 bridge 三个文件重新安装到隔离 Hermes profile；将私有 `config.json` 的 `hermes.bridgeMinimumVersion` 显式更新为 `"0.1.1"`（或已独立评审的更高安全版本），并读回确认该值仍小于 `bridgeMaximumExclusiveVersion`。daemon 0.1.1 会在打开数据库、连接 Relay 或接受 connector 前拒绝仍允许 0.1.0 的存量配置；不要只覆盖 plugin 文件，也不要从 LiViS 通道执行 `/update`。
 5. 若 active protocol profile 仍为 schema v1，只能按升级 runbook 在停服状态执行 `profile migrate-v2` 并重新生成 proof；普通 `upstream activate` 不能替代 schema migration，也不得由 launchd 自动猜测或旁路迁移。
 6. 若 active profile 已是 schema v2，但新提交需要切换到另一份已人工审阅的兼容 v2 profile，保持双服务停止，按[普通 profile 激活事务](PROFILE-ACTIVATION.md)执行 `upstream activate`；记录 `backupConfigPath` 与 `receiptPath`，在线复核通过后才继续。
 7. 若 Relay plist 模板变化，重新生成本机副本、`plutil -lint`、读回占位符和路径，再覆盖 LaunchAgents 中的副本。
@@ -1077,7 +1097,7 @@ bun run src/index.ts doctor --online --config "$CONFIG"
 
 普通回滚只恢复 `profile` 与 `profileSha256`，不会恢复 relay、security、Hermes、connector 或 stateDir 等其他字段；旧 profile 无法重新得到 current supported proof 时不得启动。schema v1→v2 migration 的回滚是另一套 `profile rollback-migration` 状态机，不能混用普通 activation 备份。
 
-回滚到不认识 JobStore v3 的旧 daemon 时，必须同时恢复升级前的完整数据库备份；只切回 checkout 或只回滚 protocol profile 都不安全。Hermes runtime 或 bridge 变更后仍须保持 `[0.15.1, 0.15.2)` 的 fail-closed 支持窗，除非独立升级评审已经修改代码、配置和 canary 证据。
+回滚到不认识 JobStore v3 的旧 daemon 时，必须同时恢复升级前的完整数据库备份；只切回 checkout 或只回滚 protocol profile 都不安全。Hermes runtime 仍须保持 `[0.15.1, 0.15.2)`，bridge 必须保持 `[0.1.1, 0.2.0)` 的 fail-closed 支持窗，除非独立升级评审已经修改代码、配置和 canary 证据。回滚到 bridge 0.1.0 会重新开放本次关闭的远程输入竞态和命令面，不属于受支持回滚。
 
 #### 7.6 分层验收
 

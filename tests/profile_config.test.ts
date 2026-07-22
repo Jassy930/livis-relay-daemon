@@ -5,6 +5,7 @@ import {
   initializeConfig,
   loadRelayConfig,
   MAX_RELAY_MAX_FRAME_BYTES,
+  MINIMUM_SAFE_BRIDGE_VERSION,
   parseRelayConfig,
 } from "../src/config.ts";
 import {
@@ -137,6 +138,13 @@ describe("配置与协议 profile", () => {
       hermes: { ...config.hermes, maximumExclusiveVersion: config.hermes.minimumVersion },
     };
     expect(() => parseRelayConfig(JSON.stringify(invalidHermesRange), "/tmp/config.json")).toThrow("版本范围");
+
+    const legacyUnsafeBridge = {
+      ...config,
+      hermes: { ...config.hermes, bridgeMinimumVersion: "0.1.0" },
+    };
+    expect(() => parseRelayConfig(JSON.stringify(legacyUnsafeBridge), "/tmp/config.json"))
+      .toThrow(`不能低于 daemon 安全下限 ${MINIMUM_SAFE_BRIDGE_VERSION}`);
   });
 
   test("旧配置兼容 relay 帧默认上限，并拒绝无效或过大的显式值", () => {
@@ -169,6 +177,7 @@ describe("配置与协议 profile", () => {
       });
       const loaded = await loadRelayConfig(configPath);
       expect(loaded.config.relay.maxFrameBytes).toBe(DEFAULT_RELAY_MAX_FRAME_BYTES);
+      expect(loaded.config.hermes.bridgeMinimumVersion).toBe(MINIMUM_SAFE_BRIDGE_VERSION);
       expect(loaded.config.profile).toStartWith(join(directory.path, "relay", "protocol-profiles"));
       expect((await loadProtocolProfile(
         loaded.config.profile,
