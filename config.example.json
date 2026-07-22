@@ -10,7 +10,8 @@
     "maxFrameBytes": 1048576
   },
   "execution": {
-    "backend": "hermes"
+    "backend": "hermes",
+    "legacyV4JobBackend": null
   },
   "connector": {
     "socketPath": "~/.livis-relay/connector.sock",
@@ -38,6 +39,8 @@
     "command": "codex",
     "model": null,
     "requestTimeoutMs": 30000,
+    "turnTimeoutMs": 900000,
+    "interruptGraceMs": 5000,
     "shutdownTimeoutMs": 5000,
     "acknowledgeRemoteExecution": false
   }

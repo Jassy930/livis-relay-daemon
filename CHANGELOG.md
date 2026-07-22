@@ -6,6 +6,10 @@
 
 ### 修复
 
+- Codex app-server 现在以独立 POSIX 进程组运行；关闭按 `SIGTERM`、有界等待、`SIGKILL`、再次等待和进程组/stdio 收口回执执行，无法确认时向上抛错，不再把直接子进程退出等同于全部后代已结束。
+- Codex turn 新增从 `turn/start` 前开始计算的绝对 deadline；超时后只允许一个 interrupt owner，并在固定 grace 后失败关闭。deadline 之后的 terminal、取消或迟到通知不会写入 result/outbox，`stop()` 会等待同一断连和进程组收口结果。
+- Codex `turn/interrupt` 的 RPC response 不再被误当成 terminal；取消与 `turn/start` 并发时先持久化 turn ID，等待权威 `turn/completed` 并 checkpoint 实际尾部后才进入 `CancelUnknown`。人工 `session release` 会退役不确定的 backend session/thread 绑定，下次创建新 thread，避免清除 active 后错误恢复已漂移尾部。
+- Codex app-server 的宿主 HOME/TMPDIR 已移到 workspace 外，agent shell 使用 workspace 内独立 HOME/TMPDIR；四类目录均固定为 `0700` 并校验 realpath、symlink 与 inode，避免 agent 持久修改宿主后续会读取的运行目录。
 - 本地 `status` 请求增加 3 秒硬超时，避免 connector socket 已接受但 daemon 不响应时让 launchd 启动验收无界卡住。
 - 结果 ACK 重试耗尽后改为持久化退避并自动恢复；在线、重连与重启都不会再遗留永久 `AckFailed`，退避期间的迟到 ACK 仍可完成投递。
 - WebSocket `send()` 同步失败会原子撤销未出进程的投递 attempt，恢复前一个真实投递 ID 与时间；没有真实 attempt 的 ACK 不再误结算或清除当前 ACK timer。
@@ -31,6 +35,7 @@
 
 ### 变更
 
+- 执行后端配置固定为 Hermes/Codex/Claude 三选一；Claude 尚未实现时 `doctor` 与 `serve` 明确失败关闭。JobStore v5 让 job 首次入库即不可变绑定目标 backend，配置切换不再接管旧积压；含待派发 job 的 v4 数据库必须显式声明原始 backend，否则迁移事务回滚。当前 schema v6 继续绑定 Codex 账号身份摘要/强度、请求与实际模型、模型 provider、安全配置 SHA、feature 快照 SHA 和单调 thread-tail checkpoint；旧 v5 session 只有在没有 active/recovery 证据时才允许首次安全补绑。
 - macOS Relay LaunchAgent 模板补齐显式 `HOME`、可解析 Bun/Hermes 的 `PATH`、10 秒启动节流与 `077` umask；运行手册固定稳定 checkout、Relay/Hermes 双 LaunchAgent 的安装、启停、升级、日志和分层验收，并把历史服务级记录与旧基线测试数量降为参考信息。
 - JobStore schema 升级为 v3；fresh、v1、v2 数据库在取得 SQLite `IMMEDIATE` 写锁后统一裁决并原子迁移，提交前验证 integrity 与 foreign keys，失败时完整回滚。
 - 新增完全离线的 IDaaS / Relay S2 protocol probe、机器可读 wire contract registry、append-only 历史门禁、精确 artifact 发布白名单与严格 fake Relay 场景；当前风险以“观察”记录，不升级为服务端事实。

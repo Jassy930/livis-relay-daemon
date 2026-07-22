@@ -2,12 +2,14 @@ import { describe, expect, test } from "bun:test";
 import {
   CODEX_APP_SERVER_COMMAND,
   CodexAppServerClient,
+  CodexAppServerCloseUnconfirmedError,
   CodexAppServerRequestTransportError,
   CodexAppServerRpcError,
   CodexAppServerTimeoutError,
   type CodexAppServerProcess,
   type CodexAppServerSpawn,
   type CodexAppServerSpawnOptions,
+  type CodexProcessGroupController,
 } from "../src/backends/codex/app-server-client.ts";
 
 interface Deferred<T> {
@@ -45,6 +47,9 @@ class FakeAppServer {
   command: readonly string[] | null = null;
   spawnOptions: CodexAppServerSpawnOptions | null = null;
   writeGate: Deferred<void> | null = null;
+  readonly killSignals: Array<number | NodeJS.Signals | undefined> = [];
+  ignoreSigterm = false;
+  ignoreAllSignals = false;
   onMessage: (message: Record<string, unknown>) => void | Promise<void> = async (message) => {
     if (typeof message.id === "number" && typeof message.method === "string") {
       await this.send({ id: message.id, result: { method: message.method, params: message.params } });
@@ -61,6 +66,7 @@ class FakeAppServer {
 
   constructor() {
     this.process = {
+      pid: 42_424,
       stdin: {
         write: async (chunk) => {
           if (this.writeGate) await this.writeGate.promise;
@@ -85,7 +91,10 @@ class FakeAppServer {
       stdout: this.stdout.readable,
       stderr: this.stderr.readable,
       exited: this.exit.promise,
-      kill: () => {
+      kill: (signal) => {
+        this.killSignals.push(signal);
+        if (this.ignoreAllSignals) return;
+        if (this.ignoreSigterm && (signal === undefined || signal === "SIGTERM")) return;
         void this.stop(0);
       },
     };
@@ -138,7 +147,11 @@ describe("Codex app-server stdio client", () => {
     const client = await fake.startClient({ cwd: "/daemon/sessions/session-1" });
     try {
       expect(fake.command).toEqual(CODEX_APP_SERVER_COMMAND);
-      expect(fake.spawnOptions).toEqual({ cwd: "/daemon/sessions/session-1", env: undefined });
+      expect(fake.spawnOptions).toEqual({
+        cwd: "/daemon/sessions/session-1",
+        env: undefined,
+        detached: true,
+      });
       expect(fake.messages).toHaveLength(2);
       expect(fake.messages[0]).toEqual({
         id: 1,
@@ -462,5 +475,57 @@ describe("Codex app-server stdio client", () => {
     expect(client.stderrTruncated).toBeTrue();
     expect(new TextEncoder().encode(client.stderrText).byteLength).toBeLessThanOrEqual(8);
     await client.close();
+  });
+
+  test("close 幂等，并在 SIGTERM 无效时升级 SIGKILL 后等待直接 child 与 stdio", async () => {
+    const fake = new FakeAppServer();
+    fake.ignoreSigterm = true;
+    const client = await fake.startClient({ closeTimeoutMs: 15 });
+
+    const first = client.close();
+    const second = client.close();
+    expect(second).toBe(first);
+    await first;
+
+    expect(fake.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(client.exitCode).toBe(0);
+  });
+
+  test("SIGKILL 后直接 child 或 stdio 仍未收口时明确失败", async () => {
+    const fake = new FakeAppServer();
+    fake.ignoreAllSignals = true;
+    const client = await fake.startClient({ closeTimeoutMs: 10 });
+
+    try {
+      await expect(client.close()).rejects.toBeInstanceOf(CodexAppServerCloseUnconfirmedError);
+      expect(fake.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+    } finally {
+      await fake.stop(137);
+    }
+  });
+
+  test("注入进程组控制时必须以 PGID 收口，不能只依赖直接 child kill", async () => {
+    const fake = new FakeAppServer();
+    let groupExists = true;
+    const signals: Array<number | NodeJS.Signals> = [];
+    const groups: number[] = [];
+    const controller: CodexProcessGroupController = {
+      signal(processGroupId, signal) {
+        groups.push(processGroupId);
+        signals.push(signal);
+        groupExists = false;
+        void fake.stop(0);
+      },
+      exists() {
+        return groupExists;
+      },
+    };
+    const client = await fake.startClient({ processGroupController: controller });
+
+    await client.close();
+
+    expect(groups).toEqual([42_424]);
+    expect(signals).toEqual(["SIGTERM"]);
+    expect(fake.killSignals).toEqual([]);
   });
 });

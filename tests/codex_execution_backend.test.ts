@@ -4,22 +4,28 @@ import { join } from "node:path";
 import {
   CodexExecutionBackend,
   type CodexCommandRunner,
+  validateDisabledCodexFeatures,
 } from "../src/backends/codex/codex-execution-backend.ts";
 import type {
   ExecutionBackendHandlers,
   ExecutionJobEvent,
 } from "../src/backends/execution-backend.ts";
 import {
+  CODEX_0145_ALLOWED_ENABLED_FEATURES,
   CODEX_DISABLED_FEATURES,
   type CodexAppServerProcess,
   type CodexAppServerSpawn,
   type CodexAppServerSpawnOptions,
 } from "../src/backends/codex/app-server-client.ts";
-import { ensureCodexRuntimeLayout } from "../src/backends/codex/runtime-layout.ts";
+import {
+  codexRemoteConfig,
+  ensureCodexRuntimeLayout,
+} from "../src/backends/codex/runtime-layout.ts";
 import { runCodexAppServerLocalSmoke } from "../src/backends/codex/local-smoke.ts";
 import { serializeResult } from "../src/protocol/livis.ts";
 import { JobStore } from "../src/state/store.ts";
 import type { StoredJob } from "../src/types.ts";
+import { sha256 } from "../src/util.ts";
 import { incomingJob, temporaryDirectory } from "./helpers.ts";
 
 interface Deferred<T> {
@@ -50,6 +56,34 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+interface FakeCodexFeature {
+  name: string;
+  stage: string;
+  enabled: boolean;
+  defaultEnabled: boolean;
+}
+
+function codex0145FeatureSnapshot(): FakeCodexFeature[] {
+  const features = new Map<string, FakeCodexFeature>();
+  for (const name of CODEX_DISABLED_FEATURES) {
+    features.set(name, {
+      name,
+      stage: "experimental",
+      enabled: false,
+      defaultEnabled: false,
+    });
+  }
+  for (const [name, stage] of CODEX_0145_ALLOWED_ENABLED_FEATURES) {
+    features.set(name, {
+      name,
+      stage,
+      enabled: true,
+      defaultEnabled: true,
+    });
+  }
+  return [...features.values()];
+}
+
 class FakeCodexAppServer {
   readonly messages: Array<Record<string, unknown>> = [];
   readonly process: CodexAppServerProcess;
@@ -58,9 +92,14 @@ class FakeCodexAppServer {
   spawnOptions: CodexAppServerSpawnOptions | null = null;
   workspace = "";
   threadId = "019f-thread-1";
+  threadStatus: "idle" | "active" = "idle";
+  turns: Array<Record<string, unknown>> = [];
   account: Record<string, unknown> | null = { type: "chatgpt", email: null, planType: "plus" };
   permissionAllowed = true;
   enabledHighRiskFeature: string | null = null;
+  featureListTransform: (
+    features: FakeCodexFeature[],
+  ) => FakeCodexFeature[] = (features) => features;
   threadReadbackOverride: Record<string, unknown> = {};
   materializationMode: "valid" | "missing" | "wrong-id" = "valid";
   materializationReadMisses = 0;
@@ -68,7 +107,10 @@ class FakeCodexAppServer {
   failWriteMethod: string | null = null;
   blockWriteResponseId: number | null = null;
   holdTurnStart = false;
+  holdTurnInterrupt = false;
+  autoInterruptTerminal = true;
   readonly heldTurnStart = deferred<Record<string, unknown>>();
+  readonly heldTurnInterrupt = deferred<Record<string, unknown>>();
   readonly heldWrite = deferred<void>();
 
   private readonly stdout = new TransformStream<Uint8Array, Uint8Array>();
@@ -149,11 +191,15 @@ class FakeCodexAppServer {
       return;
     }
     if (message.method === "experimentalFeature/list") {
+      const features = codex0145FeatureSnapshot();
+      if (this.enabledHighRiskFeature !== null) {
+        const highRiskFeature = features.find(
+          (feature) => feature.name === this.enabledHighRiskFeature,
+        );
+        if (highRiskFeature) highRiskFeature.enabled = true;
+      }
       await this.respond(message.id, {
-        data: CODEX_DISABLED_FEATURES.map((name) => ({
-          name,
-          enabled: name === this.enabledHighRiskFeature,
-        })),
+        data: this.featureListTransform(features),
         nextCursor: null,
       });
       return;
@@ -201,10 +247,33 @@ class FakeCodexAppServer {
           .catch(() => undefined);
         return;
       }
+      this.threadStatus = "active";
+      this.turns.push({ id: "019f-turn-1", status: "inProgress" });
       await this.respond(message.id, { turn: { id: "019f-turn-1", status: "inProgress" } });
       return;
     }
-    if (message.method === "turn/interrupt" || message.method === "thread/unsubscribe") {
+    if (message.method === "turn/interrupt" && this.holdTurnInterrupt) {
+      void this.heldTurnInterrupt.promise
+        .then((response) => this.respond(message.id as number, response))
+        .catch(() => undefined);
+      return;
+    }
+    if (message.method === "turn/interrupt") {
+      await this.respond(message.id, {});
+      if (this.autoInterruptTerminal) {
+        const params = isRecord(message.params) ? message.params : {};
+        const turnId = typeof params.turnId === "string" ? params.turnId : "019f-turn-1";
+        await this.send({
+          method: "turn/completed",
+          params: {
+            threadId: this.threadId,
+            turn: { id: turnId, status: "interrupted", items: [] },
+          },
+        });
+      }
+      return;
+    }
+    if (message.method === "thread/unsubscribe") {
       await this.respond(message.id, {});
       return;
     }
@@ -261,6 +330,8 @@ class FakeCodexAppServer {
         excludeTmpdirEnvVar: true,
         excludeSlashTmp: true,
       },
+      model: "gpt-5.6-sol",
+      modelProvider: "openai",
       ...this.threadReadbackOverride,
     };
   }
@@ -272,8 +343,8 @@ class FakeCodexAppServer {
       cwd: this.workspace,
       cliVersion: "0.145.0",
       ephemeral: false,
-      status: { type: "idle" },
-      turns: [],
+      status: { type: this.threadStatus },
+      turns: this.turns.map((turn) => ({ ...turn })),
       path: this.rolloutPath,
     };
   }
@@ -305,6 +376,16 @@ class FakeCodexAppServer {
   }
 
   async send(message: Record<string, unknown>): Promise<void> {
+    if (message.method === "turn/completed" && isRecord(message.params)) {
+      const turn = isRecord(message.params.turn) ? message.params.turn : null;
+      if (turn && typeof turn.id === "string" && typeof turn.status === "string") {
+        this.threadStatus = "idle";
+        const existing = this.turns.findIndex((candidate) => candidate.id === turn.id);
+        const snapshot = { id: turn.id, status: turn.status };
+        if (existing >= 0) this.turns[existing] = snapshot;
+        else this.turns.push(snapshot);
+      }
+    }
     await this.stdoutWriter.write(new TextEncoder().encode(`${JSON.stringify(message)}\n`));
   }
 
@@ -346,6 +427,8 @@ function requireCodexAttempt(event: ExecutionJobEvent & { turnId?: string | null
 async function createHarness(options: {
   start?: boolean;
   requestTimeoutMs?: number;
+  turnTimeoutMs?: number;
+  interruptGraceMs?: number;
   configureFake?: (fake: FakeCodexAppServer) => void;
   commandRunner?: CodexCommandRunner;
   existingThreadId?: string;
@@ -373,6 +456,22 @@ async function createHarness(options: {
       sessionHash: layout.sessionHash,
       cwd: layout.workspace,
       cliVersion: "0.145.0",
+      accountType: "chatgpt",
+      accountSubjectSha256: null,
+      accountIdentityStrength: "type-only",
+      requestedModel: null,
+      effectiveModel: "gpt-5.6-sol",
+      modelProvider: "openai",
+      securityConfigSha256: sha256(codexRemoteConfig(layout.workspace)),
+      featureSnapshotSha256: validateDisabledCodexFeatures({
+        data: codex0145FeatureSnapshot(),
+        nextCursor: null,
+      }, "0.145.0"),
+      checkpointTurnId: null,
+      checkpointTurnStatus: null,
+      checkpointTurnCount: 0,
+      checkpointTurnsSha256: sha256(JSON.stringify([])),
+      checkpointedAt: Date.now(),
     });
     store.bindBackendThread("codex", sessionKey, options.existingThreadId);
     fake.threadId = options.existingThreadId;
@@ -475,6 +574,8 @@ async function createHarness(options: {
     model: null,
     maxOutputChars: options.maxOutputChars ?? 1_048_576,
     requestTimeoutMs: options.requestTimeoutMs ?? 100,
+    turnTimeoutMs: options.turnTimeoutMs ?? 5_000,
+    interruptGraceMs: options.interruptGraceMs ?? 25,
     shutdownTimeoutMs: 100,
   }, {
     store,
@@ -509,7 +610,7 @@ async function createHarness(options: {
 }
 
 function claimJob(harness: Harness, jobId: string, text = "请处理"): StoredJob {
-  const ingested = harness.store.ingest(incomingJob(jobId, text), "livis:agent-test");
+  const ingested = harness.store.ingest(incomingJob(jobId, text), "livis:agent-test", "codex");
   harness.store.markAcked(ingested.job.jobId);
   const executionId = harness.backend.executionId;
   if (!executionId) throw new Error("backend 尚未 ready");
@@ -604,28 +705,7 @@ describe("CodexExecutionBackend", () => {
         "app-server",
         "--strict-config",
         "--stdio",
-        "--disable",
-        "plugins",
-        "--disable",
-        "remote_plugin",
-        "--disable",
-        "apps",
-        "--disable",
-        "shell_snapshot",
-        "--disable",
-        "hooks",
-        "--disable",
-        "image_generation",
-        "--disable",
-        "goals",
-        "--disable",
-        "memories",
-        "--disable",
-        "skill_mcp_dependency_install",
-        "--disable",
-        "multi_agent",
-        "--disable",
-        "multi_agent_v2",
+        ...CODEX_DISABLED_FEATURES.flatMap((feature) => ["--disable", feature]),
       ]);
       const canonicalStateDir = await realpath(harness.directory.path);
       expect(harness.fake.spawnOptions?.env?.CODEX_HOME).toStartWith(canonicalStateDir);
@@ -692,6 +772,8 @@ describe("CodexExecutionBackend", () => {
         model: null,
         maxOutputChars: 1_048_576,
         requestTimeoutMs: 100,
+        turnTimeoutMs: 5_000,
+        interruptGraceMs: 25,
         shutdownTimeoutMs: 100,
       }, {
         store: harness.store,
@@ -727,7 +809,7 @@ describe("CodexExecutionBackend", () => {
     try {
       expect(harness.backend.ready).toBeTrue();
       expect(harness.fake.messages.filter((message) => message.method === "thread/read"))
-        .toHaveLength(3);
+        .toHaveLength(4);
       expect(harness.store.getBackendSession("codex", "livis:agent-test")?.threadId)
         .toBe(harness.fake.threadId);
     } finally {
@@ -753,7 +835,7 @@ describe("CodexExecutionBackend", () => {
         .toBeLessThan(materializationTimeoutMs + 500);
       expect(harness.fake.messages.filter((message) => message.method === "thread/read").length)
         .toBeGreaterThan(1);
-      expect(harness.store.getBackendSession("codex", "livis:agent-test")?.threadId).toBeNull();
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")).toBeNull();
       expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
         .toContain("rollout 物化");
       expect(harness.events).toEqual([]);
@@ -776,7 +858,7 @@ describe("CodexExecutionBackend", () => {
       );
       expect(harness.fake.messages.filter((message) => message.method === "thread/read"))
         .toHaveLength(1);
-      expect(harness.store.getBackendSession("codex", "livis:agent-test")?.threadId).toBeNull();
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")).toBeNull();
       expect(harness.events).toEqual([]);
     } finally {
       await harness.cleanup();
@@ -846,6 +928,38 @@ describe("CodexExecutionBackend", () => {
     }
   });
 
+  test("恢复时拒绝未知活动 turn 和未记录的 completed tail", async () => {
+    for (const scenario of [
+      {
+        status: "active" as const,
+        turns: [{ id: "external-active", status: "inProgress" }],
+        expected: "不是 idle",
+      },
+      {
+        status: "idle" as const,
+        turns: [{ id: "external-completed", status: "completed" }],
+        expected: "持久 checkpoint 不一致",
+      },
+    ]) {
+      const harness = await createHarness({
+        start: false,
+        existingThreadId: "019f-thread-existing",
+        existingRollout: "valid",
+        configureFake: (fake) => {
+          fake.threadStatus = scenario.status;
+          fake.turns = scenario.turns;
+        },
+      });
+      try {
+        await expect(harness.backend.start()).rejects.toThrow(scenario.expected);
+        expect(harness.backend.ready).toBeFalse();
+        expect(harness.store.getSessionQuarantine("livis:agent-test")).not.toBeNull();
+      } finally {
+        await harness.cleanup();
+      }
+    }
+  });
+
   test("私有 CODEX_HOME 未登录时 fail-closed，不创建 thread", async () => {
     const harness = await createHarness({
       start: false,
@@ -872,6 +986,85 @@ describe("CodexExecutionBackend", () => {
     });
     try {
       await expect(harness.backend.start()).rejects.toThrow("高风险 feature 未禁用");
+      expect(harness.fake.messages.some((message) => message.method === "thread/start")).toBeFalse();
+      expect(harness.backend.ready).toBeFalse();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("Codex feature 快照出现未知 enabled 项时 fail-closed，不创建 thread", async () => {
+    const harness = await createHarness({
+      start: false,
+      configureFake: (fake) => {
+        fake.featureListTransform = (features) => [...features, {
+          name: "unreviewed_future_feature",
+          stage: "experimental",
+          enabled: true,
+          defaultEnabled: false,
+        }];
+      },
+    });
+    try {
+      await expect(harness.backend.start()).rejects.toThrow("enabled feature 集合未经审核");
+      expect(harness.fake.messages.some((message) => message.method === "thread/start")).toBeFalse();
+      expect(harness.backend.ready).toBeFalse();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("Codex feature 快照出现重复名称时 fail-closed，不创建 thread", async () => {
+    const harness = await createHarness({
+      start: false,
+      configureFake: (fake) => {
+        fake.featureListTransform = (features) => {
+          const duplicate = features.find((feature) => feature.name === "shell_tool");
+          if (!duplicate) throw new Error("test feature fixture 缺少 shell_tool");
+          return [...features, { ...duplicate }];
+        };
+      },
+    });
+    try {
+      await expect(harness.backend.start()).rejects.toThrow("feature 列表包含重复名称");
+      expect(harness.fake.messages.some((message) => message.method === "thread/start")).toBeFalse();
+      expect(harness.backend.ready).toBeFalse();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("Codex 允许 feature 的 stage 漂移时 fail-closed，不创建 thread", async () => {
+    const harness = await createHarness({
+      start: false,
+      configureFake: (fake) => {
+        fake.featureListTransform = (features) => features.map((feature) =>
+          feature.name === "shell_tool"
+            ? { ...feature, stage: "experimental" }
+            : feature
+        );
+      },
+    });
+    try {
+      await expect(harness.backend.start()).rejects.toThrow("允许 feature 的 stage/default 已漂移");
+      expect(harness.fake.messages.some((message) => message.method === "thread/start")).toBeFalse();
+      expect(harness.backend.ready).toBeFalse();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("Codex feature 快照缺少允许项时 fail-closed，不创建 thread", async () => {
+    const harness = await createHarness({
+      start: false,
+      configureFake: (fake) => {
+        fake.featureListTransform = (features) => features.filter(
+          (feature) => feature.name !== "shell_tool",
+        );
+      },
+    });
+    try {
+      await expect(harness.backend.start()).rejects.toThrow("enabled feature 集合未经审核");
       expect(harness.fake.messages.some((message) => message.method === "thread/start")).toBeFalse();
       expect(harness.backend.ready).toBeFalse();
     } finally {
@@ -990,6 +1183,42 @@ describe("CodexExecutionBackend", () => {
       expect(harness.events).toEqual(["ready", "accepted:job-final", "result:job-final"]);
       expect(harness.backend.status().active).toBeNull();
       expect(harness.store.require(job.jobId).outbox?.resultJson).toBe(serializeResult("最终答案"));
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")).toMatchObject({
+        accountType: "chatgpt",
+        accountIdentityStrength: "type-only",
+        requestedModel: null,
+        effectiveModel: "gpt-5.6-sol",
+        modelProvider: "openai",
+        checkpointTurnId: "019f-turn-1",
+        checkpointTurnStatus: "completed",
+        checkpointTurnCount: 1,
+      });
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("dispatch 前发现外部追加 turn 时 quarantine，且绝不发送新的 turn/start", async () => {
+    const harness = await createHarness();
+    try {
+      harness.fake.threadStatus = "idle";
+      harness.fake.turns = [{ id: "external-completed", status: "completed" }];
+      const job = claimJob(harness, "job-external-tail");
+      const turnStartsBefore = harness.fake.messages
+        .filter((message) => message.method === "turn/start").length;
+
+      expect(await harness.backend.dispatch(job)).toBe("not_sent");
+      expect(harness.fake.messages.filter((message) => message.method === "turn/start"))
+        .toHaveLength(turnStartsBefore);
+      expect(harness.backend.ready).toBeFalse();
+      expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
+        .toContain("thread checkpoint");
+      expect(harness.store.resetUnsentBackendDispatch(
+        job.jobId,
+        "codex",
+        job.leaseId!,
+        job.runGeneration,
+      )).toBeTrue();
     } finally {
       await harness.cleanup();
     }
@@ -1066,6 +1295,138 @@ describe("CodexExecutionBackend", () => {
     }
   });
 
+  test("preflight 尚未完成时收到 cancel 不得发 turn/start 或误判 deadline", async () => {
+    const harness = await createHarness();
+    try {
+      const job = claimJob(harness, "job-cancel-during-preflight");
+      const dispatch = harness.backend.dispatch(job);
+      const cancelling = harness.store.requestCancel(job.jobId);
+      if (!cancelling) throw new Error("test cancel job missing");
+      const cancel = harness.backend.cancel(cancelling);
+
+      expect(await dispatch).toBe("not_sent");
+      expect(await cancel).toBe("not_sent");
+      expect(harness.fake.messages.filter((message) => message.method === "turn/start"))
+        .toHaveLength(0);
+      expect(harness.disconnects).toEqual([]);
+      expect(harness.store.getSessionQuarantine("livis:agent-test")).toBeNull();
+      expect(harness.store.finishUnsentBackendCancellation(
+        job.jobId,
+        "codex",
+        job.leaseId!,
+        job.runGeneration,
+      )?.status).toBe("Cancelled");
+      expect(harness.store.require(job.jobId).status).toBe("Cancelled");
+      expect(harness.backend.ready).toBeTrue();
+      expect(harness.backend.status().active).toBeNull();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("完整 turn deadline 在 turnId 未知时直接失败关闭且绝不回报 not_sent", async () => {
+    const harness = await createHarness({
+      requestTimeoutMs: 500,
+      turnTimeoutMs: 25,
+      interruptGraceMs: 15,
+      configureFake: (fake) => {
+        fake.holdTurnStart = true;
+      },
+    });
+    try {
+      const job = claimJob(harness, "job-deadline-before-turn-id");
+      expect(await harness.backend.dispatch(job)).toBe("submitted");
+      await waitFor(() => harness.disconnects.length === 1, "unknown turn deadline disconnect");
+
+      expect(harness.fake.messages.filter((message) => message.method === "turn/interrupt"))
+        .toHaveLength(0);
+      expect(harness.results).toEqual([]);
+      expect(harness.store.require(job.jobId).status).toBe("Interrupted");
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")?.activeTurnId)
+        .toBeNull();
+      expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
+        .toContain("turnId 仍未知");
+    } finally {
+      harness.fake.heldTurnStart.resolve({ turn: { id: "late-turn", status: "inProgress" } });
+      await harness.cleanup();
+    }
+  });
+
+  test("完整 turn deadline 只 interrupt 一次，grace 后隔离并丢弃迟到 terminal", async () => {
+    const harness = await createHarness({
+      requestTimeoutMs: 500,
+      turnTimeoutMs: 30,
+      interruptGraceMs: 30,
+    });
+    try {
+      const job = claimJob(harness, "job-deadline-known-turn");
+      expect(await harness.backend.dispatch(job)).toBe("submitted");
+      await waitFor(
+        () => harness.fake.messages.some((message) => message.method === "turn/interrupt"),
+        "timeout interrupt",
+      );
+      await harness.fake.send({
+        method: "turn/completed",
+        params: {
+          threadId: harness.fake.threadId,
+          turn: {
+            id: "019f-turn-1",
+            status: "completed",
+            items: [{
+              type: "agentMessage",
+              id: "late-final",
+              text: "不得交付的迟到结果",
+              phase: "final_answer",
+            }],
+          },
+        },
+      });
+      await waitFor(() => harness.disconnects.length === 1, "known turn deadline disconnect");
+
+      expect(harness.fake.messages.filter((message) => message.method === "turn/interrupt"))
+        .toHaveLength(1);
+      expect(harness.results).toEqual([]);
+      expect(harness.store.require(job.jobId).status).toBe("Interrupted");
+      expect(harness.store.require(job.jobId).outbox).toBeNull();
+      expect(harness.disconnects[0]).toContain("interrupt grace 已耗尽");
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("用户 cancel 与 turn deadline 竞争时只有一个 interrupt 且 timeout 不伪装为取消成功", async () => {
+    const harness = await createHarness({
+      requestTimeoutMs: 500,
+      turnTimeoutMs: 35,
+      interruptGraceMs: 25,
+      configureFake: (fake) => {
+        fake.holdTurnInterrupt = true;
+      },
+    });
+    try {
+      const job = claimJob(harness, "job-cancel-deadline-race");
+      await harness.backend.dispatch(job);
+      const cancelling = harness.store.requestCancel(job.jobId);
+      if (!cancelling) throw new Error("test cancel job missing");
+      const cancel = harness.backend.cancel(cancelling);
+      await waitFor(
+        () => harness.fake.messages.some((message) => message.method === "turn/interrupt"),
+        "user interrupt",
+      );
+      await waitFor(() => harness.disconnects.length === 1, "cancel deadline disconnect");
+      expect(await cancel).toBe("submitted");
+
+      expect(harness.fake.messages.filter((message) => message.method === "turn/interrupt"))
+        .toHaveLength(1);
+      expect(harness.events).not.toContain("cancelled:job-cancel-deadline-race");
+      expect(harness.store.require(job.jobId).status).toBe("CancelUnknown");
+      expect(harness.results).toEqual([]);
+    } finally {
+      harness.fake.heldTurnInterrupt.resolve({});
+      await harness.cleanup();
+    }
+  });
+
   test("cancel 可早于 turn/start response，绑定后自行 interrupt 且不返回 final", async () => {
     const harness = await createHarness({
       configureFake: (fake) => {
@@ -1087,11 +1448,87 @@ describe("CodexExecutionBackend", () => {
       expect(await dispatch).toBe("submitted");
       expect(await cancel).toBe("submitted");
       expect(harness.fake.messages.some((message) => message.method === "turn/interrupt")).toBeTrue();
-      expect(harness.store.require(claimed.jobId).status).toBe("CancelUnknown");
-
       await waitFor(() => harness.events.includes("cancelled:job-cancel-race"), "cancel terminal");
+      expect(harness.store.require(claimed.jobId).status).toBe("CancelUnknown");
+      const session = harness.store.getBackendSession("codex", "livis:agent-test");
+      expect(session?.checkpointTurnId).toBe("019f-turn-1");
+      expect(session?.checkpointTurnStatus).toBe("interrupted");
+      expect(session?.checkpointTurnCount).toBe(1);
       expect(harness.results).toEqual([]);
       expect(harness.backend.ready).toBeFalse();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("turn/interrupt response 不是 terminal，缺少 turn/completed 时保持 Cancelling 到 deadline", async () => {
+    const harness = await createHarness({
+      turnTimeoutMs: 45,
+      interruptGraceMs: 20,
+      configureFake: (fake) => {
+        fake.autoInterruptTerminal = false;
+      },
+    });
+    try {
+      const job = claimJob(harness, "job-interrupt-without-terminal");
+      await harness.backend.dispatch(job);
+      const cancelling = harness.store.requestCancel(job.jobId);
+      if (!cancelling) throw new Error("test cancel job missing");
+
+      expect(await harness.backend.cancel(cancelling)).toBe("submitted");
+      expect(harness.store.require(job.jobId).status).toBe("Cancelling");
+      expect(harness.events).not.toContain("cancelled:job-interrupt-without-terminal");
+
+      await waitFor(() => harness.disconnects.length === 1, "interrupt without terminal deadline");
+      expect(harness.store.require(job.jobId).status).toBe("CancelUnknown");
+      expect(harness.results).toEqual([]);
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")?.recoveryRequired)
+        .toBeTrue();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("cancel 与 completed 竞态按真实 terminal checkpoint，但不交付 final", async () => {
+    const harness = await createHarness({
+      configureFake: (fake) => {
+        fake.autoInterruptTerminal = false;
+      },
+    });
+    try {
+      const job = claimJob(harness, "job-cancel-completed-race");
+      await harness.backend.dispatch(job);
+      const cancelling = harness.store.requestCancel(job.jobId);
+      if (!cancelling) throw new Error("test cancel job missing");
+      expect(await harness.backend.cancel(cancelling)).toBe("submitted");
+
+      await harness.fake.send({
+        method: "turn/completed",
+        params: {
+          threadId: harness.fake.threadId,
+          turn: {
+            id: "019f-turn-1",
+            status: "completed",
+            items: [{
+              type: "agentMessage",
+              id: "cancel-race-final",
+              text: "不得交付的竞态结果",
+              phase: "final_answer",
+            }],
+          },
+        },
+      });
+      await waitFor(
+        () => harness.events.includes("cancelled:job-cancel-completed-race"),
+        "cancel completed race terminal",
+      );
+
+      const session = harness.store.getBackendSession("codex", "livis:agent-test");
+      expect(session?.checkpointTurnId).toBe("019f-turn-1");
+      expect(session?.checkpointTurnStatus).toBe("completed");
+      expect(session?.checkpointTurnCount).toBe(1);
+      expect(harness.store.require(job.jobId).status).toBe("CancelUnknown");
+      expect(harness.results).toEqual([]);
     } finally {
       await harness.cleanup();
     }

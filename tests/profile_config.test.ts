@@ -139,13 +139,14 @@ describe("配置与协议 profile", () => {
     expect(() => parseRelayConfig(JSON.stringify(invalidHermesRange), "/tmp/config.json")).toThrow("版本范围");
   });
 
-  test("旧配置默认使用 Hermes，Codex 配置失败关闭并使用固定版本窗", () => {
+  test("旧配置默认使用 Hermes，三选一配置明确且 Codex 使用固定版本窗", () => {
     const config = testConfig("/tmp/test-state");
     const legacy = structuredClone(config) as unknown as Record<string, unknown>;
     delete legacy.execution;
     delete legacy.codex;
     const parsedLegacy = parseRelayConfig(JSON.stringify(legacy), "/tmp/config.json");
     expect(parsedLegacy.execution.backend).toBe("hermes");
+    expect(parsedLegacy.execution.legacyV4JobBackend).toBeNull();
     expect(parsedLegacy.codex.acknowledgeRemoteExecution).toBeFalse();
 
     const codex = parseRelayConfig(JSON.stringify({
@@ -155,6 +156,8 @@ describe("配置与协议 profile", () => {
         command: "/opt/homebrew/bin/codex",
         model: "gpt-5.6-sol",
         requestTimeoutMs: 12_000,
+        turnTimeoutMs: 45_000,
+        interruptGraceMs: 3_000,
         shutdownTimeoutMs: 4_000,
         acknowledgeRemoteExecution: true,
       },
@@ -164,14 +167,33 @@ describe("配置与协议 profile", () => {
       command: "/opt/homebrew/bin/codex",
       model: "gpt-5.6-sol",
       requestTimeoutMs: 12_000,
+      turnTimeoutMs: 45_000,
+      interruptGraceMs: 3_000,
       shutdownTimeoutMs: 4_000,
       acknowledgeRemoteExecution: true,
     });
 
-    expect(() => parseRelayConfig(JSON.stringify({
+    const claude = parseRelayConfig(JSON.stringify({
       ...config,
       execution: { backend: "claude" },
-    }), "/tmp/config.json")).toThrow("只支持 hermes 或 codex");
+    }), "/tmp/config.json");
+    expect(claude.execution.backend).toBe("claude");
+    expect(() => parseRelayConfig(JSON.stringify({
+      ...config,
+      execution: { backend: "gemini" },
+    }), "/tmp/config.json")).toThrow("只支持 hermes、codex 或 claude");
+    expect(parseRelayConfig(JSON.stringify({
+      ...config,
+      execution: { backend: "hermes", legacyV4JobBackend: "codex" },
+    }), "/tmp/config.json").execution.legacyV4JobBackend).toBe("codex");
+    expect(() => parseRelayConfig(JSON.stringify({
+      ...config,
+      execution: { backend: "hermes", legacyV4JobBackend: "unknown" },
+    }), "/tmp/config.json")).toThrow("legacyV4JobBackend");
+    expect(() => parseRelayConfig(JSON.stringify({
+      ...config,
+      execution: { backend: "hermes", legacyV4JobBackend: "claude" },
+    }), "/tmp/config.json")).toThrow("v4 已实现的 hermes 或 codex");
     expect(() => parseRelayConfig(JSON.stringify({
       ...config,
       execution: { backend: "codex" },

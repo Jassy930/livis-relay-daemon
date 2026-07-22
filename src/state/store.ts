@@ -2,12 +2,16 @@ import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type {
+  BackendAccountIdentityStrength,
+  BackendCheckpointTurnStatus,
+  ExecutionBackendKind,
   IncomingRelayJob,
   JobStatus,
   OutboxStatus,
   StoredBackendSession,
   StoredJob,
   StoredOutbox,
+  LegacyV4JobBackendKind,
 } from "../types.ts";
 import { sha256 } from "../util.ts";
 
@@ -26,6 +30,7 @@ interface JobViewRow {
   job_id: string;
   msg_id: string;
   payload_hash: string;
+  target_backend: string;
   from_node_id: string;
   from_node_type: string | null;
   input_text: string;
@@ -60,6 +65,19 @@ interface BackendSessionRow {
   thread_id: string | null;
   cwd: string;
   cli_version: string;
+  account_type: string | null;
+  account_subject_sha256: string | null;
+  account_identity_strength: BackendAccountIdentityStrength | null;
+  requested_model: string | null;
+  effective_model: string | null;
+  model_provider: string | null;
+  security_config_sha256: string | null;
+  feature_snapshot_sha256: string | null;
+  checkpoint_turn_id: string | null;
+  checkpoint_turn_status: BackendCheckpointTurnStatus | null;
+  checkpoint_turn_count: number | null;
+  checkpoint_turns_sha256: string | null;
+  checkpointed_at: number | null;
   active_job_id: string | null;
   active_lease_id: string | null;
   active_run_generation: number | null;
@@ -85,6 +103,13 @@ const JOB_VIEW = `
 `;
 
 function rowToJob(row: JobViewRow): StoredJob {
+  if (
+    row.target_backend !== "hermes" &&
+    row.target_backend !== "codex" &&
+    row.target_backend !== "claude"
+  ) {
+    throw new Error(`job target_backend 非法或尚未完成迁移：${row.job_id}`);
+  }
   const outbox: StoredOutbox | null = row.outbox_status && row.result_json !== null
     ? {
         jobId: row.job_id,
@@ -102,6 +127,7 @@ function rowToJob(row: JobViewRow): StoredJob {
   return {
     scopeKey: row.scope_key,
     payloadHash: row.payload_hash,
+    targetBackend: row.target_backend,
     jobId: row.job_id,
     messageId: row.msg_id,
     fromNodeId: row.from_node_id,
@@ -132,6 +158,19 @@ function rowToBackendSession(row: BackendSessionRow): StoredBackendSession {
     threadId: row.thread_id,
     cwd: row.cwd,
     cliVersion: row.cli_version,
+    accountType: row.account_type,
+    accountSubjectSha256: row.account_subject_sha256,
+    accountIdentityStrength: row.account_identity_strength,
+    requestedModel: row.requested_model,
+    effectiveModel: row.effective_model,
+    modelProvider: row.model_provider,
+    securityConfigSha256: row.security_config_sha256,
+    featureSnapshotSha256: row.feature_snapshot_sha256,
+    checkpointTurnId: row.checkpoint_turn_id,
+    checkpointTurnStatus: row.checkpoint_turn_status,
+    checkpointTurnCount: row.checkpoint_turn_count,
+    checkpointTurnsSha256: row.checkpoint_turns_sha256,
+    checkpointedAt: row.checkpointed_at,
     activeJobId: row.active_job_id,
     activeLeaseId: row.active_lease_id,
     activeRunGeneration: row.active_run_generation,
@@ -160,11 +199,130 @@ export interface EnsureBackendSessionInput {
   sessionHash: string;
   cwd: string;
   cliVersion: string;
+  accountType: string;
+  accountSubjectSha256: string | null;
+  accountIdentityStrength: BackendAccountIdentityStrength;
+  requestedModel: string | null;
+  effectiveModel: string;
+  modelProvider: string;
+  securityConfigSha256: string;
+  featureSnapshotSha256: string;
+  checkpointTurnId: string | null;
+  checkpointTurnStatus: BackendCheckpointTurnStatus | null;
+  checkpointTurnCount: number;
+  checkpointTurnsSha256: string;
+  checkpointedAt: number;
+}
+
+export type BackendThreadTailFence =
+  | { kind: "idle" }
+  | {
+      kind: "active";
+      jobId: string;
+      leaseId: string;
+      runGeneration: number;
+      turnId: string;
+    };
+
+export interface CheckpointBackendThreadTailInput {
+  backend: string;
+  sessionKey: string;
+  threadId: string;
+  checkpointTurnId: string | null;
+  checkpointTurnStatus: BackendCheckpointTurnStatus | null;
+  checkpointTurnCount: number;
+  checkpointTurnsSha256: string;
+  checkpointedAt: number;
+  fence: BackendThreadTailFence;
+}
+
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
+
+function requireNonEmptyMetadata(value: string, field: string, maxLength: number): void {
+  if (value.length === 0 || value.length > maxLength) {
+    throw new BackendSessionConflictError(`${field} 长度非法`);
+  }
+}
+
+function validateSha256(value: string, field: string): void {
+  if (!SHA256_HEX_PATTERN.test(value)) {
+    throw new BackendSessionConflictError(`${field} 必须是 64 位小写 SHA-256`);
+  }
+}
+
+function validateCheckpointShape(input: {
+  checkpointTurnId: string | null;
+  checkpointTurnStatus: BackendCheckpointTurnStatus | null;
+  checkpointTurnCount: number;
+  checkpointTurnsSha256: string;
+  checkpointedAt: number;
+}): void {
+  if (!Number.isSafeInteger(input.checkpointTurnCount) || input.checkpointTurnCount < 0) {
+    throw new BackendSessionConflictError("checkpoint turn count 必须是非负安全整数");
+  }
+  if (!Number.isSafeInteger(input.checkpointedAt) || input.checkpointedAt < 0) {
+    throw new BackendSessionConflictError("checkpointedAt 必须是非负安全整数");
+  }
+  validateSha256(input.checkpointTurnsSha256, "checkpointTurnsSha256");
+  if (input.checkpointTurnCount === 0) {
+    if (input.checkpointTurnId !== null || input.checkpointTurnStatus !== null) {
+      throw new BackendSessionConflictError("零 turn checkpoint 不得携带 tail turn");
+    }
+    return;
+  }
+  if (input.checkpointTurnId === null || input.checkpointTurnStatus === null) {
+    throw new BackendSessionConflictError("非空 checkpoint 必须携带 tail turn id/status");
+  }
+  requireNonEmptyMetadata(input.checkpointTurnId, "checkpointTurnId", 256);
+  if (!["completed", "failed", "interrupted"].includes(input.checkpointTurnStatus)) {
+    throw new BackendSessionConflictError(
+      `checkpointTurnStatus 非法：${input.checkpointTurnStatus}`,
+    );
+  }
+}
+
+function validateEnsureBackendSessionInput(input: EnsureBackendSessionInput): void {
+  requireNonEmptyMetadata(input.backend, "backend", 32);
+  requireNonEmptyMetadata(input.sessionKey, "sessionKey", 4096);
+  validateSha256(input.sessionHash, "sessionHash");
+  requireNonEmptyMetadata(input.cwd, "cwd", 4096);
+  requireNonEmptyMetadata(input.cliVersion, "cliVersion", 64);
+  requireNonEmptyMetadata(input.accountType, "accountType", 64);
+  if (input.accountSubjectSha256 !== null) {
+    validateSha256(input.accountSubjectSha256, "accountSubjectSha256");
+  }
+  if (
+    input.accountIdentityStrength !== "subject" &&
+    input.accountIdentityStrength !== "type-only"
+  ) {
+    throw new BackendSessionConflictError(
+      `accountIdentityStrength 非法：${input.accountIdentityStrength}`,
+    );
+  }
+  if (
+    (input.accountIdentityStrength === "subject" && input.accountSubjectSha256 === null) ||
+    (input.accountIdentityStrength === "type-only" && input.accountSubjectSha256 !== null)
+  ) {
+    throw new BackendSessionConflictError("账号身份强度与 subject 摘要不一致");
+  }
+  if (input.requestedModel !== null) {
+    requireNonEmptyMetadata(input.requestedModel, "requestedModel", 256);
+  }
+  requireNonEmptyMetadata(input.effectiveModel, "effectiveModel", 256);
+  requireNonEmptyMetadata(input.modelProvider, "modelProvider", 128);
+  validateSha256(input.securityConfigSha256, "securityConfigSha256");
+  validateSha256(input.featureSnapshotSha256, "featureSnapshotSha256");
+  validateCheckpointShape(input);
 }
 
 export interface JobStoreOptions {
   /** 仅供确定性迁移 harness 在尝试 IMMEDIATE 写锁前建立进程间屏障。 */
   beforeMigrationLock?: () => void;
+  /**
+   * 仅在含 Received/Acked job 的 SQLite v4→v5 迁移中使用。v4 未记录
+   * provider，调用方必须显式声明这些积压 job 原本属于哪个 backend。
+   */
+  legacyV4JobBackend?: LegacyV4JobBackendKind;
 }
 
 export class JobStore {
@@ -241,21 +399,27 @@ export class JobStore {
     return transaction.immediate();
   }
 
-  ingest(input: IncomingRelayJob, sessionKey: string): { inserted: boolean; job: StoredJob } {
+  ingest(
+    input: IncomingRelayJob,
+    sessionKey: string,
+    targetBackend: ExecutionBackendKind = "hermes",
+  ): { inserted: boolean; job: StoredJob } {
     const payloadHash = businessPayloadHash(input);
     const transaction = this.database.transaction(() => {
       const now = Date.now();
       this.pruneExpiredPendingCancelsLocked(now);
       const result = this.database
         .query(`INSERT OR IGNORE INTO jobs (
-          scope_key, job_id, msg_id, payload_hash, from_node_id, from_node_type, input_text, raw_payload,
+          scope_key, job_id, msg_id, payload_hash, target_backend,
+          from_node_id, from_node_type, input_text, raw_payload,
           status, session_key, created_at, updated_at, input_timestamp
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Received', ?, ?, ?, ?)`)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Received', ?, ?, ?, ?)`)
         .run(
           this.scopeKey,
           input.jobId,
           input.messageId,
           payloadHash,
+          targetBackend,
           input.fromNodeId,
           input.fromNodeType,
           input.text,
@@ -273,6 +437,8 @@ export class JobStore {
     if (job.payloadHash !== payloadHash) {
       throw new JobConflictError(`同一 job_id 收到不同业务内容：${input.jobId}`);
     }
+    // duplicate delivery 在 backend 切换后仍属于首次入库时的 provider；
+    // 这里故意不把 targetBackend 纳入业务冲突，也绝不改写已存绑定。
     return { inserted, job };
   }
 
@@ -302,12 +468,18 @@ export class JobStore {
   }
 
   ensureBackendSession(input: EnsureBackendSessionInput): StoredBackendSession {
+    validateEnsureBackendSessionInput(input);
     const now = Date.now();
     const transaction = this.database.transaction(() => {
       this.database
         .query(`INSERT INTO backend_sessions(
-                  scope_key,backend,session_key,session_hash,cwd,cli_version,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?)
+                  scope_key,backend,session_key,session_hash,cwd,cli_version,
+                  account_type,account_subject_sha256,account_identity_strength,
+                  requested_model,effective_model,model_provider,
+                  security_config_sha256,feature_snapshot_sha256,
+                  checkpoint_turn_id,checkpoint_turn_status,checkpoint_turn_count,
+                  checkpoint_turns_sha256,checkpointed_at,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(scope_key,backend,session_key) DO NOTHING`)
         .run(
           this.scopeKey,
@@ -316,10 +488,23 @@ export class JobStore {
           input.sessionHash,
           input.cwd,
           input.cliVersion,
+          input.accountType,
+          input.accountSubjectSha256,
+          input.accountIdentityStrength,
+          input.requestedModel,
+          input.effectiveModel,
+          input.modelProvider,
+          input.securityConfigSha256,
+          input.featureSnapshotSha256,
+          input.checkpointTurnId,
+          input.checkpointTurnStatus,
+          input.checkpointTurnCount,
+          input.checkpointTurnsSha256,
+          input.checkpointedAt,
           now,
           now,
         );
-      const row = this.database
+      let row = this.database
         .query<BackendSessionRow, [string, string, string]>(
           `SELECT * FROM backend_sessions
            WHERE scope_key=? AND backend=? AND session_key=?`,
@@ -328,10 +513,75 @@ export class JobStore {
       if (!row) {
         throw new BackendSessionConflictError("backend session 唯一目录或路径发生冲突");
       }
+      if (row.account_type === null) {
+        // schema v5 旧行没有身份、模型、安全摘要和 tail checkpoint。只有没有
+        // active/recovery 证据时才允许一次性补齐；一旦绑定，immutable trigger
+        // 和下方严格比较都会拒绝漂移。
+        const bound = this.database
+          .query(`UPDATE backend_sessions
+                  SET account_type=?,account_subject_sha256=?,account_identity_strength=?,
+                      requested_model=?,effective_model=?,model_provider=?,
+                      security_config_sha256=?,feature_snapshot_sha256=?,
+                      checkpoint_turn_id=?,checkpoint_turn_status=?,checkpoint_turn_count=?,
+                      checkpoint_turns_sha256=?,checkpointed_at=?,updated_at=?
+                  WHERE scope_key=? AND backend=? AND session_key=?
+                    AND account_type IS NULL
+                    AND account_subject_sha256 IS NULL
+                    AND account_identity_strength IS NULL
+                    AND requested_model IS NULL
+                    AND effective_model IS NULL
+                    AND model_provider IS NULL
+                    AND security_config_sha256 IS NULL
+                    AND feature_snapshot_sha256 IS NULL
+                    AND checkpoint_turn_id IS NULL
+                    AND checkpoint_turn_status IS NULL
+                    AND checkpoint_turn_count IS NULL
+                    AND checkpoint_turns_sha256 IS NULL
+                    AND checkpointed_at IS NULL
+                    AND active_job_id IS NULL AND recovery_required=0`)
+          .run(
+            input.accountType,
+            input.accountSubjectSha256,
+            input.accountIdentityStrength,
+            input.requestedModel,
+            input.effectiveModel,
+            input.modelProvider,
+            input.securityConfigSha256,
+            input.featureSnapshotSha256,
+            input.checkpointTurnId,
+            input.checkpointTurnStatus,
+            input.checkpointTurnCount,
+            input.checkpointTurnsSha256,
+            input.checkpointedAt,
+            now,
+            this.scopeKey,
+            input.backend,
+            input.sessionKey,
+          );
+        if (bound.changes !== 1) {
+          throw new BackendSessionConflictError(
+            `schema v5 backend session 当前不可绑定 v6 metadata：${input.backend}/${input.sessionKey}`,
+          );
+        }
+        row = this.database
+          .query<BackendSessionRow, [string, string, string]>(
+            `SELECT * FROM backend_sessions
+             WHERE scope_key=? AND backend=? AND session_key=?`,
+          )
+          .get(this.scopeKey, input.backend, input.sessionKey)!;
+      }
       if (
         row.session_hash !== input.sessionHash ||
         row.cwd !== input.cwd ||
-        row.cli_version !== input.cliVersion
+        row.cli_version !== input.cliVersion ||
+        row.account_type !== input.accountType ||
+        row.account_subject_sha256 !== input.accountSubjectSha256 ||
+        row.account_identity_strength !== input.accountIdentityStrength ||
+        row.requested_model !== input.requestedModel ||
+        row.effective_model !== input.effectiveModel ||
+        row.model_provider !== input.modelProvider ||
+        row.security_config_sha256 !== input.securityConfigSha256 ||
+        row.feature_snapshot_sha256 !== input.featureSnapshotSha256
       ) {
         throw new BackendSessionConflictError(
           `backend session immutable metadata 不一致：${input.backend}/${input.sessionKey}`,
@@ -348,6 +598,11 @@ export class JobStore {
       if (!current) {
         throw new Error(`backend session 不存在：${backend}/${sessionKey}`);
       }
+      if (current.accountType === null) {
+        throw new BackendSessionConflictError(
+          `backend session 尚未绑定 v6 metadata：${backend}/${sessionKey}`,
+        );
+      }
       if (current.threadId === threadId) return current;
       if (current.threadId !== null) {
         throw new BackendSessionConflictError(
@@ -358,7 +613,7 @@ export class JobStore {
         .query(`UPDATE backend_sessions
                 SET thread_id=?, updated_at=?
                 WHERE scope_key=? AND backend=? AND session_key=?
-                  AND thread_id IS NULL AND recovery_required=0
+                  AND thread_id IS NULL AND account_type IS NOT NULL AND recovery_required=0
                   AND NOT EXISTS (
                     SELECT 1 FROM session_quarantine quarantine
                     WHERE quarantine.scope_key=backend_sessions.scope_key
@@ -371,6 +626,137 @@ export class JobStore {
         );
       }
       return this.getBackendSession(backend, sessionKey)!;
+    });
+    return transaction.immediate();
+  }
+
+  /**
+   * 记录已验证的稳定 thread tail。idle 路径要求没有 active attempt；active
+   * 路径则要求 job/lease/generation/turn 全部命中当前 fencing evidence。
+   */
+  checkpointBackendThreadTail(
+    input: CheckpointBackendThreadTailInput,
+  ): StoredBackendSession {
+    requireNonEmptyMetadata(input.backend, "backend", 32);
+    requireNonEmptyMetadata(input.sessionKey, "sessionKey", 4096);
+    requireNonEmptyMetadata(input.threadId, "threadId", 256);
+    validateCheckpointShape(input);
+    if (input.fence.kind === "active") {
+      requireNonEmptyMetadata(input.fence.jobId, "fence.jobId", 4096);
+      requireNonEmptyMetadata(input.fence.leaseId, "fence.leaseId", 4096);
+      requireNonEmptyMetadata(input.fence.turnId, "fence.turnId", 256);
+      if (!Number.isSafeInteger(input.fence.runGeneration) || input.fence.runGeneration <= 0) {
+        throw new BackendSessionConflictError("fence.runGeneration 必须是正安全整数");
+      }
+      if (input.checkpointTurnId !== input.fence.turnId) {
+        throw new BackendSessionConflictError("active fence turn 与 checkpoint tail 不一致");
+      }
+    }
+
+    const transaction = this.database.transaction(() => {
+      const current = this.getBackendSession(input.backend, input.sessionKey);
+      if (!current) {
+        throw new BackendSessionConflictError(
+          `backend session 不存在：${input.backend}/${input.sessionKey}`,
+        );
+      }
+      if (current.threadId !== input.threadId || current.accountType === null) {
+        throw new BackendSessionConflictError(
+          `backend session thread 或 v6 metadata 未绑定：${input.backend}/${input.sessionKey}`,
+        );
+      }
+      if (current.recoveryRequired || this.getSessionQuarantine(input.sessionKey) !== null) {
+        throw new BackendSessionConflictError(
+          `backend session 处于 recovery/quarantine：${input.backend}/${input.sessionKey}`,
+        );
+      }
+      if (input.fence.kind === "idle") {
+        if (
+          current.activeJobId !== null ||
+          current.activeLeaseId !== null ||
+          current.activeRunGeneration !== null ||
+          current.activeTurnId !== null
+        ) {
+          throw new BackendSessionConflictError("idle checkpoint 遇到 active attempt");
+        }
+      } else if (
+        current.activeJobId !== input.fence.jobId ||
+        current.activeLeaseId !== input.fence.leaseId ||
+        current.activeRunGeneration !== input.fence.runGeneration ||
+        current.activeTurnId !== input.fence.turnId
+      ) {
+        throw new BackendSessionConflictError("active checkpoint fencing evidence 不一致");
+      }
+
+      if (
+        current.checkpointTurnCount === null ||
+        current.checkpointTurnsSha256 === null ||
+        current.checkpointedAt === null
+      ) {
+        throw new BackendSessionConflictError("backend session checkpoint 尚未完成 v6 绑定");
+      }
+      if (input.checkpointTurnCount < current.checkpointTurnCount) {
+        throw new BackendSessionConflictError("checkpoint turn count 不得回退");
+      }
+      if (input.checkpointTurnCount === current.checkpointTurnCount) {
+        if (
+          input.checkpointTurnId !== current.checkpointTurnId ||
+          input.checkpointTurnStatus !== current.checkpointTurnStatus ||
+          input.checkpointTurnsSha256 !== current.checkpointTurnsSha256
+        ) {
+          throw new BackendSessionConflictError("相同 turn count 的 checkpoint 内容不一致");
+        }
+        return current;
+      }
+
+      const fenceClause = input.fence.kind === "idle"
+        ? `AND active_job_id IS NULL AND active_lease_id IS NULL
+             AND active_run_generation IS NULL AND active_turn_id IS NULL`
+        : `AND active_job_id=? AND active_lease_id=?
+             AND active_run_generation=? AND active_turn_id=?`;
+      const query = this.database.query(`UPDATE backend_sessions
+                SET checkpoint_turn_id=?,checkpoint_turn_status=?,checkpoint_turn_count=?,
+                    checkpoint_turns_sha256=?,checkpointed_at=?,updated_at=?
+                WHERE scope_key=? AND backend=? AND session_key=? AND thread_id=?
+                  AND account_type IS NOT NULL AND recovery_required=0
+                  AND checkpoint_turn_count=?
+                  AND checkpoint_turn_id IS ? AND checkpoint_turn_status IS ?
+                  AND checkpoint_turns_sha256=?
+                  ${fenceClause}
+                  AND NOT EXISTS (
+                    SELECT 1 FROM session_quarantine quarantine
+                    WHERE quarantine.scope_key=backend_sessions.scope_key
+                      AND quarantine.session_key=backend_sessions.session_key
+                  )`);
+      const commonParameters = [
+        input.checkpointTurnId,
+        input.checkpointTurnStatus,
+        input.checkpointTurnCount,
+        input.checkpointTurnsSha256,
+        input.checkpointedAt,
+        Date.now(),
+        this.scopeKey,
+        input.backend,
+        input.sessionKey,
+        input.threadId,
+        current.checkpointTurnCount,
+        current.checkpointTurnId,
+        current.checkpointTurnStatus,
+        current.checkpointTurnsSha256,
+      ];
+      const updated = input.fence.kind === "idle"
+        ? query.run(...commonParameters)
+        : query.run(
+            ...commonParameters,
+            input.fence.jobId,
+            input.fence.leaseId,
+            input.fence.runGeneration,
+            input.fence.turnId,
+          );
+      if (updated.changes !== 1) {
+        throw new BackendSessionConflictError("checkpoint CAS/fence 未命中");
+      }
+      return this.getBackendSession(input.backend, input.sessionKey)!;
     });
     return transaction.immediate();
   }
@@ -392,6 +778,7 @@ export class JobStore {
                 SET status='Dispatching', connector_id=?, lease_id=?,
                     run_generation=run_generation+1, updated_at=?
                 WHERE target.scope_key=? AND target.job_id=?
+                  AND target.target_backend=?
                   AND target.status IN ('Received','Acked') AND target.cancel_requested=0
                   AND EXISTS (
                     SELECT 1 FROM backend_sessions backend_session
@@ -399,6 +786,7 @@ export class JobStore {
                       AND backend_session.backend=?
                       AND backend_session.session_key=target.session_key
                       AND backend_session.thread_id IS NOT NULL
+                      AND backend_session.account_type IS NOT NULL
                       AND backend_session.active_job_id IS NULL
                       AND backend_session.recovery_required=0
                   )
@@ -413,7 +801,7 @@ export class JobStore {
                     SELECT 1 FROM session_quarantine q
                     WHERE q.scope_key=target.scope_key AND q.session_key=target.session_key
                   )`)
-        .run(connectorId, leaseId, now, this.scopeKey, jobId, backend);
+        .run(connectorId, leaseId, now, this.scopeKey, jobId, backend, backend);
       if (claimed.changes !== 1) return false;
 
       const attempt = this.database
@@ -458,7 +846,7 @@ export class JobStore {
         .query(`UPDATE jobs
                 SET status='Acked', connector_id=NULL, lease_id=NULL, updated_at=?
                 WHERE scope_key=? AND job_id=? AND status='Dispatching'
-                  AND lease_id=? AND run_generation=?
+                  AND target_backend=? AND lease_id=? AND run_generation=?
                   AND EXISTS (
                     SELECT 1 FROM backend_sessions backend_session
                     WHERE backend_session.scope_key=jobs.scope_key
@@ -474,6 +862,7 @@ export class JobStore {
           now,
           this.scopeKey,
           jobId,
+          backend,
           leaseId,
           runGeneration,
           backend,
@@ -509,7 +898,8 @@ export class JobStore {
         .query(`UPDATE jobs
                 SET status='Cancelled', completed_at=?, updated_at=?
                 WHERE scope_key=? AND job_id=? AND status='Cancelling'
-                  AND cancel_requested=1 AND lease_id=? AND run_generation=?
+                  AND target_backend=? AND cancel_requested=1
+                  AND lease_id=? AND run_generation=?
                   AND EXISTS (
                     SELECT 1 FROM backend_sessions backend_session
                     WHERE backend_session.scope_key=jobs.scope_key
@@ -526,6 +916,7 @@ export class JobStore {
           now,
           this.scopeKey,
           jobId,
+          backend,
           leaseId,
           runGeneration,
           backend,
@@ -549,7 +940,10 @@ export class JobStore {
     return transaction.immediate() ? this.require(jobId) : null;
   }
 
-  /** turn/start 返回 turnId 后，和 Running 状态在同一事务提交。 */
+  /**
+   * turn/start 返回 turnId 后原子绑定。正常路径同时进入 Running；若 cancel 已先到，
+   * job 保持 Cancelling，但仍必须持久化真实 turnId，等待 terminal checkpoint 裁决。
+   */
   markBackendRunning(
     jobId: string,
     backend: string,
@@ -563,7 +957,8 @@ export class JobStore {
         .query(`UPDATE jobs
                 SET status='Running', updated_at=?
                 WHERE scope_key=? AND job_id=? AND status='Dispatching'
-                  AND lease_id=? AND run_generation=? AND cancel_requested=0
+                  AND target_backend=? AND lease_id=? AND run_generation=?
+                  AND cancel_requested=0
                   AND EXISTS (
                     SELECT 1 FROM backend_sessions backend_session
                     WHERE backend_session.scope_key=jobs.scope_key
@@ -579,6 +974,7 @@ export class JobStore {
           now,
           this.scopeKey,
           jobId,
+          backend,
           leaseId,
           runGeneration,
           backend,
@@ -586,14 +982,43 @@ export class JobStore {
           runGeneration,
         );
       if (running.changes !== 1) {
+        const cancellingBound = this.database
+          .query(`UPDATE backend_sessions
+                  SET active_turn_id=?, updated_at=?
+                  WHERE scope_key=? AND backend=? AND active_job_id=?
+                    AND active_lease_id=? AND active_run_generation=?
+                    AND active_turn_id IS NULL AND recovery_required=0
+                    AND EXISTS (
+                      SELECT 1 FROM jobs
+                      WHERE jobs.scope_key=backend_sessions.scope_key
+                        AND jobs.job_id=backend_sessions.active_job_id
+                        AND jobs.status='Cancelling'
+                        AND jobs.target_backend=?
+                        AND jobs.lease_id=backend_sessions.active_lease_id
+                        AND jobs.run_generation=backend_sessions.active_run_generation
+                        AND jobs.cancel_requested=1
+                    )`)
+          .run(
+            turnId,
+            now,
+            this.scopeKey,
+            backend,
+            jobId,
+            leaseId,
+            runGeneration,
+            backend,
+          );
+        if (cancellingBound.changes === 1) return true;
         const duplicate = this.database
-          .query<{ present: number }, [string, string, string, number, string, string, string]>(
+          .query<{ present: number }, [string, string, string, string, number, string, string, string]>(
             `SELECT 1 AS present
              FROM jobs
              JOIN backend_sessions backend_session
                ON backend_session.scope_key=jobs.scope_key
               AND backend_session.session_key=jobs.session_key
-             WHERE jobs.scope_key=? AND jobs.job_id=? AND jobs.status='Running'
+             WHERE jobs.scope_key=? AND jobs.job_id=?
+               AND jobs.status IN ('Running','Cancelling')
+               AND jobs.target_backend=?
                AND jobs.lease_id=? AND jobs.run_generation=?
                AND backend_session.backend=?
                AND backend_session.active_job_id=jobs.job_id
@@ -602,7 +1027,7 @@ export class JobStore {
                AND backend_session.active_turn_id=?
                AND backend_session.recovery_required=0`,
           )
-          .get(this.scopeKey, jobId, leaseId, runGeneration, backend, leaseId, turnId);
+          .get(this.scopeKey, jobId, backend, leaseId, runGeneration, backend, leaseId, turnId);
         return duplicate !== null;
       }
       const bound = this.database
@@ -716,9 +1141,10 @@ export class JobStore {
                  AND backend_session.active_lease_id=jobs.lease_id
                  AND backend_session.active_run_generation=jobs.run_generation
                 WHERE jobs.scope_key=? AND jobs.connector_id=?
+                  AND jobs.target_backend=?
                   AND jobs.status IN ('Dispatching','Running','Cancelling')
                   AND backend_session.recovery_required=0`)
-        .run(reason, now, backend, this.scopeKey, connectorId);
+        .run(reason, now, backend, this.scopeKey, connectorId, backend);
       const marked = this.database
         .query(`UPDATE backend_sessions
                 SET recovery_required=1, updated_at=?
@@ -731,6 +1157,7 @@ export class JobStore {
                       AND jobs.lease_id=backend_sessions.active_lease_id
                       AND jobs.run_generation=backend_sessions.active_run_generation
                       AND jobs.connector_id=?
+                      AND jobs.target_backend=backend_sessions.backend
                       AND jobs.status IN ('Dispatching','Running','Cancelling')
                   )`)
         .run(now, this.scopeKey, backend, connectorId);
@@ -738,7 +1165,8 @@ export class JobStore {
         .query(`UPDATE jobs
                 SET status='CancelUnknown', cancel_requested=1,
                     error=COALESCE(error,?), completed_at=?, updated_at=?
-                WHERE scope_key=? AND connector_id=? AND status='Cancelling'
+                WHERE scope_key=? AND connector_id=? AND target_backend=?
+                  AND status='Cancelling'
                   AND EXISTS (
                     SELECT 1 FROM backend_sessions backend_session
                     WHERE backend_session.scope_key=jobs.scope_key
@@ -749,12 +1177,12 @@ export class JobStore {
                       AND backend_session.active_run_generation=jobs.run_generation
                       AND backend_session.recovery_required=1
                   )`)
-        .run(reason, now, now, this.scopeKey, connectorId, backend).changes;
+        .run(reason, now, now, this.scopeKey, connectorId, backend, backend).changes;
       const interrupted = this.database
         .query(`UPDATE jobs
                 SET status='Interrupted', error=COALESCE(error,?),
                     completed_at=?, updated_at=?
-                WHERE scope_key=? AND connector_id=?
+                WHERE scope_key=? AND connector_id=? AND target_backend=?
                   AND status IN ('Dispatching','Running')
                   AND EXISTS (
                     SELECT 1 FROM backend_sessions backend_session
@@ -766,7 +1194,7 @@ export class JobStore {
                       AND backend_session.active_run_generation=jobs.run_generation
                       AND backend_session.recovery_required=1
                   )`)
-        .run(reason, now, now, this.scopeKey, connectorId, backend).changes;
+        .run(reason, now, now, this.scopeKey, connectorId, backend, backend).changes;
       const changed = cancelUnknown + interrupted;
       if (marked.changes !== changed) {
         throw new Error("backend disconnect 的 job 与 session recovery 数量不一致");
@@ -777,13 +1205,9 @@ export class JobStore {
   }
 
   releaseBackendSessionRecovery(backend: string, sessionKey: string): boolean {
-    const now = Date.now();
     const transaction = this.database.transaction(() => {
       const released = this.database
-        .query(`UPDATE backend_sessions
-                SET active_job_id=NULL, active_lease_id=NULL,
-                    active_run_generation=NULL, active_turn_id=NULL,
-                    recovery_required=0, updated_at=?
+        .query(`DELETE FROM backend_sessions
                 WHERE scope_key=? AND backend=? AND session_key=?
                   AND recovery_required=1
                   AND active_job_id IS NOT NULL
@@ -795,7 +1219,7 @@ export class JobStore {
                         'Succeeded','Cancelled','CancelUnknown','Interrupted','Failed','Rejected'
                       )
                   )`)
-        .run(now, this.scopeKey, backend, sessionKey);
+        .run(this.scopeKey, backend, sessionKey);
       if (released.changes !== 1) return false;
       this.database
         .query("DELETE FROM session_quarantine WHERE scope_key=? AND session_key=?")
@@ -809,9 +1233,12 @@ export class JobStore {
    * 离线人工释放 session 时以数据库中的历史 recovery 证据为准，而不是以
    * 当前 config 选择的 backend 为准。这样从 Codex 切回 Hermes 也不能只删
    * 通用 quarantine、遗留 active attempt 后绕过恢复所有权。
+   *
+   * recovery 表示旧 provider execution 的最终尾部可能已经变化；仅清 active 字段
+   * 再 resume 原 thread 会把未知尾部伪装成安全连续性。因此人工确认后退役整条
+   * backend session，保留 jobs/outbox 与上游 rollout，但下次启动必须创建新 thread。
    */
   releaseSessionRecovery(sessionKey: string): boolean {
-    const now = Date.now();
     const transaction = this.database.transaction(() => {
       const recovery = this.database
         .query<{ total: number; releasable: number }, [string, string]>(
@@ -837,12 +1264,9 @@ export class JobStore {
       if (recovery.releasable !== recovery.total) return false;
 
       const released = this.database
-        .query(`UPDATE backend_sessions
-                SET active_job_id=NULL, active_lease_id=NULL,
-                    active_run_generation=NULL, active_turn_id=NULL,
-                    recovery_required=0, updated_at=?
+        .query(`DELETE FROM backend_sessions
                 WHERE scope_key=? AND session_key=? AND recovery_required=1`)
-        .run(now, this.scopeKey, sessionKey);
+        .run(this.scopeKey, sessionKey);
       if (released.changes !== recovery.total) {
         throw new Error("session recovery 释放数量与已验证历史证据不一致");
       }
@@ -865,6 +1289,7 @@ export class JobStore {
       .query(`UPDATE jobs AS target
               SET status='Dispatching', connector_id=?, lease_id=?, run_generation=run_generation+1, updated_at=?
               WHERE target.scope_key=? AND target.job_id=?
+                AND target.target_backend='hermes'
                 AND target.status IN ('Received','Acked') AND target.cancel_requested=0
                 AND NOT EXISTS (
                   SELECT 1 FROM jobs active
@@ -883,13 +1308,13 @@ export class JobStore {
 
   resetUnsentDispatch(jobId: string, leaseId: string): void {
     this.database
-      .query("UPDATE jobs SET status='Acked', connector_id=NULL, lease_id=NULL, updated_at=? WHERE scope_key=? AND job_id=? AND status='Dispatching' AND lease_id=?")
+      .query("UPDATE jobs SET status='Acked', connector_id=NULL, lease_id=NULL, updated_at=? WHERE scope_key=? AND job_id=? AND target_backend='hermes' AND status='Dispatching' AND lease_id=?")
       .run(Date.now(), this.scopeKey, jobId, leaseId);
   }
 
   markRunning(jobId: string, connectorId: string, leaseId: string): StoredJob {
     this.database
-      .query("UPDATE jobs SET status='Running', connector_id=?, updated_at=? WHERE scope_key=? AND job_id=? AND status='Dispatching' AND lease_id=? AND cancel_requested=0")
+      .query("UPDATE jobs SET status='Running', connector_id=?, updated_at=? WHERE scope_key=? AND job_id=? AND target_backend='hermes' AND status='Dispatching' AND lease_id=? AND cancel_requested=0")
       .run(connectorId, Date.now(), this.scopeKey, jobId, leaseId);
     return this.require(jobId);
   }
@@ -1100,7 +1525,7 @@ export class JobStore {
     const now = Date.now();
     const transaction = this.database.transaction(() => {
       const result = this.database
-        .query("UPDATE jobs SET status='CancelUnknown', cancel_requested=1, error=?, completed_at=?, updated_at=? WHERE scope_key=? AND job_id=? AND lease_id=? AND status='Cancelling'")
+        .query("UPDATE jobs SET status='CancelUnknown', cancel_requested=1, error=?, completed_at=?, updated_at=? WHERE scope_key=? AND job_id=? AND target_backend='hermes' AND lease_id=? AND status='Cancelling'")
         .run(reason, now, now, this.scopeKey, jobId, leaseId);
       if (result.changes === 1) {
         this.database
@@ -1119,24 +1544,27 @@ export class JobStore {
         INSERT OR IGNORE INTO session_quarantine(scope_key,session_key,reason,created_at)
         SELECT scope_key,session_key,'connector disconnected during active execution',?
         FROM jobs
-        WHERE scope_key=? AND connector_id=? AND status IN ('Dispatching','Running','Cancelling')
+        WHERE scope_key=? AND connector_id=? AND target_backend='hermes'
+          AND status IN ('Dispatching','Running','Cancelling')
       `).run(now, this.scopeKey, connectorId);
       const cancelUnknown = this.database
-        .query("UPDATE jobs SET status='CancelUnknown', error=COALESCE(error, 'connector disconnected during cancellation'), completed_at=?, updated_at=? WHERE scope_key=? AND connector_id=? AND status='Cancelling'")
+        .query("UPDATE jobs SET status='CancelUnknown', error=COALESCE(error, 'connector disconnected during cancellation'), completed_at=?, updated_at=? WHERE scope_key=? AND connector_id=? AND target_backend='hermes' AND status='Cancelling'")
         .run(now, now, this.scopeKey, connectorId).changes;
       const interrupted = this.database
         .query(`UPDATE jobs SET status='Interrupted', error=COALESCE(error, 'connector disconnected'), completed_at=?, updated_at=?
-                WHERE scope_key=? AND connector_id=? AND status IN ('Dispatching','Running')`)
+                WHERE scope_key=? AND connector_id=? AND target_backend='hermes'
+                  AND status IN ('Dispatching','Running')`)
         .run(now, now, this.scopeKey, connectorId).changes;
       return cancelUnknown + interrupted;
     });
     return transaction.immediate();
   }
 
-  listDispatchable(limit = 100): StoredJob[] {
+  listDispatchable(targetBackend: ExecutionBackendKind, limit = 100): StoredJob[] {
     return this.database
-      .query<JobViewRow, [string, number]>(`${JOB_VIEW}
-        WHERE j.scope_key=? AND j.status IN ('Received','Acked') AND j.cancel_requested=0
+      .query<JobViewRow, [string, string, number]>(`${JOB_VIEW}
+        WHERE j.scope_key=? AND j.target_backend=?
+          AND j.status IN ('Received','Acked') AND j.cancel_requested=0
           AND NOT EXISTS (
             SELECT 1 FROM jobs active
             WHERE active.scope_key=j.scope_key
@@ -1149,7 +1577,7 @@ export class JobStore {
             WHERE q.scope_key=j.scope_key AND q.session_key=j.session_key
           )
         ORDER BY j.created_at ASC LIMIT ?`)
-      .all(this.scopeKey, limit)
+      .all(this.scopeKey, targetBackend, limit)
       .map(rowToJob);
   }
 
@@ -1252,7 +1680,7 @@ export class JobStore {
                     error=COALESCE(error,?),
                     completed_at=?, updated_at=?
                 WHERE scope_key=? AND job_id=? AND ${fromStatus}
-                  AND lease_id=? AND run_generation=?
+                  AND target_backend=? AND lease_id=? AND run_generation=?
                   AND EXISTS (
                     SELECT 1 FROM backend_sessions backend_session
                     WHERE backend_session.scope_key=jobs.scope_key
@@ -1278,6 +1706,7 @@ export class JobStore {
           now,
           this.scopeKey,
           jobId,
+          backend,
           leaseId,
           runGeneration,
           backend,
@@ -1340,7 +1769,8 @@ export class JobStore {
         .query(`UPDATE jobs
                 SET status=?, error=?, completed_at=?, updated_at=?
                 WHERE scope_key=? AND job_id=? AND status='Running'
-                  AND lease_id=? AND run_generation=? AND cancel_requested=0
+                  AND target_backend=? AND lease_id=? AND run_generation=?
+                  AND cancel_requested=0
                   AND EXISTS (
                     SELECT 1 FROM backend_sessions backend_session
                     WHERE backend_session.scope_key=jobs.scope_key
@@ -1359,6 +1789,7 @@ export class JobStore {
           now,
           this.scopeKey,
           jobId,
+          backend,
           leaseId,
           runGeneration,
           backend,
@@ -1397,6 +1828,7 @@ export class JobStore {
       const result = this.database
         .query(`UPDATE jobs SET status=?, error=?, completed_at=?, updated_at=?
                 WHERE scope_key=? AND job_id=? AND lease_id=?
+                  AND target_backend='hermes'
                   AND status IN ('Dispatching','Running') AND cancel_requested=0`)
         .run(status, error, now, now, this.scopeKey, jobId, leaseId);
       if (result.changes === 1) {
@@ -1501,12 +1933,27 @@ export class JobStore {
     const transaction = this.database.transaction(() => {
       const row = this.database.query<{ user_version: number }, []>("PRAGMA user_version").get();
       const version = row?.user_version ?? 0;
-      if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4) {
+      if (
+        version !== 0 && version !== 1 && version !== 2 && version !== 3 &&
+        version !== 4 && version !== 5 && version !== 6
+      ) {
         throw new Error(`不支持的数据库 schema 版本：${version}`);
+      }
+      if (version === 6) {
+        this.assertMigratedSchemaV6();
+        this.assertLegacyV4MigrationDecision();
+        return;
+      }
+      if (version === 5) {
+        this.assertMigratedSchemaV5();
+        this.createBackendSessionMetadataSchemaV6();
+        this.database.exec("PRAGMA user_version=6;");
+        this.assertMigratedSchemaV6();
+        this.assertLegacyV4MigrationDecision();
+        return;
       }
       if (version === 4) {
         this.assertBackendSessionsSchemaV4();
-        return;
       }
       if (version === 1) {
         this.database.exec(`
@@ -1604,9 +2051,15 @@ export class JobStore {
         CREATE INDEX idx_pending_cancels_gc ON pending_cancels(created_at,scope_key,job_id);
         `);
       }
-      this.createBackendSessionsSchemaV4();
-      this.database.exec("PRAGMA user_version=4;");
-      this.assertMigratedSchemaV4();
+      if (version < 4) {
+        this.createBackendSessionsSchemaV4();
+      }
+      this.createJobTargetBackendSchemaV5(version);
+      this.assertMigratedSchemaV5();
+      this.createBackendSessionMetadataSchemaV6();
+      this.database.exec("PRAGMA user_version=6;");
+      this.assertMigratedSchemaV6();
+      this.assertLegacyV4MigrationDecision();
     });
     // 先取得 RESERVED 写锁，再读取 user_version。两个 opener 因而不会
     // 同时基于旧版本作迁移裁决；回调抛错时 Bun 会回滚全部 DDL/DML。
@@ -1660,6 +2113,270 @@ export class JobStore {
     `);
   }
 
+  private createJobTargetBackendSchemaV5(fromVersion: number): void {
+    const pendingV4Jobs = fromVersion === 4
+      ? this.database
+        .query<{ count: number }, []>(
+          "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('Received','Acked')",
+        )
+        .get()?.count ?? 0
+      : 0;
+    if (pendingV4Jobs > 0 && !this.options.legacyV4JobBackend) {
+      throw new Error(
+        `SQLite v4 中有 ${pendingV4Jobs} 个未绑定 provider 的待派发 job；` +
+        "必须先确认它们入库时使用的 backend，并设置 config.execution.legacyV4JobBackend 后再迁移",
+      );
+    }
+    if (pendingV4Jobs > 0) {
+      const conflictingEvidence = this.database
+        .query<{ count: number }, [string]>(`
+          SELECT COUNT(*) AS count
+          FROM jobs
+          WHERE status IN ('Received','Acked')
+            AND EXISTS (
+              SELECT 1 FROM backend_sessions backend_session
+              WHERE backend_session.scope_key=jobs.scope_key
+                AND backend_session.session_key=jobs.session_key
+                AND backend_session.backend<>?
+            )
+        `)
+        .get(this.options.legacyV4JobBackend!)?.count ?? 0;
+      if (conflictingEvidence > 0) {
+        throw new Error(
+          `SQLite v4 中有 ${conflictingEvidence} 个待派发 job 的 session 证据与 ` +
+          `config.execution.legacyV4JobBackend=${this.options.legacyV4JobBackend} 冲突；` +
+          "拒绝猜测 provider，必须保留备份并人工审阅",
+        );
+      }
+    }
+
+    // SQLite 不能给已有表直接增加“无默认值的 NOT NULL 列”。迁移专用默认值
+    // 只负责填充旧行；两个 trigger 会拒绝任何新 INSERT/UPDATE 留下该标记，
+    // rowToJob 和 schema readback 也会再次失败关闭。
+    this.database.exec(`
+      ALTER TABLE jobs ADD COLUMN target_backend TEXT NOT NULL DEFAULT '__migration_unbound__'
+        CHECK(target_backend IN ('hermes','codex','claude','__migration_unbound__'));
+      CREATE TRIGGER jobs_target_backend_insert_required
+      BEFORE INSERT ON jobs
+      WHEN NEW.target_backend='__migration_unbound__'
+      BEGIN
+        SELECT RAISE(ABORT, 'jobs.target_backend is required');
+      END;
+      CREATE TRIGGER jobs_target_backend_update_required
+      BEFORE UPDATE OF target_backend ON jobs
+      WHEN NEW.target_backend='__migration_unbound__'
+      BEGIN
+        SELECT RAISE(ABORT, 'jobs.target_backend is required');
+      END;
+      DROP INDEX idx_jobs_dispatch;
+      CREATE INDEX idx_jobs_dispatch
+        ON jobs(scope_key,target_backend,status,cancel_requested,session_key,created_at);
+    `);
+
+    if (fromVersion < 4) {
+      // v1-v3 只有 Hermes connector，绑定为 Hermes 不需要猜测。
+      this.database.query("UPDATE jobs SET target_backend='hermes'").run();
+      this.database.query(
+        "INSERT INTO meta(key,value) VALUES('schema_v5_legacy_job_backend','hermes-pre-v4') " +
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      ).run();
+      return;
+    }
+
+    // v4 已经可能由 Hermes 或 Codex 创建。活动 attempt 可从 backend_sessions
+    // 精确恢复；已完成的 Codex job 只在同 session 存在 Codex 元数据且 execution
+    // ID 使用固定 codex: 前缀时回填。其余历史终态不再派发，保守记为 Hermes。
+    this.database.query("UPDATE jobs SET target_backend='hermes'").run();
+    this.database.exec(`
+      UPDATE jobs
+      SET target_backend=(
+        SELECT backend_session.backend
+        FROM backend_sessions backend_session
+        WHERE backend_session.scope_key=jobs.scope_key
+          AND backend_session.active_job_id=jobs.job_id
+          AND backend_session.backend IN ('hermes','codex','claude')
+        LIMIT 1
+      )
+      WHERE EXISTS (
+        SELECT 1 FROM backend_sessions backend_session
+        WHERE backend_session.scope_key=jobs.scope_key
+          AND backend_session.active_job_id=jobs.job_id
+          AND backend_session.backend IN ('hermes','codex','claude')
+      );
+      UPDATE jobs
+      SET target_backend='codex'
+      WHERE connector_id LIKE 'codex:%'
+        AND EXISTS (
+          SELECT 1 FROM backend_sessions backend_session
+          WHERE backend_session.scope_key=jobs.scope_key
+            AND backend_session.session_key=jobs.session_key
+            AND backend_session.backend='codex'
+        );
+    `);
+    if (pendingV4Jobs > 0) {
+      this.database
+        .query("UPDATE jobs SET target_backend=? WHERE status IN ('Received','Acked')")
+        .run(this.options.legacyV4JobBackend!);
+    }
+    this.database
+      .query(
+        "INSERT INTO meta(key,value) VALUES('schema_v5_legacy_job_backend',?) " +
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      )
+      .run(pendingV4Jobs > 0 ? this.options.legacyV4JobBackend! : "no-pending-v4-jobs");
+  }
+
+  private createBackendSessionMetadataSchemaV6(): void {
+    // 新字段允许 NULL 仅用于表示“由 v5 迁入、尚未安全绑定”的历史行。
+    // fresh INSERT trigger 和一次性 binding trigger 保证 v6 新行不能留下半状态。
+    this.database.exec(`
+      ALTER TABLE backend_sessions ADD COLUMN account_type TEXT
+        CHECK(account_type IS NULL OR length(account_type) BETWEEN 1 AND 64);
+      ALTER TABLE backend_sessions ADD COLUMN account_subject_sha256 TEXT
+        CHECK(account_subject_sha256 IS NULL OR (
+          length(account_subject_sha256)=64 AND
+          account_subject_sha256 NOT GLOB '*[^0-9a-f]*'
+        ));
+      ALTER TABLE backend_sessions ADD COLUMN account_identity_strength TEXT
+        CHECK(account_identity_strength IS NULL OR account_identity_strength IN ('subject','type-only'));
+      ALTER TABLE backend_sessions ADD COLUMN requested_model TEXT
+        CHECK(requested_model IS NULL OR length(requested_model) BETWEEN 1 AND 256);
+      ALTER TABLE backend_sessions ADD COLUMN effective_model TEXT
+        CHECK(effective_model IS NULL OR length(effective_model) BETWEEN 1 AND 256);
+      ALTER TABLE backend_sessions ADD COLUMN model_provider TEXT
+        CHECK(model_provider IS NULL OR length(model_provider) BETWEEN 1 AND 128);
+      ALTER TABLE backend_sessions ADD COLUMN security_config_sha256 TEXT
+        CHECK(security_config_sha256 IS NULL OR (
+          length(security_config_sha256)=64 AND
+          security_config_sha256 NOT GLOB '*[^0-9a-f]*'
+        ));
+      ALTER TABLE backend_sessions ADD COLUMN feature_snapshot_sha256 TEXT
+        CHECK(feature_snapshot_sha256 IS NULL OR (
+          length(feature_snapshot_sha256)=64 AND
+          feature_snapshot_sha256 NOT GLOB '*[^0-9a-f]*'
+        ));
+      ALTER TABLE backend_sessions ADD COLUMN checkpoint_turn_id TEXT
+        CHECK(checkpoint_turn_id IS NULL OR length(checkpoint_turn_id) BETWEEN 1 AND 256);
+      ALTER TABLE backend_sessions ADD COLUMN checkpoint_turn_status TEXT
+        CHECK(checkpoint_turn_status IS NULL OR checkpoint_turn_status IN ('completed','failed','interrupted'));
+      ALTER TABLE backend_sessions ADD COLUMN checkpoint_turn_count INTEGER
+        CHECK(checkpoint_turn_count IS NULL OR checkpoint_turn_count >= 0);
+      ALTER TABLE backend_sessions ADD COLUMN checkpoint_turns_sha256 TEXT
+        CHECK(checkpoint_turns_sha256 IS NULL OR (
+          length(checkpoint_turns_sha256)=64 AND
+          checkpoint_turns_sha256 NOT GLOB '*[^0-9a-f]*'
+        ));
+      ALTER TABLE backend_sessions ADD COLUMN checkpointed_at INTEGER
+        CHECK(checkpointed_at IS NULL OR checkpointed_at >= 0);
+
+      CREATE TRIGGER backend_sessions_v6_metadata_insert_required
+      BEFORE INSERT ON backend_sessions
+      WHEN NEW.account_type IS NULL
+        OR NEW.account_identity_strength IS NULL
+        OR NEW.effective_model IS NULL
+        OR NEW.model_provider IS NULL
+        OR NEW.security_config_sha256 IS NULL
+        OR NEW.feature_snapshot_sha256 IS NULL
+        OR NEW.checkpoint_turn_count IS NULL
+        OR NEW.checkpoint_turns_sha256 IS NULL
+        OR NEW.checkpointed_at IS NULL
+        OR (NEW.account_identity_strength='subject' AND NEW.account_subject_sha256 IS NULL)
+        OR (NEW.account_identity_strength='type-only' AND NEW.account_subject_sha256 IS NOT NULL)
+        OR (NEW.checkpoint_turn_count=0 AND (
+          NEW.checkpoint_turn_id IS NOT NULL OR NEW.checkpoint_turn_status IS NOT NULL
+        ))
+        OR (NEW.checkpoint_turn_count>0 AND (
+          NEW.checkpoint_turn_id IS NULL OR NEW.checkpoint_turn_status IS NULL
+        ))
+      BEGIN
+        SELECT RAISE(ABORT, 'backend_sessions v6 metadata is required');
+      END;
+
+      CREATE TRIGGER backend_sessions_v6_metadata_binding_complete
+      BEFORE UPDATE OF account_type,account_subject_sha256,account_identity_strength,
+        requested_model,effective_model,model_provider,security_config_sha256,
+        feature_snapshot_sha256,checkpoint_turn_id,checkpoint_turn_status,
+        checkpoint_turn_count,checkpoint_turns_sha256,checkpointed_at
+      ON backend_sessions
+      WHEN OLD.account_type IS NULL AND (
+        NEW.account_type IS NULL
+        OR NEW.account_identity_strength IS NULL
+        OR NEW.effective_model IS NULL
+        OR NEW.model_provider IS NULL
+        OR NEW.security_config_sha256 IS NULL
+        OR NEW.feature_snapshot_sha256 IS NULL
+        OR NEW.checkpoint_turn_count IS NULL
+        OR NEW.checkpoint_turns_sha256 IS NULL
+        OR NEW.checkpointed_at IS NULL
+        OR (NEW.account_identity_strength='subject' AND NEW.account_subject_sha256 IS NULL)
+        OR (NEW.account_identity_strength='type-only' AND NEW.account_subject_sha256 IS NOT NULL)
+        OR (NEW.checkpoint_turn_count=0 AND (
+          NEW.checkpoint_turn_id IS NOT NULL OR NEW.checkpoint_turn_status IS NOT NULL
+        ))
+        OR (NEW.checkpoint_turn_count>0 AND (
+          NEW.checkpoint_turn_id IS NULL OR NEW.checkpoint_turn_status IS NULL
+        ))
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'backend_sessions v6 metadata binding must be complete');
+      END;
+
+      CREATE TRIGGER backend_sessions_v6_metadata_immutable
+      BEFORE UPDATE OF account_type,account_subject_sha256,account_identity_strength,
+        requested_model,effective_model,model_provider,security_config_sha256,
+        feature_snapshot_sha256
+      ON backend_sessions
+      WHEN OLD.account_type IS NOT NULL AND (
+        NEW.account_type IS NOT OLD.account_type
+        OR NEW.account_subject_sha256 IS NOT OLD.account_subject_sha256
+        OR NEW.account_identity_strength IS NOT OLD.account_identity_strength
+        OR NEW.requested_model IS NOT OLD.requested_model
+        OR NEW.effective_model IS NOT OLD.effective_model
+        OR NEW.model_provider IS NOT OLD.model_provider
+        OR NEW.security_config_sha256 IS NOT OLD.security_config_sha256
+        OR NEW.feature_snapshot_sha256 IS NOT OLD.feature_snapshot_sha256
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'backend_sessions v6 immutable metadata drift');
+      END;
+
+      CREATE TRIGGER backend_sessions_v6_checkpoint_shape
+      BEFORE UPDATE OF checkpoint_turn_id,checkpoint_turn_status,checkpoint_turn_count,
+        checkpoint_turns_sha256,checkpointed_at
+      ON backend_sessions
+      WHEN NEW.account_type IS NOT NULL AND (
+        NEW.checkpoint_turn_count IS NULL
+        OR NEW.checkpoint_turns_sha256 IS NULL
+        OR NEW.checkpointed_at IS NULL
+        OR (NEW.checkpoint_turn_count=0 AND (
+          NEW.checkpoint_turn_id IS NOT NULL OR NEW.checkpoint_turn_status IS NOT NULL
+        ))
+        OR (NEW.checkpoint_turn_count>0 AND (
+          NEW.checkpoint_turn_id IS NULL OR NEW.checkpoint_turn_status IS NULL
+        ))
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'backend_sessions v6 checkpoint shape invalid');
+      END;
+
+      CREATE TRIGGER backend_sessions_v6_checkpoint_monotonic
+      BEFORE UPDATE OF checkpoint_turn_id,checkpoint_turn_status,checkpoint_turn_count,
+        checkpoint_turns_sha256
+      ON backend_sessions
+      WHEN OLD.checkpoint_turn_count IS NOT NULL AND (
+        NEW.checkpoint_turn_count < OLD.checkpoint_turn_count
+        OR (NEW.checkpoint_turn_count=OLD.checkpoint_turn_count AND (
+          NEW.checkpoint_turn_id IS NOT OLD.checkpoint_turn_id
+          OR NEW.checkpoint_turn_status IS NOT OLD.checkpoint_turn_status
+          OR NEW.checkpoint_turns_sha256 IS NOT OLD.checkpoint_turns_sha256
+        ))
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'backend_sessions v6 checkpoint must be monotonic');
+      END;
+    `);
+  }
+
   private assertBackendSessionsSchemaV4(): void {
     const columns = this.database
       .query<{ name: string }, []>("PRAGMA table_info(backend_sessions)")
@@ -1686,15 +2403,197 @@ export class JobStore {
     }
   }
 
-  private assertMigratedSchemaV4(): void {
+  private assertMigratedSchemaV5(): void {
     const integrity = this.database.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get();
     if (integrity?.integrity_check !== "ok") {
-      throw new Error(`SQLite v4 迁移完整性检查失败：${integrity?.integrity_check ?? "unknown"}`);
+      throw new Error(`SQLite v5 迁移完整性检查失败：${integrity?.integrity_check ?? "unknown"}`);
     }
     const foreignKeyViolations = this.database.query<Record<string, unknown>, []>("PRAGMA foreign_key_check").all();
     if (foreignKeyViolations.length > 0) {
-      throw new Error(`SQLite v4 迁移外键检查失败：${JSON.stringify(foreignKeyViolations)}`);
+      throw new Error(`SQLite v5 迁移外键检查失败：${JSON.stringify(foreignKeyViolations)}`);
     }
     this.assertBackendSessionsSchemaV4();
+    const targetBackendColumn = this.database
+      .query<{ name: string; notnull: number; dflt_value: string | null }, []>("PRAGMA table_info(jobs)")
+      .all()
+      .find((column) => column.name === "target_backend");
+    if (
+      !targetBackendColumn ||
+      targetBackendColumn.notnull !== 1 ||
+      targetBackendColumn.dflt_value !== "'__migration_unbound__'"
+    ) {
+      throw new Error("SQLite v5 jobs.target_backend schema 不完整");
+    }
+    const triggers = this.database
+      .query<{ name: string }, []>(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='jobs'",
+      )
+      .all()
+      .map((item) => item.name);
+    for (const expected of [
+      "jobs_target_backend_insert_required",
+      "jobs_target_backend_update_required",
+    ]) {
+      if (!triggers.includes(expected)) {
+        throw new Error(`SQLite v5 target_backend trigger 缺失：${expected}`);
+      }
+    }
+    const unbound = this.database
+      .query<{ count: number }, []>(
+        "SELECT COUNT(*) AS count FROM jobs WHERE target_backend='__migration_unbound__'",
+      )
+      .get()?.count ?? 0;
+    if (unbound !== 0) {
+      throw new Error(`SQLite v5 仍有 ${unbound} 个未绑定 provider 的 job`);
+    }
+  }
+
+  private assertMigratedSchemaV6(): void {
+    const integrity = this.database.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get();
+    if (integrity?.integrity_check !== "ok") {
+      throw new Error(`SQLite v6 迁移完整性检查失败：${integrity?.integrity_check ?? "unknown"}`);
+    }
+    const foreignKeyViolations = this.database.query<Record<string, unknown>, []>("PRAGMA foreign_key_check").all();
+    if (foreignKeyViolations.length > 0) {
+      throw new Error(`SQLite v6 迁移外键检查失败：${JSON.stringify(foreignKeyViolations)}`);
+    }
+
+    const backendSessionColumns = this.database
+      .query<{ name: string }, []>("PRAGMA table_info(backend_sessions)")
+      .all()
+      .map((column) => column.name);
+    const expectedBackendSessionColumns = [
+      "scope_key",
+      "backend",
+      "session_key",
+      "session_hash",
+      "thread_id",
+      "cwd",
+      "cli_version",
+      "active_job_id",
+      "active_lease_id",
+      "active_run_generation",
+      "active_turn_id",
+      "recovery_required",
+      "created_at",
+      "updated_at",
+      "account_type",
+      "account_subject_sha256",
+      "account_identity_strength",
+      "requested_model",
+      "effective_model",
+      "model_provider",
+      "security_config_sha256",
+      "feature_snapshot_sha256",
+      "checkpoint_turn_id",
+      "checkpoint_turn_status",
+      "checkpoint_turn_count",
+      "checkpoint_turns_sha256",
+      "checkpointed_at",
+    ];
+    if (
+      backendSessionColumns.length !== expectedBackendSessionColumns.length ||
+      expectedBackendSessionColumns.some((column) => !backendSessionColumns.includes(column))
+    ) {
+      throw new Error("SQLite v6 backend_sessions schema 不完整");
+    }
+
+    const targetBackendColumn = this.database
+      .query<{ name: string; notnull: number; dflt_value: string | null }, []>("PRAGMA table_info(jobs)")
+      .all()
+      .find((column) => column.name === "target_backend");
+    if (
+      !targetBackendColumn ||
+      targetBackendColumn.notnull !== 1 ||
+      targetBackendColumn.dflt_value !== "'__migration_unbound__'"
+    ) {
+      throw new Error("SQLite v6 jobs.target_backend schema 不完整");
+    }
+
+    const triggers = this.database
+      .query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type='trigger'")
+      .all()
+      .map((item) => item.name);
+    for (const expected of [
+      "jobs_target_backend_insert_required",
+      "jobs_target_backend_update_required",
+      "backend_sessions_v6_metadata_insert_required",
+      "backend_sessions_v6_metadata_binding_complete",
+      "backend_sessions_v6_metadata_immutable",
+      "backend_sessions_v6_checkpoint_shape",
+      "backend_sessions_v6_checkpoint_monotonic",
+    ]) {
+      if (!triggers.includes(expected)) {
+        throw new Error(`SQLite v6 trigger 缺失：${expected}`);
+      }
+    }
+
+    const unboundJobs = this.database
+      .query<{ count: number }, []>(
+        "SELECT COUNT(*) AS count FROM jobs WHERE target_backend='__migration_unbound__'",
+      )
+      .get()?.count ?? 0;
+    if (unboundJobs !== 0) {
+      throw new Error(`SQLite v6 仍有 ${unboundJobs} 个未绑定 provider 的 job`);
+    }
+
+    const malformedMetadata = this.database
+      .query<{ count: number }, []>(`
+        SELECT COUNT(*) AS count
+        FROM backend_sessions
+        WHERE (
+          account_type IS NULL AND (
+            account_subject_sha256 IS NOT NULL
+            OR account_identity_strength IS NOT NULL
+            OR requested_model IS NOT NULL
+            OR effective_model IS NOT NULL
+            OR model_provider IS NOT NULL
+            OR security_config_sha256 IS NOT NULL
+            OR feature_snapshot_sha256 IS NOT NULL
+            OR checkpoint_turn_id IS NOT NULL
+            OR checkpoint_turn_status IS NOT NULL
+            OR checkpoint_turn_count IS NOT NULL
+            OR checkpoint_turns_sha256 IS NOT NULL
+            OR checkpointed_at IS NOT NULL
+          )
+        ) OR (
+          account_type IS NOT NULL AND (
+            account_identity_strength IS NULL
+            OR effective_model IS NULL
+            OR model_provider IS NULL
+            OR security_config_sha256 IS NULL
+            OR feature_snapshot_sha256 IS NULL
+            OR checkpoint_turn_count IS NULL
+            OR checkpoint_turns_sha256 IS NULL
+            OR checkpointed_at IS NULL
+            OR (account_identity_strength='subject' AND account_subject_sha256 IS NULL)
+            OR (account_identity_strength='type-only' AND account_subject_sha256 IS NOT NULL)
+            OR (checkpoint_turn_count=0 AND (
+              checkpoint_turn_id IS NOT NULL OR checkpoint_turn_status IS NOT NULL
+            ))
+            OR (checkpoint_turn_count>0 AND (
+              checkpoint_turn_id IS NULL OR checkpoint_turn_status IS NULL
+            ))
+          )
+        )
+      `)
+      .get()?.count ?? 0;
+    if (malformedMetadata !== 0) {
+      throw new Error(`SQLite v6 有 ${malformedMetadata} 个半绑定 backend session`);
+    }
+  }
+
+  private assertLegacyV4MigrationDecision(): void {
+    if (!this.options.legacyV4JobBackend) return;
+    const recorded = this.getMeta("schema_v5_legacy_job_backend");
+    if (
+      (recorded === "hermes" || recorded === "codex" || recorded === "claude") &&
+      recorded !== this.options.legacyV4JobBackend
+    ) {
+      throw new Error(
+        `SQLite v5 已按 ${recorded} 绑定原 v4 积压，与当前 ` +
+        `config.execution.legacyV4JobBackend=${this.options.legacyV4JobBackend} 冲突`,
+      );
+    }
   }
 }

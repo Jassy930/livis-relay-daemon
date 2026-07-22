@@ -12,6 +12,22 @@ import {
 } from "../src/state/store.ts";
 import { incomingJob, temporaryDirectory } from "./helpers.ts";
 
+const BACKEND_SESSION_METADATA = {
+  accountType: "chatgpt",
+  accountSubjectSha256: "b".repeat(64),
+  accountIdentityStrength: "subject" as const,
+  requestedModel: null,
+  effectiveModel: "gpt-5.6-sol",
+  modelProvider: "openai",
+  securityConfigSha256: "c".repeat(64),
+  featureSnapshotSha256: "d".repeat(64),
+  checkpointTurnId: null,
+  checkpointTurnStatus: null,
+  checkpointTurnCount: 0,
+  checkpointTurnsSha256: "e".repeat(64),
+  checkpointedAt: 100,
+};
+
 function pendingCancelCount(databasePath: string): number {
   const database = new Database(databasePath, { readonly: true });
   try {
@@ -28,6 +44,7 @@ interface DatabaseHealth {
   foreignKeyViolations: Array<Record<string, unknown>>;
   outboxColumns: string[];
   backendSessionColumns: string[];
+  jobColumns: string[];
 }
 
 function databaseHealth(databasePath: string): DatabaseHealth {
@@ -46,25 +63,77 @@ function databaseHealth(databasePath: string): DatabaseHealth {
       .query<{ name: string }, []>("PRAGMA table_info(backend_sessions)")
       .all()
       .map((column) => column.name);
-    return { version, integrity, foreignKeyViolations, outboxColumns, backendSessionColumns };
+    const jobColumns = database
+      .query<{ name: string }, []>("PRAGMA table_info(jobs)")
+      .all()
+      .map((column) => column.name);
+    return { version, integrity, foreignKeyViolations, outboxColumns, backendSessionColumns, jobColumns };
   } finally {
     database.close();
   }
 }
 
-function expectHealthyV4(databasePath: string): void {
+function expectHealthyV6(databasePath: string): void {
   const health = databaseHealth(databasePath);
-  expect(health.version).toBe(4);
+  expect(health.version).toBe(6);
   expect(health.integrity).toBe("ok");
   expect(health.foreignKeyViolations).toEqual([]);
   expect(health.outboxColumns).toContain("next_attempt_at");
   expect(health.backendSessionColumns).toContain("active_turn_id");
   expect(health.backendSessionColumns).toContain("recovery_required");
+  expect(health.backendSessionColumns).toContain("account_type");
+  expect(health.backendSessionColumns).toContain("feature_snapshot_sha256");
+  expect(health.backendSessionColumns).toContain("checkpoint_turn_count");
+  expect(health.backendSessionColumns).toContain("checkpoint_turns_sha256");
+  expect(health.jobColumns).toContain("target_backend");
+}
+
+const DROP_V6_BACKEND_METADATA = `
+  DROP TRIGGER backend_sessions_v6_metadata_insert_required;
+  DROP TRIGGER backend_sessions_v6_metadata_binding_complete;
+  DROP TRIGGER backend_sessions_v6_metadata_immutable;
+  DROP TRIGGER backend_sessions_v6_checkpoint_shape;
+  DROP TRIGGER backend_sessions_v6_checkpoint_monotonic;
+  ALTER TABLE backend_sessions DROP COLUMN checkpointed_at;
+  ALTER TABLE backend_sessions DROP COLUMN checkpoint_turns_sha256;
+  ALTER TABLE backend_sessions DROP COLUMN checkpoint_turn_count;
+  ALTER TABLE backend_sessions DROP COLUMN checkpoint_turn_status;
+  ALTER TABLE backend_sessions DROP COLUMN checkpoint_turn_id;
+  ALTER TABLE backend_sessions DROP COLUMN feature_snapshot_sha256;
+  ALTER TABLE backend_sessions DROP COLUMN security_config_sha256;
+  ALTER TABLE backend_sessions DROP COLUMN model_provider;
+  ALTER TABLE backend_sessions DROP COLUMN effective_model;
+  ALTER TABLE backend_sessions DROP COLUMN requested_model;
+  ALTER TABLE backend_sessions DROP COLUMN account_identity_strength;
+  ALTER TABLE backend_sessions DROP COLUMN account_subject_sha256;
+  ALTER TABLE backend_sessions DROP COLUMN account_type;
+`;
+
+const DROP_V5_JOB_BACKEND = `
+  DROP TRIGGER jobs_target_backend_insert_required;
+  DROP TRIGGER jobs_target_backend_update_required;
+  DROP INDEX idx_jobs_dispatch;
+  ALTER TABLE jobs DROP COLUMN target_backend;
+  CREATE INDEX idx_jobs_dispatch ON jobs(scope_key,status,cancel_requested,session_key,created_at);
+`;
+
+function downgradeV6ToV5(databasePath: string): void {
+  const database = new Database(databasePath, { strict: true });
+  database.exec(`${DROP_V6_BACKEND_METADATA} PRAGMA user_version=5;`);
+  database.close();
+}
+
+function downgradeV6ToV4(databasePath: string): void {
+  const database = new Database(databasePath, { strict: true });
+  database.exec(`${DROP_V6_BACKEND_METADATA} ${DROP_V5_JOB_BACKEND} PRAGMA user_version=4;`);
+  database.close();
 }
 
 function downgradeV4ToV2(databasePath: string): void {
   const database = new Database(databasePath, { strict: true });
   database.exec(`
+    ${DROP_V6_BACKEND_METADATA}
+    ${DROP_V5_JOB_BACKEND}
     DROP TABLE backend_sessions;
     DROP INDEX idx_outbox_delivery;
     DROP INDEX idx_pending_cancels_gc;
@@ -78,6 +147,8 @@ function downgradeV4ToV2(databasePath: string): void {
 function downgradeV4ToV1(databasePath: string): void {
   const database = new Database(databasePath, { strict: true });
   database.exec(`
+    ${DROP_V6_BACKEND_METADATA}
+    ${DROP_V5_JOB_BACKEND}
     DROP TABLE backend_sessions;
     DROP INDEX idx_outbox_delivery;
     DROP INDEX idx_pending_cancels_gc;
@@ -91,7 +162,7 @@ function downgradeV4ToV1(databasePath: string): void {
 
 function downgradeV4ToV3(databasePath: string): void {
   const database = new Database(databasePath, { strict: true });
-  database.exec("DROP TABLE backend_sessions; PRAGMA user_version=3;");
+  database.exec(`${DROP_V6_BACKEND_METADATA} ${DROP_V5_JOB_BACKEND} DROP TABLE backend_sessions; PRAGMA user_version=3;`);
   database.close();
 }
 
@@ -121,6 +192,25 @@ describe("durable jobs + outbox", () => {
     expect(store.ingest(incomingJob("job-1"), "session-1").inserted).toBeTrue();
     expect(store.ingest(incomingJob("job-1"), "session-1").inserted).toBeFalse();
     expect(() => store.ingest(incomingJob("job-1", "different"), "session-1")).toThrow(JobConflictError);
+  });
+
+  test("job 首次入库即绑定 backend，配置切换与重复投递都不能改写", () => {
+    const first = store.ingest(incomingJob("provider-bound"), "session-1", "codex");
+    expect(first.job.targetBackend).toBe("codex");
+    store.markAcked("provider-bound");
+
+    const duplicateAfterSwitch = store.ingest(
+      incomingJob("provider-bound"),
+      "session-1",
+      "hermes",
+    );
+    expect(duplicateAfterSwitch.inserted).toBeFalse();
+    expect(duplicateAfterSwitch.job.targetBackend).toBe("codex");
+    expect(store.listDispatchable("hermes").map((job) => job.jobId)).not.toContain("provider-bound");
+    expect(store.listDispatchable("codex").map((job) => job.jobId)).toContain("provider-bound");
+    expect(store.claimForDispatch("provider-bound", "hermes-connector", "lease-hermes"))
+      .toBeNull();
+    expect(store.require("provider-bound").status).toBe("Acked");
   });
 
   test("SQLite 主文件、WAL 和 SHM 都是 0600", () => {
@@ -176,7 +266,7 @@ describe("durable jobs + outbox", () => {
     expect(store.findJobIdByOutboxMessageId("legacy-result-msg")).toBe("job-migrated");
     expect(store.integrityCheck()).toBe("ok");
     store.close();
-    expectHealthyV4(databasePath);
+    expectHealthyV6(databasePath);
     store = new JobStore(databasePath, "account:agent");
   });
 
@@ -416,7 +506,7 @@ describe("durable jobs + outbox", () => {
     expect(pendingCancelCount(databasePath)).toBe(PENDING_CANCEL_MAX_ROWS);
   });
 
-  test("schema v2 迁移到 v4 时补 GC 索引，并在 daemon 恢复时清除历史 intent", () => {
+  test("schema v2 迁移到 v6 时补 GC 索引，并在 daemon 恢复时清除历史 intent", () => {
     const databasePath = join(directory.path, "relay.db");
     store.ingest(incomingJob("matched-job"), "session-1");
     store.close();
@@ -450,7 +540,7 @@ describe("durable jobs + outbox", () => {
       .all().map((row) => row.name);
     migrated.close();
     expect(indexes).toContain("idx_pending_cancels_gc");
-    expect(version?.user_version).toBe(4);
+    expect(version?.user_version).toBe(6);
     expect(outboxColumns).toContain("next_attempt_at");
   });
 
@@ -541,6 +631,7 @@ describe("backend session durability", () => {
 
   function ensureSession() {
     return store.ensureBackendSession({
+      ...BACKEND_SESSION_METADATA,
       backend,
       sessionKey,
       sessionHash,
@@ -552,7 +643,7 @@ describe("backend session durability", () => {
   function prepareRunningJob(jobId = "codex-job") {
     ensureSession();
     store.bindBackendThread(backend, sessionKey, "thread-1");
-    store.ingest(incomingJob(jobId), sessionKey);
+    store.ingest(incomingJob(jobId), sessionKey, backend);
     store.markAcked(jobId);
     const claimed = store.claimForBackendDispatch(jobId, backend, "codex:process-1", "lease-1")!;
     expect(claimed.status).toBe("Dispatching");
@@ -563,6 +654,19 @@ describe("backend session durability", () => {
     const created = ensureSession();
     expect(created.threadId).toBeNull();
     expect(created.recoveryRequired).toBeFalse();
+    expect(created.accountType).toBe(BACKEND_SESSION_METADATA.accountType);
+    expect(created.accountSubjectSha256).toBe(BACKEND_SESSION_METADATA.accountSubjectSha256);
+    expect(created.accountIdentityStrength).toBe("subject");
+    expect(created.requestedModel).toBeNull();
+    expect(created.effectiveModel).toBe(BACKEND_SESSION_METADATA.effectiveModel);
+    expect(created.modelProvider).toBe(BACKEND_SESSION_METADATA.modelProvider);
+    expect(created.securityConfigSha256).toBe(BACKEND_SESSION_METADATA.securityConfigSha256);
+    expect(created.featureSnapshotSha256).toBe(BACKEND_SESSION_METADATA.featureSnapshotSha256);
+    expect(created.checkpointTurnId).toBeNull();
+    expect(created.checkpointTurnStatus).toBeNull();
+    expect(created.checkpointTurnCount).toBe(0);
+    expect(created.checkpointTurnsSha256).toBe(BACKEND_SESSION_METADATA.checkpointTurnsSha256);
+    expect(created.checkpointedAt).toBe(BACKEND_SESSION_METADATA.checkpointedAt);
     expect(store.getBackendSession(backend, sessionKey)).toEqual(created);
     expect(ensureSession()).toEqual(created);
 
@@ -572,12 +676,148 @@ describe("backend session durability", () => {
     expect(() => store.bindBackendThread(backend, sessionKey, "thread-2"))
       .toThrow(BackendSessionConflictError);
     expect(() => store.ensureBackendSession({
+      ...BACKEND_SESSION_METADATA,
       backend,
       sessionKey,
       sessionHash,
       cwd: join(directory.path, "different"),
       cliVersion: "0.1.0",
     })).toThrow(BackendSessionConflictError);
+
+    for (const immutableDrift of [
+      { accountType: "apiKey", accountSubjectSha256: null, accountIdentityStrength: "type-only" as const },
+      { requestedModel: "gpt-5.6-sol" },
+      { effectiveModel: "gpt-5.7" },
+      { modelProvider: "different-provider" },
+      { securityConfigSha256: "1".repeat(64) },
+      { featureSnapshotSha256: "2".repeat(64) },
+    ]) {
+      expect(() => store.ensureBackendSession({
+        ...BACKEND_SESSION_METADATA,
+        ...immutableDrift,
+        backend,
+        sessionKey,
+        sessionHash,
+        cwd: join(directory.path, "sessions", sessionHash, "workspace"),
+        cliVersion: "0.1.0",
+      })).toThrow(BackendSessionConflictError);
+    }
+
+    const direct = new Database(databasePath, { strict: true });
+    expect(() => direct
+      .query("UPDATE backend_sessions SET effective_model='direct-drift' WHERE backend=?")
+      .run(backend)).toThrow("immutable metadata drift");
+    direct.close();
+  });
+
+  test("idle thread-tail checkpoint 单调、幂等并受 quarantine 保护", () => {
+    ensureSession();
+    store.bindBackendThread(backend, sessionKey, "thread-1");
+    const firstInput = {
+      backend,
+      sessionKey,
+      threadId: "thread-1",
+      checkpointTurnId: "turn-1",
+      checkpointTurnStatus: "completed" as const,
+      checkpointTurnCount: 1,
+      checkpointTurnsSha256: "1".repeat(64),
+      checkpointedAt: 200,
+      fence: { kind: "idle" as const },
+    };
+    const first = store.checkpointBackendThreadTail(firstInput);
+    expect(first.checkpointTurnId).toBe("turn-1");
+    expect(first.checkpointTurnStatus).toBe("completed");
+    expect(first.checkpointTurnCount).toBe(1);
+    expect(first.checkpointTurnsSha256).toBe("1".repeat(64));
+    expect(first.checkpointedAt).toBe(200);
+
+    const duplicate = store.checkpointBackendThreadTail({
+      ...firstInput,
+      checkpointedAt: 999,
+    });
+    expect(duplicate.checkpointedAt).toBe(200);
+    expect(() => store.checkpointBackendThreadTail({
+      ...firstInput,
+      checkpointTurnsSha256: "2".repeat(64),
+    })).toThrow("相同 turn count");
+    expect(() => store.checkpointBackendThreadTail({
+      ...firstInput,
+      checkpointTurnId: null,
+      checkpointTurnStatus: null,
+      checkpointTurnCount: 0,
+      checkpointTurnsSha256: BACKEND_SESSION_METADATA.checkpointTurnsSha256,
+    })).toThrow("不得回退");
+
+    const second = store.checkpointBackendThreadTail({
+      ...firstInput,
+      checkpointTurnId: "turn-2",
+      checkpointTurnStatus: "failed",
+      checkpointTurnCount: 2,
+      checkpointTurnsSha256: "3".repeat(64),
+      checkpointedAt: 300,
+    });
+    expect(second.checkpointTurnId).toBe("turn-2");
+    expect(second.checkpointTurnStatus).toBe("failed");
+    expect(second.checkpointTurnCount).toBe(2);
+
+    expect(store.quarantineSession(sessionKey, "tail audit mismatch")).toBeTrue();
+    expect(() => store.checkpointBackendThreadTail({
+      ...firstInput,
+      checkpointTurnId: "turn-3",
+      checkpointTurnStatus: "interrupted",
+      checkpointTurnCount: 3,
+      checkpointTurnsSha256: "4".repeat(64),
+    })).toThrow("recovery/quarantine");
+  });
+
+  test("active thread-tail checkpoint 要求 thread/turn/lease/generation 完全匹配", () => {
+    const claimed = prepareRunningJob();
+    store.markBackendRunning(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-1",
+    );
+    const checkpoint = {
+      backend,
+      sessionKey,
+      threadId: "thread-1",
+      checkpointTurnId: "turn-1",
+      checkpointTurnStatus: "completed" as const,
+      checkpointTurnCount: 1,
+      checkpointTurnsSha256: "1".repeat(64),
+      checkpointedAt: 200,
+      fence: {
+        kind: "active" as const,
+        jobId: claimed.jobId,
+        leaseId: "lease-1",
+        runGeneration: claimed.runGeneration,
+        turnId: "turn-1",
+      },
+    };
+    for (const staleFence of [
+      { leaseId: "stale-lease" },
+      { runGeneration: claimed.runGeneration + 1 },
+      { jobId: "stale-job" },
+    ]) {
+      expect(() => store.checkpointBackendThreadTail({
+        ...checkpoint,
+        fence: { ...checkpoint.fence, ...staleFence },
+      })).toThrow("fencing evidence");
+    }
+    expect(() => store.checkpointBackendThreadTail({
+      ...checkpoint,
+      checkpointTurnId: "turn-other",
+    })).toThrow("active fence turn");
+    expect(() => store.checkpointBackendThreadTail({
+      ...checkpoint,
+      threadId: "thread-other",
+    })).toThrow("thread 或 v6 metadata");
+
+    const stored = store.checkpointBackendThreadTail(checkpoint);
+    expect(stored.checkpointTurnId).toBe("turn-1");
+    expect(stored.checkpointTurnCount).toBe(1);
   });
 
   test("thread/start ambiguous quarantine 在人工 release 前阻止绑定", () => {
@@ -718,11 +958,7 @@ describe("backend session durability", () => {
     expect(store.listQuarantinedSessions().map((entry) => entry.sessionKey)).toContain(sessionKey);
 
     expect(store.releaseSessionRecovery(sessionKey)).toBeTrue();
-    const released = store.getBackendSession(backend, sessionKey)!;
-    expect(released.threadId).toBe("thread-1");
-    expect(released.activeJobId).toBeNull();
-    expect(released.activeTurnId).toBeNull();
-    expect(released.recoveryRequired).toBeFalse();
+    expect(store.getBackendSession(backend, sessionKey)).toBeNull();
     expect(store.listQuarantinedSessions()).toHaveLength(0);
     expect(store.releaseSessionRecovery(sessionKey)).toBeFalse();
   });
@@ -742,8 +978,12 @@ describe("backend session durability", () => {
     expect(store.getBackendSession(backend, sessionKey)?.activeTurnId).toBeNull();
     expect(store.listQuarantinedSessions().map((entry) => entry.sessionKey)).toContain(sessionKey);
     expect(store.releaseBackendSessionRecovery(backend, sessionKey)).toBeTrue();
+    expect(store.getBackendSession(backend, sessionKey)).toBeNull();
 
-    store.ingest(incomingJob("cancel-unknown"), sessionKey);
+    ensureSession();
+    store.bindBackendThread(backend, sessionKey, "thread-2");
+
+    store.ingest(incomingJob("cancel-unknown"), sessionKey, backend);
     store.markAcked("cancel-unknown");
     const cancelling = store.claimForBackendDispatch(
       "cancel-unknown",
@@ -782,7 +1022,7 @@ describe("backend session durability", () => {
     expect(session.activeTurnId).toBe("turn-2");
   });
 
-  test("cancel 与 turn/start accept 竞态会持久化已知 turnId 后隔离", () => {
+  test("cancel 与 turn/start accept 竞态先持久化 turnId，等待 terminal 再裁决", () => {
     const claimed = prepareRunningJob("cancel-before-accept");
     expect(store.requestCancel(claimed.jobId)?.status).toBe("Cancelling");
     expect(store.markBackendRunning(
@@ -791,8 +1031,10 @@ describe("backend session durability", () => {
       "lease-1",
       claimed.runGeneration,
       "turn-after-cancel",
-    )).toBeNull();
-    expect(store.getBackendSession(backend, sessionKey)?.activeTurnId).toBeNull();
+    )?.status).toBe("Cancelling");
+    expect(store.getBackendSession(backend, sessionKey)?.activeTurnId).toBe("turn-after-cancel");
+    expect(store.getBackendSession(backend, sessionKey)?.recoveryRequired).toBeFalse();
+    expect(store.listQuarantinedSessions()).toHaveLength(0);
 
     const unknown = store.markBackendCancelUnknown(
       claimed.jobId,
@@ -855,6 +1097,7 @@ describe("backend session durability", () => {
     ];
     for (const item of cases) {
       store.ensureBackendSession({
+        ...BACKEND_SESSION_METADATA,
         backend,
         sessionKey: item.sessionKey,
         sessionHash: item.sessionHash,
@@ -862,7 +1105,7 @@ describe("backend session durability", () => {
         cliVersion: "0.1.0",
       });
       store.bindBackendThread(backend, item.sessionKey, item.threadId);
-      store.ingest(incomingJob(item.jobId), item.sessionKey);
+      store.ingest(incomingJob(item.jobId), item.sessionKey, backend);
       store.markAcked(item.jobId);
       const claimed = store.claimForBackendDispatch(
         item.jobId,
@@ -895,25 +1138,150 @@ describe("backend session durability", () => {
   });
 });
 
-describe("SQLite schema v4 migration", () => {
-  test("fresh 数据库直接创建 v4，重复打开保持完整", async () => {
-    const directory = await temporaryDirectory("livis-store-fresh-v4-");
+describe("SQLite schema v6 migration", () => {
+  test("fresh 数据库直接创建 v6，重复打开保持完整", async () => {
+    const directory = await temporaryDirectory("livis-store-fresh-v6-");
     const databasePath = join(directory.path, "relay.db");
     try {
       const first = new JobStore(databasePath, "account:agent");
       first.close();
-      expectHealthyV4(databasePath);
+      expectHealthyV6(databasePath);
 
       const reopened = new JobStore(databasePath, "account:agent");
       reopened.close();
-      expectHealthyV4(databasePath);
+      expectHealthyV6(databasePath);
     } finally {
       await directory.cleanup();
     }
   });
 
-  test("schema v3 原地升级到 v4", async () => {
-    const directory = await temporaryDirectory("livis-store-v3-to-v4-");
+  test("v5 backend session 仅在无 active/recovery 时一次性绑定完整 v6 metadata", async () => {
+    const directory = await temporaryDirectory("livis-store-v5-session-binding-");
+    const databasePath = join(directory.path, "relay.db");
+    const sessionHash = "a".repeat(64);
+    const sessionInput = {
+      ...BACKEND_SESSION_METADATA,
+      backend: "codex",
+      sessionKey: "livis:legacy-agent",
+      sessionHash,
+      cwd: join(directory.path, "workspace"),
+      cliVersion: "0.145.0",
+      checkpointTurnId: "legacy-turn",
+      checkpointTurnStatus: "completed" as const,
+      checkpointTurnCount: 1,
+      checkpointTurnsSha256: "f".repeat(64),
+      checkpointedAt: 500,
+    };
+    try {
+      const seed = new JobStore(databasePath, "account:agent");
+      seed.ensureBackendSession({
+        ...sessionInput,
+        checkpointTurnId: null,
+        checkpointTurnStatus: null,
+        checkpointTurnCount: 0,
+        checkpointTurnsSha256: BACKEND_SESSION_METADATA.checkpointTurnsSha256,
+      });
+      seed.bindBackendThread("codex", sessionInput.sessionKey, "legacy-thread");
+      seed.close();
+      downgradeV6ToV5(databasePath);
+
+      const migrated = new JobStore(databasePath, "account:agent");
+      const unbound = migrated.getBackendSession("codex", sessionInput.sessionKey)!;
+      expect(unbound.accountType).toBeNull();
+      expect(unbound.effectiveModel).toBeNull();
+      expect(unbound.checkpointTurnCount).toBeNull();
+
+      const partialBinding = new Database(databasePath, { strict: true });
+      expect(() => partialBinding
+        .query(`UPDATE backend_sessions SET account_type='chatgpt'
+                WHERE backend='codex' AND session_key=?`)
+        .run(sessionInput.sessionKey)).toThrow("metadata binding must be complete");
+      partialBinding.close();
+
+      const bound = migrated.ensureBackendSession(sessionInput);
+      expect(bound.accountType).toBe("chatgpt");
+      expect(bound.accountIdentityStrength).toBe("subject");
+      expect(bound.threadId).toBe("legacy-thread");
+      expect(bound.checkpointTurnId).toBe("legacy-turn");
+      expect(bound.checkpointTurnCount).toBe(1);
+      expect(bound.checkpointedAt).toBe(500);
+
+      // mutable tail 不属于 ensure 的 immutable 比较，也不会被重复 ensure 覆盖。
+      const repeated = migrated.ensureBackendSession({
+        ...sessionInput,
+        checkpointTurnId: "different-observation",
+        checkpointTurnStatus: "failed",
+        checkpointTurnCount: 2,
+        checkpointTurnsSha256: "1".repeat(64),
+        checkpointedAt: 999,
+      });
+      expect(repeated.checkpointTurnId).toBe("legacy-turn");
+      expect(repeated.checkpointTurnCount).toBe(1);
+      expect(repeated.checkpointedAt).toBe(500);
+      expect(() => migrated.ensureBackendSession({
+        ...sessionInput,
+        effectiveModel: "gpt-drift",
+      })).toThrow("immutable metadata");
+      migrated.close();
+      expectHealthyV6(databasePath);
+    } finally {
+      await directory.cleanup();
+    }
+  });
+
+  test("v5 active/recovery session 拒绝补绑 v6 metadata", async () => {
+    const directory = await temporaryDirectory("livis-store-v5-active-session-");
+    const databasePath = join(directory.path, "relay.db");
+    const sessionInput = {
+      ...BACKEND_SESSION_METADATA,
+      backend: "codex",
+      sessionKey: "livis:active-agent",
+      sessionHash: "a".repeat(64),
+      cwd: join(directory.path, "workspace"),
+      cliVersion: "0.145.0",
+    };
+    try {
+      const seed = new JobStore(databasePath, "account:agent");
+      seed.ensureBackendSession(sessionInput);
+      seed.bindBackendThread("codex", sessionInput.sessionKey, "thread-active");
+      seed.ingest(incomingJob("legacy-active"), sessionInput.sessionKey, "codex");
+      seed.markAcked("legacy-active");
+      const claimed = seed.claimForBackendDispatch(
+        "legacy-active",
+        "codex",
+        "codex:legacy",
+        "lease-active",
+      )!;
+      seed.markBackendRunning(
+        claimed.jobId,
+        "codex",
+        "lease-active",
+        claimed.runGeneration,
+        "turn-active",
+      );
+      seed.close();
+      downgradeV6ToV5(databasePath);
+
+      const migrated = new JobStore(databasePath, "account:agent");
+      const recovery = migrated.recoverAfterRestart();
+      expect(recovery.interrupted).toBe(1);
+      const legacy = migrated.getBackendSession("codex", sessionInput.sessionKey)!;
+      expect(legacy.accountType).toBeNull();
+      expect(legacy.activeJobId).toBe("legacy-active");
+      expect(legacy.recoveryRequired).toBeTrue();
+      expect(() => migrated.ensureBackendSession(sessionInput)).toThrow(
+        "当前不可绑定 v6 metadata",
+      );
+      expect(migrated.getBackendSession("codex", sessionInput.sessionKey)?.accountType)
+        .toBeNull();
+      migrated.close();
+    } finally {
+      await directory.cleanup();
+    }
+  });
+
+  test("schema v3 原地升级到 v6", async () => {
+    const directory = await temporaryDirectory("livis-store-v3-to-v6-");
     const databasePath = join(directory.path, "relay.db");
     try {
       const seed = new JobStore(databasePath, "account:agent");
@@ -922,14 +1290,61 @@ describe("SQLite schema v4 migration", () => {
 
       const migrated = new JobStore(databasePath, "account:agent");
       migrated.close();
-      expectHealthyV4(databasePath);
+      expectHealthyV6(databasePath);
+    } finally {
+      await directory.cleanup();
+    }
+  });
+
+  test("v4 待派发 job 缺少来源声明时回滚，显式声明后固定绑定", async () => {
+    const directory = await temporaryDirectory("livis-store-v4-provider-binding-");
+    const databasePath = join(directory.path, "relay.db");
+    try {
+      const seed = new JobStore(databasePath, "account:agent");
+      seed.ensureBackendSession({
+        ...BACKEND_SESSION_METADATA,
+        backend: "codex",
+        sessionKey: "session-1",
+        sessionHash: "c".repeat(64),
+        cwd: join(directory.path, "codex-workspace"),
+        cliVersion: "0.145.0",
+      });
+      seed.bindBackendThread("codex", "session-1", "legacy-thread");
+      seed.ingest(incomingJob("legacy-pending"), "session-1", "codex");
+      seed.markAcked("legacy-pending");
+      seed.close();
+      downgradeV6ToV4(databasePath);
+
+      expect(() => new JobStore(databasePath, "account:agent"))
+        .toThrow("config.execution.legacyV4JobBackend");
+      const rolledBack = databaseHealth(databasePath);
+      expect(rolledBack.version).toBe(4);
+      expect(rolledBack.jobColumns).not.toContain("target_backend");
+
+      expect(() => new JobStore(databasePath, "account:agent", {
+        legacyV4JobBackend: "hermes",
+      })).toThrow("session 证据");
+      expect(databaseHealth(databasePath).version).toBe(4);
+
+      const migrated = new JobStore(databasePath, "account:agent", {
+        legacyV4JobBackend: "codex",
+      });
+      expect(migrated.require("legacy-pending").targetBackend).toBe("codex");
+      expect(migrated.listDispatchable("hermes")).toHaveLength(0);
+      expect(migrated.listDispatchable("codex").map((job) => job.jobId))
+        .toEqual(["legacy-pending"]);
+      migrated.close();
+      expectHealthyV6(databasePath);
+      expect(() => new JobStore(databasePath, "account:agent", {
+        legacyV4JobBackend: "hermes",
+      })).toThrow("SQLite v5 已按 codex 绑定原 v4 积压");
     } finally {
       await directory.cleanup();
     }
   });
 
   test("并发 opener 在取得 IMMEDIATE 写锁后才裁决版本", async () => {
-    const directory = await temporaryDirectory("livis-store-concurrent-v4-");
+    const directory = await temporaryDirectory("livis-store-concurrent-v6-");
     const databasePath = join(directory.path, "relay.db");
     const readyPath = join(directory.path, "child-ready");
     const proceedPath = join(directory.path, "child-proceed");
@@ -962,7 +1377,7 @@ describe("SQLite schema v4 migration", () => {
             },
           });
           store.close();
-          process.stdout.write("opened-v4");
+          process.stdout.write("opened-v6");
         `,
       ], {
         cwd: join(import.meta.dir, ".."),
@@ -999,9 +1414,9 @@ describe("SQLite schema v4 migration", () => {
 
       const [exitCode, childStdout, childStderr] = await Promise.all([child.exited, stdout, stderr]);
       expect(exitCode).toBe(0);
-      expect(childStdout).toBe("opened-v4");
+      expect(childStdout).toBe("opened-v6");
       expect(childStderr).toBe("");
-      expectHealthyV4(databasePath);
+      expectHealthyV6(databasePath);
     } finally {
       if (blocker) {
         if (!committed) {
@@ -1021,8 +1436,8 @@ describe("SQLite schema v4 migration", () => {
     }
   });
 
-  test("外键检查失败会回滚全部 v2→v4 DDL 与版本号", async () => {
-    const directory = await temporaryDirectory("livis-store-rollback-v4-");
+  test("外键检查失败会回滚全部 v2→v6 DDL 与版本号", async () => {
+    const directory = await temporaryDirectory("livis-store-rollback-v6-");
     const databasePath = join(directory.path, "relay.db");
     try {
       const seed = new JobStore(databasePath, "account:agent");
@@ -1038,7 +1453,7 @@ describe("SQLite schema v4 migration", () => {
       corrupt.exec("PRAGMA foreign_keys=OFF; DELETE FROM jobs WHERE job_id='orphaned-job';");
       corrupt.close();
 
-      expect(() => new JobStore(databasePath, "account:agent")).toThrow("SQLite v4 迁移外键检查失败");
+      expect(() => new JobStore(databasePath, "account:agent")).toThrow("SQLite v5 迁移外键检查失败");
       const rolledBack = databaseHealth(databasePath);
       expect(rolledBack.version).toBe(2);
       expect(rolledBack.outboxColumns).not.toContain("next_attempt_at");

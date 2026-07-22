@@ -82,6 +82,11 @@ export class RelayDaemon {
   static create(dependencies: RelayDaemonDependencies): RelayDaemon {
     const logger = dependencies.logger ?? new Logger("livis-relayd");
     const scopeKey = IdentityStore.scopeKey(dependencies.identity);
+    if (dependencies.config.execution.backend === "claude") {
+      throw new Error(
+        "Claude backend 尚未实现；execution.backend=claude 只用于固化三选一配置边界，serve 拒绝启动",
+      );
+    }
     if (
       dependencies.config.execution.backend === "codex" &&
       (dependencies.config.security.allowAllNodes ||
@@ -91,7 +96,9 @@ export class RelayDaemon {
         "Codex backend 只支持单设备：必须关闭 allowAllNodes 并配置唯一 allowedNodeId",
       );
     }
-    const store = new JobStore(join(dependencies.config.stateDir, "relay.db"), scopeKey);
+    const store = new JobStore(join(dependencies.config.stateDir, "relay.db"), scopeKey, {
+      legacyV4JobBackend: dependencies.config.execution.legacyV4JobBackend ?? undefined,
+    });
     const auth = new IdaasClient(dependencies.profile, dependencies.secrets);
     let daemon!: RelayDaemon;
 
@@ -172,6 +179,8 @@ export class RelayDaemon {
         model: dependencies.config.codex.model,
         maxOutputChars: dependencies.config.security.maxOutputChars,
         requestTimeoutMs: dependencies.config.codex.requestTimeoutMs,
+        turnTimeoutMs: dependencies.config.codex.turnTimeoutMs,
+        interruptGraceMs: dependencies.config.codex.interruptGraceMs,
         shutdownTimeoutMs: dependencies.config.codex.shutdownTimeoutMs,
       }, {
         store,
@@ -294,6 +303,7 @@ export class RelayDaemon {
       quarantinedSessions: this.store.listQuarantinedSessions(),
       recentJobs: this.store.listRecent(20).map((job) => ({
         jobId: job.jobId,
+        targetBackend: job.targetBackend,
         status: job.status,
         outboxStatus: job.outbox?.status ?? null,
         outboxNextAttemptAt: job.outbox?.nextAttemptAt ?? null,
@@ -324,13 +334,14 @@ export class RelayDaemon {
     const sessionKey = `livis:${this.identity.agentId}`;
     let job: StoredJob;
     try {
-      const ingested = this.store.ingest(incoming, sessionKey);
+      const ingested = this.store.ingest(incoming, sessionKey, this.executionBackend.kind);
       job = ingested.job;
       if (job.status === "Received") {
         job = this.store.markAcked(job.jobId);
       }
       this.logger.info(ingested.inserted ? "LiViS job 已持久化" : "LiViS job 重复投递", {
         jobId: job.jobId,
+        targetBackend: job.targetBackend,
         status: job.status,
       });
     } catch (error) {
@@ -359,6 +370,11 @@ export class RelayDaemon {
       return;
     }
     if (job.status === "Cancelling" && job.leaseId) {
+      if (job.targetBackend !== this.executionBackend.kind) {
+        throw new Error(
+          `job ${job.jobId} 已绑定 ${job.targetBackend}，当前 ${this.executionBackend.kind} backend 不得发送 cancel`,
+        );
+      }
       let submission: Awaited<ReturnType<ExecutionBackend["cancel"]>>;
       try {
         submission = await this.executionBackend.cancel(job);
@@ -410,22 +426,6 @@ export class RelayDaemon {
         turnId,
       );
       if (!job) {
-        const current = this.store.get(event.jobId);
-        if (
-          current?.status === "Cancelling" &&
-          current.leaseId === event.leaseId &&
-          current.runGeneration === runGeneration
-        ) {
-          const quarantined = this.store.markBackendCancelUnknown(
-            event.jobId,
-            event.kind,
-            event.leaseId,
-            runGeneration,
-            turnId,
-            "cancel 与 Codex turn/start 并发；interrupt 只能证明请求已接受",
-          );
-          if (quarantined) return;
-        }
         throw new Error(`Codex accepted 使用了失效 attempt：${event.jobId}`);
       }
       return;
@@ -596,7 +596,7 @@ export class RelayDaemon {
       return;
     }
     if (!this.executionBackend.ready || !this.executionBackend.executionId) return;
-    for (const candidate of this.store.listDispatchable()) {
+    for (const candidate of this.store.listDispatchable(this.executionBackend.kind)) {
       if (this.isUpstreamProofExpired()) {
         await this.beginUpstreamBlock(UPSTREAM_PROOF_EXPIRED_REASON, waitForRelayStop);
         return;

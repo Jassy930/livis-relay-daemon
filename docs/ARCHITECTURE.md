@@ -14,15 +14,17 @@
   模式只管理 daemon 服务，app-server 随 daemon 启停。
 
 这种边界允许以后评审新的执行后端，而不复制 LiViS 登录、协议和 durable outbox。
-Claude Code 当前尚未实现，不属于可选择 backend。
+`execution.backend` 的配置值固定为 `hermes | codex | claude`，一套 daemon 同时只选择
+一个。Claude Code 当前尚未实现：配置解析会接受该枚举值，但 `doctor` 会明确报错，
+`serve` 会在启动任何执行 backend 前失败关闭，绝不退回 Hermes 或 Codex。
 
 当前抽象还不是完整的 provider-neutral managed-session 层：事件中的 `turnId`、SQLite
 中的 `thread_id/active_turn_id` 以及 daemon 多处 `kind === "codex"` 分支都带 Codex
 语义。引入 Claude Code 前，应先抽出 backend registry、托管目录/session 生命周期、
 attempt fencing、terminal/cancel 能力和 provider session/execution 标识；Codex 的
 JSON-RPC stdio 与 Claude 的 SDK/CLI stream-json 必须保留为两个独立 transport，不能
-为了复用代码把它们伪装成同一协议。一套 daemon 是否同时承载两个 provider 仍是产品
-决策，当前只支持配置时二选一。
+为了复用代码把它们伪装成同一协议。当前产品边界已经固定为 Hermes、Codex、Claude
+三选一，不支持同一 daemon 同时承载多个 provider。
 
 这里的“协议所有者”描述本地状态职责，不代表项目掌握服务端规范。服务端已经接受、仅由官方客户端观察、只在 fake Relay 验证或仍未知的行为，统一登记在[LiViS 服务端协议证据与支持边界](LIVIS-RELAY-PROTOCOL-BOUNDARY.md)。
 
@@ -33,7 +35,8 @@ JSON-RPC stdio 与 Claude 的 SDK/CLI stream-json 必须保留为两个独立 tr
 受支持的部署拓扑固定为一个 daemon、一个 config、一个 state directory、一个执行
 backend 和恰好一个获准 `node_id`。Hermes 模式额外对应一个专用 profile；Codex
 模式额外对应一个 daemon 私有 `CODEX_HOME`、一个 session workspace 和一个持久
-thread。两种 backend 不得在同一 daemon 中同时启用或共享会话。
+thread。两种已实现 backend 不得在同一 daemon 中同时启用或共享会话；未来 Claude
+实现后也必须遵守同一三选一边界。
 
 `security.allowedNodeIds` 的数组形式和 Hermes `LIVIS_ALLOWED_USERS` 的逗号列表形式只是
 配置格式，不代表一期支持多个设备；`allowAllNodes` 与 `LIVIS_ALLOW_ALL_USERS` 必须
@@ -60,7 +63,8 @@ Pending → Delivering → Delivered
 
 `Succeeded` 只表示 Agent final 已持久化；远端完成还要求 outbox 收到 `ack_send_result`。重启时：
 
-- 未派发 job 可以继续派发。
+- job 首次入库时会把所选 provider 写入不可变的 `jobs.target_backend`；重复投递或后续
+  配置切换都不会改写。未派发 job 只有在当前 backend 与该绑定一致时才可继续派发。
 - `Dispatching/Running/Cancelling` 属于 ambiguous execution，不自动重跑。
 - 未 ACK 的结果只重发 outbox，每次生成新的 `msg_id`，保留原 `job_id` 和结果内容。
 
@@ -77,13 +81,20 @@ Pending → Delivering → Delivered
 `Pending`、`Delivering` 或 `AckFailed` 收敛到 `Delivered`；从未投递的结果不接受
 ACK。
 
-JobStore schema v3 曾为 outbox 增加 `next_attempt_at`；当前 schema v4 新增
-`backend_sessions`，保存 backend/session hash/cwd/CLI version/thread ID，以及活动
-job/lease/run generation/turn ID 与 recovery 标记。fresh、v1、v2 和 v3 数据库都在
+JobStore schema v3 曾为 outbox 增加 `next_attempt_at`，schema v4 新增
+`backend_sessions`，schema v5 为每个 job 增加不可变 `target_backend`；当前 schema v6
+又为 Codex session 增加账号身份、请求/实际模型、安全配置与 feature 摘要，以及单调
+thread-tail checkpoint。v1-v3
+数据只可能来自 Hermes，可确定性回填为 `hermes`；v4 已可能来自 Hermes 或 Codex，若
+仍有 `Received/Acked` 积压，迁移必须由操作者用
+`execution.legacyV4JobBackend` 显式声明其原始 backend，否则整笔事务回滚。fresh、v1、v2、
+v3 和 v4 数据库都在
 同一个 `BEGIN IMMEDIATE` 事务内完成版本读取、DDL、旧 `AckFailed` 恢复为
 `Pending`、完整性与外键检查以及最终版本提交。版本裁决发生在取得写锁之后，避免
 两个 opener 同时按旧版本迁移；任一步失败会回滚全部 DDL/DML 和
-`PRAGMA user_version`。
+`PRAGMA user_version`。v5 旧 session 只有在没有 active attempt、recovery 或 quarantine
+时，才允许在真实 app-server 安全回读后一次性补绑 v6 元数据；不能仅靠数据库迁移猜测
+账号、模型或 thread 尾部。
 
 取消意图在 SQLite `IMMEDIATE` 事务内按当前状态原子转移：`Received/Acked` 可直接进入 `Cancelled`，`Dispatching/Running` 只能进入 `Cancelling`。重复 cancel 保持 `Cancelling`，迟到 cancel 不会回退 `Interrupted` 或任何终态；Hermes connector 确认已发出 `/stop`，或 Codex app-server 接受 `turn/interrupt`，都不能证明工具副作用已经停止，daemon 仍须记录 `CancelUnknown` 并隔离 session。
 
@@ -120,7 +131,7 @@ Codex 是 daemon 内部 backend，不使用 connector v1。daemon 为稳定
 
 ```text
 initialize → account/read → permissionProfile/list → experimentalFeature/list
-           → thread/start → memoryMode/set → thread/read → SQLite bind
+           → thread/start → thread/memoryMode/set → thread/read → SQLite bind
            → 或 thread/resume → thread/read
 job claim  → turn/start → item/completed* → turn/completed
 cancel     → turn/interrupt
@@ -129,13 +140,20 @@ cancel     → turn/interrupt
 私有运行目录位于 `<stateDir>/backends/codex`；session workspace 是唯一工具可写根，
 工具网络关闭，审批策略为 `never`，所有 approval request 默认拒绝。daemon 在创建或
 恢复 thread 后读回 cwd、runtime workspace roots、permission profile、approval policy
-与 sandbox；任一字段或固定配置漂移都失败关闭。
+与 sandbox，并比较账号身份强度、实际 model/provider、配置/feature 摘要及稳定 thread
+tail；任一字段、未映射 turn 或固定配置漂移都失败关闭。
 
 JobStore 先原子 claim job 并保留 backend attempt，随后才允许发送 `turn/start`。
 只有 transport 明确证明请求未写入时才可撤销 attempt；请求可能已写入、响应无法绑定
 turn、app-server 断连或 daemon 重启时，均保留 attempt 并进入
 `Interrupted`/`CancelUnknown`、recovery 和 quarantine，绝不自动重发或创建替代
 thread。
+
+完整 turn 的 deadline 在发送 `turn/start` 前安装。超时取得唯一 interruption owner 后，
+只发送一次 `turn/interrupt`，固定 grace 结束仍未安全收敛就断开 backend；deadline 后的
+任何 terminal 都不会进入 outbox。app-server 位于独立 POSIX 进程组，关闭按 TERM/KILL
+两阶段并等待直接 child、stdout/stderr 和进程组消失；逃逸到其他 session/进程组的后代
+仍需目标机 cgroup/systemd 等更强边界。
 
 Codex 0.145.0 的新 thread 在首个 turn 前不会自动落盘。daemon 只在有界物化回读确认
 rollout 位于专用 `CODEX_HOME/sessions`、首条 `session_meta.id` 匹配后写入 SQLite；
@@ -153,7 +171,8 @@ LiViS 与执行后端使用不同门禁：
 1. LiViS：版本化 protocol profile、artifact 哈希、wire marker、`wireContractRevision + credentialMode`、active profile SHA pin、runtime contract digest、24 小时 supported proof 与本地脱敏 S2 probe artifact。
 2. Hermes：外置公共 platform plugin、connector hello、bridge 版本区间、Hermes runtime 版本区间和真实包 smoke test。
 3. Codex：CLI `[0.145.0, 0.146.0)` 版本窗、专用登录、固定 app-server argv/config、
-   高风险 feature 回读、thread/rollout/sandbox 安全回读和真实恶意凭据负向 canary。
+   精确 enabled feature allowlist 与快照摘要、thread/rollout/sandbox 安全回读和真实恶意
+   凭据负向 canary。
 4. daemon：自身版本与上述 profile 分离；升级 daemon 不覆盖状态目录中的 active profile、
    backend session 或 workspace。
 

@@ -10,7 +10,45 @@ export const CODEX_DISABLED_FEATURES = [
   "skill_mcp_dependency_install",
   "multi_agent",
   "multi_agent_v2",
+  "code_mode_host",
+  "terminal_resize_reflow",
+  "sqlite",
+  "enable_request_compression",
+  "tool_search_always_defer_mcp_tools",
+  "tool_suggest",
+  "in_app_browser",
+  "browser_use",
+  "browser_use_full_cdp_access",
+  "browser_use_external",
+  "computer_use",
+  "plugin_sharing",
+  "resize_all_images",
+  "skill_search",
+  "mentions_v2",
+  "steer",
+  "guardian_approval",
+  "collaboration_modes",
+  "tool_call_mcp_elicitation",
+  "auth_elicitation",
+  "personality",
+  "fast_mode",
+  "tui_app_server",
+  "remote_compaction_v2",
+  "workspace_dependencies",
 ] as const;
+
+/**
+ * Codex 0.145.0 即使收到 `--disable`，仍会把四个 removed feature 回读为 enabled。
+ * 它们不是安全承诺，只是精确版本锁定的不可关闭例外；最终工具面仍须另做 canary。
+ */
+export const CODEX_0145_ALLOWED_ENABLED_FEATURES = new Map<string, string>([
+  ["shell_tool", "stable"],
+  ["unified_exec", "stable"],
+  ["terminal_resize_reflow", "removed"],
+  ["tool_search_always_defer_mcp_tools", "removed"],
+  ["resize_all_images", "removed"],
+  ["tui_app_server", "removed"],
+]);
 
 export const CODEX_APP_SERVER_COMMAND = [
   "codex",
@@ -56,22 +94,30 @@ export interface CodexAppServerInput {
 
 /** 测试可以注入这一最小进程边界，避免读取真实 Codex 配置或会话。 */
 export interface CodexAppServerProcess {
+  readonly pid?: number;
   readonly stdin: CodexAppServerInput;
   readonly stdout: ReadableStream<Uint8Array>;
   readonly stderr: ReadableStream<Uint8Array>;
   readonly exited: Promise<number>;
-  kill(exitCode?: number): void;
+  kill(signal?: number | NodeJS.Signals): void;
 }
 
 export interface CodexAppServerSpawnOptions {
   cwd?: string;
   env?: Record<string, string | undefined>;
+  /** 生产实现必须让 app-server 成为独立 POSIX 进程组 leader。 */
+  detached?: boolean;
 }
 
 export type CodexAppServerSpawn = (
   command: readonly string[],
   options: CodexAppServerSpawnOptions,
 ) => CodexAppServerProcess;
+
+export interface CodexProcessGroupController {
+  signal(processGroupId: number, signal: number | NodeJS.Signals): void;
+  exists(processGroupId: number): boolean;
+}
 
 export interface CodexAppServerNotification {
   method: string;
@@ -167,6 +213,8 @@ export interface CodexAppServerClientOptions {
   cwd?: string;
   env?: Record<string, string | undefined>;
   spawn?: CodexAppServerSpawn;
+  /** 测试注入；生产默认在 macOS/Linux 使用负 PGID 信号和存活探针。 */
+  processGroupController?: CodexProcessGroupController | null;
   requestTimeoutMs?: number;
   stderrMaxBytes?: number;
   stdoutLineMaxBytes?: number;
@@ -237,6 +285,40 @@ export class CodexAppServerProcessError extends Error {
   }
 }
 
+export class CodexAppServerCloseUnconfirmedError extends Error {
+  constructor(
+    readonly timeoutMs: number,
+    override readonly cause?: unknown,
+  ) {
+    super(`Codex app-server SIGKILL 后仍无法确认进程组与 stdio 收口（${timeoutMs} ms）`);
+    this.name = "CodexAppServerCloseUnconfirmedError";
+  }
+}
+
+function isErrnoCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error &&
+    (error as { code?: unknown }).code === code;
+}
+
+const POSIX_PROCESS_GROUP_CONTROLLER: CodexProcessGroupController | null =
+  process.platform === "darwin" || process.platform === "linux"
+    ? {
+        signal(processGroupId, signal) {
+          process.kill(-processGroupId, signal);
+        },
+        exists(processGroupId) {
+          try {
+            process.kill(-processGroupId, 0);
+            return true;
+          } catch (error) {
+            if (isErrnoCode(error, "ESRCH")) return false;
+            if (isErrnoCode(error, "EPERM")) return true;
+            throw error;
+          }
+        },
+      }
+    : null;
+
 function defaultSpawn(
   command: readonly string[],
   options: CodexAppServerSpawnOptions,
@@ -244,6 +326,7 @@ function defaultSpawn(
   return Bun.spawn([...command], {
     cwd: options.cwd,
     env: options.env,
+    detached: true,
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -292,6 +375,8 @@ function rpcErrorDetails(value: unknown): { code?: number; message: string; data
 
 export class CodexAppServerClient {
   private readonly child: CodexAppServerProcess;
+  private readonly processGroupController: CodexProcessGroupController | null;
+  private readonly processGroupId: number | null;
   private readonly requestTimeoutMs: number;
   private readonly stderrMaxBytes: number;
   private readonly stdoutLineMaxBytes: number;
@@ -309,6 +394,7 @@ export class CodexAppServerClient {
   private stderrBytes = new Uint8Array(0);
   private stderrTotalBytes = 0;
   private _exitCode: number | null = null;
+  private closePromise: Promise<void> | null = null;
 
   private constructor(options: CodexAppServerClientOptions) {
     this.requestTimeoutMs =
@@ -329,7 +415,24 @@ export class CodexAppServerClient {
     if (command.length === 0 || command.some((part) => typeof part !== "string" || part.length === 0)) {
       throw new Error("Codex app-server command 必须包含非空 argv");
     }
-    this.child = spawn(command, { cwd: options.cwd, env: options.env });
+    this.child = spawn(command, { cwd: options.cwd, env: options.env, detached: true });
+    this.processGroupController = options.processGroupController === undefined
+      ? options.spawn === undefined
+        ? POSIX_PROCESS_GROUP_CONTROLLER
+        : null
+      : options.processGroupController;
+    this.processGroupId = this.processGroupController !== null &&
+        Number.isSafeInteger(this.child.pid) && (this.child.pid ?? 0) > 0
+      ? this.child.pid!
+      : null;
+    if (this.processGroupController !== null && this.processGroupId === null) {
+      try {
+        this.child.kill("SIGKILL");
+      } catch {
+        // 构造失败时只能尽力终止直接 child；没有 PID 时不能声明进程组收口。
+      }
+      throw new Error("Codex app-server 进程组控制要求有效 child pid");
+    }
     this.stderrTask = this.collectStderr();
     void this.stderrTask.catch((error: unknown) => {
       this.failTransport(error instanceof Error ? error : new Error(String(error)));
@@ -369,7 +472,14 @@ export class CodexAppServerClient {
       await client.notify("initialized");
       return client;
     } catch (error) {
-      await client.close().catch(() => undefined);
+      try {
+        await client.close();
+      } catch (closeError) {
+        throw new AggregateError(
+          [error, closeError],
+          "Codex app-server 初始化失败且进程组收口未确认",
+        );
+      }
       throw error;
     }
   }
@@ -477,8 +587,13 @@ export class CodexAppServerClient {
     return this.request<T>("thread/unsubscribe", params);
   }
 
-  async close(): Promise<void> {
-    if (this.state === "exited") return;
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closePromise = this.closeInternal();
+    return this.closePromise;
+  }
+
+  private async closeInternal(): Promise<void> {
     if (this.state === "running") {
       this.state = "closing";
       this.rejectAll(new Error("Codex app-server 客户端已关闭"));
@@ -487,33 +602,73 @@ export class CodexAppServerClient {
       } catch {
         // 子进程可能已经关闭 stdin；后续 kill/exit observer 会完成收口。
       }
+    }
+    const gracefulSignalErrors = this.signalProcessTree("SIGTERM");
+    try {
+      await this.awaitCloseReceipt(this.closeTimeoutMs);
+      return;
+    } catch (gracefulError) {
+      const killSignalErrors = this.signalProcessTree("SIGKILL");
       try {
-        this.child.kill();
-      } catch {
-        // 与自然退出竞争时 kill 允许失败。
+        await this.awaitCloseReceipt(this.closeTimeoutMs);
+        return;
+      } catch (killError) {
+        throw new CodexAppServerCloseUnconfirmedError(
+          this.closeTimeoutMs,
+          new AggregateError(
+            [...gracefulSignalErrors, gracefulError, ...killSignalErrors, killError],
+            "Codex app-server 两阶段关闭未确认",
+          ),
+        );
       }
     }
+  }
+
+  private signalProcessTree(signal: NodeJS.Signals): unknown[] {
+    const errors: unknown[] = [];
+    if (this.processGroupController && this.processGroupId !== null) {
+      try {
+        this.processGroupController.signal(this.processGroupId, signal);
+        return errors;
+      } catch (error) {
+        if (isErrnoCode(error, "ESRCH")) return errors;
+        errors.push(error);
+      }
+    }
+    try {
+      this.child.kill(signal);
+    } catch (error) {
+      errors.push(error);
+    }
+    return errors;
+  }
+
+  private async awaitCloseReceipt(timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    const groupGone = async (): Promise<void> => {
+      if (!this.processGroupController || this.processGroupId === null) return;
+      while (this.processGroupController.exists(this.processGroupId)) {
+        if (Date.now() >= deadline) {
+          throw new Error(`Codex app-server 进程组关闭超时（${timeoutMs} ms）`);
+        }
+        await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 5));
+      }
+    };
     try {
       await Promise.race([
         Promise.all([
           this.child.exited.catch(() => undefined),
           Promise.allSettled([this.stdoutTask, this.stderrTask]),
+          groupGone(),
         ]),
         new Promise<never>((_resolve, reject) => {
           timeout = setTimeout(
-            () => reject(new Error(`Codex app-server 关闭超时（${this.closeTimeoutMs} ms）`)),
-            this.closeTimeoutMs,
+            () => reject(new Error(`Codex app-server 关闭超时（${timeoutMs} ms）`)),
+            timeoutMs,
           );
         }),
       ]);
-    } catch (error) {
-      try {
-        this.child.kill(9);
-      } catch {
-        // 已经尝试升级终止；把有界关闭失败交给上层处理。
-      }
-      throw error;
     } finally {
       if (timeout) clearTimeout(timeout);
     }
@@ -736,11 +891,7 @@ export class CodexAppServerClient {
     if (this.state !== "running") return;
     this.terminalError = error;
     this.rejectAllForTransport(error);
-    try {
-      this.child.kill();
-    } catch {
-      // 进程可能已经退出。
-    }
+    this.signalProcessTree("SIGTERM");
   }
 
   private handleExit(exitCode: number): void {

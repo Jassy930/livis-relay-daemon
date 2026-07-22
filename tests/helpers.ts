@@ -36,6 +36,7 @@ export function testConfig(stateDir: string): RelayConfig {
     },
     execution: {
       backend: "hermes",
+      legacyV4JobBackend: null,
     },
     connector: {
       socketPath: join(stateDir, "connector.sock"),
@@ -63,6 +64,8 @@ export function testConfig(stateDir: string): RelayConfig {
       command: "codex",
       model: null,
       requestTimeoutMs: 30_000,
+      turnTimeoutMs: 900_000,
+      interruptGraceMs: 5_000,
       shutdownTimeoutMs: 5_000,
       acknowledgeRemoteExecution: false,
     },

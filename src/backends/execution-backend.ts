@@ -1,4 +1,4 @@
-import type { StoredJob } from "../types.ts";
+import type { ExecutionBackendKind, StoredJob } from "../types.ts";
 
 /**
  * daemon 当前选择的本地执行后端。
@@ -6,7 +6,7 @@ import type { StoredJob } from "../types.ts";
  * `hermes` 仍通过 connector v1 接入；`codex` 使用 daemon 持有的
  * app-server 子进程。这个类型不代表两种后端共享传输协议。
  */
-export type ExecutionBackendKind = "hermes" | "codex";
+export type { ExecutionBackendKind } from "../types.ts";
 
 /**
  * `not_sent` 只能在后端能够证明请求没有离开 daemon 时返回。

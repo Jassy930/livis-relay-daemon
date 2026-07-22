@@ -1,5 +1,14 @@
 export const CONNECTOR_PROTOCOL_VERSION = 1 as const;
 
+/**
+ * daemon 启动时三选一的执行后端。该值同时作为 job 入库时的不可变路由绑定，
+ * 不表示三种 transport 可以互换或在同一 daemon 内同时在线。
+ */
+export type ExecutionBackendKind = "hermes" | "codex" | "claude";
+
+/** schema v4 发布时实际存在的两个 backend；仅用于一次性迁移声明。 */
+export type LegacyV4JobBackendKind = Exclude<ExecutionBackendKind, "claude">;
+
 export type JobStatus =
   | "Received"
   | "Acked"
@@ -14,6 +23,12 @@ export type JobStatus =
   | "Rejected";
 
 export type OutboxStatus = "Pending" | "Delivering" | "Delivered" | "AckFailed";
+
+/** 只有已经稳定落盘的 terminal turn 才能成为恢复 checkpoint。 */
+export type BackendCheckpointTurnStatus = "completed" | "failed" | "interrupted";
+
+/** 账号身份绑定能否区分同类型账号；API key/Bedrock 当前只能绑定账号类型。 */
+export type BackendAccountIdentityStrength = "subject" | "type-only";
 
 export interface RelayMetadata {
   msg_id?: string;
@@ -45,6 +60,8 @@ export interface IncomingRelayJob {
 export interface StoredJob extends IncomingRelayJob {
   scopeKey: string;
   payloadHash: string;
+  /** 首次入库时绑定；配置切换不得改写已有 job 的目标后端。 */
+  targetBackend: ExecutionBackendKind;
   status: JobStatus;
   sessionKey: string;
   connectorId: string | null;
@@ -85,6 +102,20 @@ export interface StoredBackendSession {
   threadId: string | null;
   cwd: string;
   cliVersion: string;
+  /** v5 旧行在首次安全绑定前为 null；新建 v6 行始终完整。 */
+  accountType: string | null;
+  accountSubjectSha256: string | null;
+  accountIdentityStrength: BackendAccountIdentityStrength | null;
+  requestedModel: string | null;
+  effectiveModel: string | null;
+  modelProvider: string | null;
+  securityConfigSha256: string | null;
+  featureSnapshotSha256: string | null;
+  checkpointTurnId: string | null;
+  checkpointTurnStatus: BackendCheckpointTurnStatus | null;
+  checkpointTurnCount: number | null;
+  checkpointTurnsSha256: string | null;
+  checkpointedAt: number | null;
   activeJobId: string | null;
   activeLeaseId: string | null;
   activeRunGeneration: number | null;

@@ -84,4 +84,72 @@ describe("Codex doctor 启动前安全门禁", () => {
       await Promise.all([state.cleanup(), external.cleanup()]);
     }
   });
+
+  test("Claude 可配置但 doctor 与 serve 都清晰失败关闭", async () => {
+    const state = await temporaryDirectory("livis-claude-unimplemented-state-");
+    try {
+      await chmod(state.path, 0o700);
+      const profile = await testProfile();
+      const profileText = `${JSON.stringify(profile, null, 2)}\n`;
+      const profilePath = join(state.path, "protocol-profiles", "active.json");
+      await atomicWritePrivate(profilePath, profileText);
+      await new SecretStore(state.path).initialize();
+      await new IdentityStore(state.path, profile).initialize();
+      const configPath = join(state.path, "config.json");
+      await atomicWritePrivate(configPath, `${JSON.stringify({
+        ...testConfig(state.path),
+        profile: profilePath,
+        profileSha256: sha256(profileText),
+        execution: { backend: "claude" },
+      }, null, 2)}\n`);
+
+      const run = async (command: "doctor" | "serve") => {
+        const child = Bun.spawn([
+          process.execPath,
+          "run",
+          "src/index.ts",
+          command,
+          "--config",
+          configPath,
+        ], {
+          cwd: PROJECT_ROOT,
+          env: {
+            ...process.env,
+            LIVIS_RELAY_CONFIG: undefined,
+            LIVIS_RELAY_STATE_DIR: undefined,
+          },
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [stdout, stderr, exitCode] = await Promise.all([
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+          child.exited,
+        ]);
+        return { stdout, stderr, exitCode };
+      };
+
+      const doctor = await run("doctor");
+      expect(doctor.exitCode).toBe(1);
+      expect(doctor.stderr).toBe("");
+      const report = JSON.parse(doctor.stdout) as {
+        ok: boolean;
+        checks: Array<{ name: string; ok: boolean; detail: string }>;
+      };
+      expect(report.ok).toBeFalse();
+      expect(report.checks.find((check) => check.name === "execution_backend"))
+        .toMatchObject({ ok: false });
+      expect(report.checks.find((check) => check.name === "execution_backend")?.detail)
+        .toContain("尚未实现");
+
+      const serve = await run("serve");
+      expect(serve.exitCode).toBe(1);
+      expect(serve.stdout).toBe("");
+      expect(serve.stderr).toContain("Claude backend 尚未实现");
+      expect(serve.stderr).toContain("不会退回 Hermes 或 Codex");
+    } finally {
+      await state.cleanup();
+    }
+  });
 });

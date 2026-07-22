@@ -28,12 +28,39 @@ describe("Codex daemon 托管目录", () => {
       );
       expect(relative(layout.stateDir, layout.workspace).startsWith("..")).toBeFalse();
       expect(layout.workspace).not.toContain("agent");
-      expect((await lstat(layout.workspace)).mode & 0o777).toBe(0o700);
+      expect(layout.hostHome).toBe(join(layout.sessionRoot, "host-home"));
+      expect(layout.hostTmpDir).toBe(join(layout.sessionRoot, "host-tmp"));
+      expect(layout.agentHome).toBe(join(layout.workspace, ".agent-home"));
+      expect(layout.agentTmpDir).toBe(join(layout.workspace, ".agent-tmp"));
+      expect(relative(layout.workspace, layout.hostHome).startsWith("..")).toBeTrue();
+      expect(relative(layout.workspace, layout.hostTmpDir).startsWith("..")).toBeTrue();
+      expect(relative(layout.workspace, layout.agentHome).startsWith("..")).toBeFalse();
+      expect(relative(layout.workspace, layout.agentTmpDir).startsWith("..")).toBeFalse();
+      for (const path of [
+        layout.sessionRoot,
+        layout.workspace,
+        layout.hostHome,
+        layout.hostTmpDir,
+        layout.agentHome,
+        layout.agentTmpDir,
+      ]) {
+        const info = await lstat(path);
+        expect(info.isDirectory()).toBeTrue();
+        expect(info.isSymbolicLink()).toBeFalse();
+        expect(info.mode & 0o777).toBe(0o700);
+        expect(await realpath(path)).toBe(path);
+        expect(layout.identities[path]).toEqual({ dev: info.dev, ino: info.ino });
+      }
       const expectedConfig = codexRemoteConfig(layout.workspace);
       expect(await Bun.file(layout.configPath).text()).toBe(expectedConfig);
       expect(expectedConfig).toContain(`projects.${JSON.stringify(layout.workspace)}`);
       expect(expectedConfig).toContain('trust_level = "untrusted"');
       expect(expectedConfig).toContain('exclude = ["CODEX_HOME", "OPENAI_*", "LIVIS_*"]');
+      expect(expectedConfig).toContain(
+        `set = { HOME = ${JSON.stringify(layout.agentHome)}, TMPDIR = ${JSON.stringify(layout.agentTmpDir)} }`,
+      );
+      expect(expectedConfig).not.toContain(layout.hostHome);
+      expect(expectedConfig).not.toContain(layout.hostTmpDir);
       expect(expectedConfig).toContain("[agents]\nenabled = false");
       expect(expectedConfig).toContain("[skills]\ninclude_instructions = false");
       expect(expectedConfig).toContain("[skills.bundled]\nenabled = false");
@@ -77,6 +104,8 @@ describe("Codex daemon 托管目录", () => {
       const env = await buildCodexEnvironment(layout, {
         PATH: `${safeBin}::relative:${layout.workspace}:${outsideLinkIntoState}`,
         LANG: "zh_CN.UTF-8",
+        HOME: "/Users/example",
+        TMPDIR: "/private/inherited-tmp",
         OPENAI_API_KEY: "must-not-leak",
         CODEX_ACCESS_TOKEN: "must-not-leak",
         LIVIS_RELAY_CONFIG: "/secret/config.json",
@@ -84,10 +113,12 @@ describe("Codex daemon 托管目录", () => {
       expect(env).toEqual({
         PATH: await realpath(safeBin),
         LANG: "zh_CN.UTF-8",
-        HOME: layout.runtimeHome,
-        TMPDIR: layout.tmpDir,
+        HOME: layout.hostHome,
+        TMPDIR: layout.hostTmpDir,
         CODEX_HOME: layout.codexHome,
       });
+      expect(env.HOME).not.toBe(layout.agentHome);
+      expect(env.TMPDIR).not.toBe(layout.agentTmpDir);
     } finally {
       await Promise.all([directory.cleanup(), external.cleanup()]);
     }
@@ -122,7 +153,7 @@ describe("Codex daemon 托管目录", () => {
     }
   });
 
-  test("拒绝安全配置漂移、目录替换与 symlink", async () => {
+  test("拒绝安全配置漂移", async () => {
     const directory = await temporaryDirectory("livis-codex-drift-");
     try {
       await chmod(directory.path, 0o700);
@@ -134,22 +165,64 @@ describe("Codex daemon 托管目录", () => {
       });
       await writeFile(layout.configPath, "default_permissions = \":danger-full-access\"\n", { mode: 0o600 });
       await expect(assertCodexRuntimeLayout(layout)).rejects.toThrow("安全 config 已漂移");
+    } finally {
+      await directory.cleanup();
+    }
+  });
 
-      await writeFile(layout.configPath, codexRemoteConfig(layout.workspace), { mode: 0o600 });
-      await rm(layout.tmpDir, { recursive: true });
-      await mkdir(layout.tmpDir, { mode: 0o700 });
+  test("运行中拒绝目录权限漂移与 inode 替换", async () => {
+    const directory = await temporaryDirectory("livis-codex-identity-");
+    try {
+      await chmod(directory.path, 0o700);
+      const layout = await ensureCodexRuntimeLayout({
+        stateDir: directory.path,
+        scopeKey: "scope",
+        sessionKey: "session",
+        remoteNodeId: "node-a",
+      });
+      await chmod(layout.hostHome, 0o755);
+      await expect(assertCodexRuntimeLayout(layout)).rejects.toThrow("0700");
+
+      await chmod(layout.hostHome, 0o700);
+      await assertCodexRuntimeLayout(layout);
+      await rm(layout.agentTmpDir, { recursive: true });
+      await mkdir(layout.agentTmpDir, { mode: 0o700 });
       await expect(assertCodexRuntimeLayout(layout)).rejects.toThrow("固定 inode");
+    } finally {
+      await directory.cleanup();
+    }
+  });
 
-      await rm(layout.tmpDir, { recursive: true });
-      await symlink(layout.workspace, layout.tmpDir);
+  test("启动时拒绝 stateDir 与四类 HOME/TMPDIR 路径中的 symlink", async () => {
+    const directory = await temporaryDirectory("livis-codex-symlink-");
+    const external = await temporaryDirectory("livis-codex-symlink-external-");
+    try {
+      await chmod(directory.path, 0o700);
+      const layout = await ensureCodexRuntimeLayout({
+        stateDir: directory.path,
+        scopeKey: "scope",
+        sessionKey: "session",
+        remoteNodeId: "node-a",
+      });
+      await rm(layout.hostTmpDir, { recursive: true });
+      await symlink(layout.workspace, layout.hostTmpDir);
       await expect(ensureCodexRuntimeLayout({
         stateDir: directory.path,
         scopeKey: "scope",
         sessionKey: "session",
         remoteNodeId: "node-a",
       })).rejects.toThrow("类型或权限不安全");
+
+      const stateLink = join(external.path, "state-link");
+      await symlink(directory.path, stateLink);
+      await expect(ensureCodexRuntimeLayout({
+        stateDir: stateLink,
+        scopeKey: "scope",
+        sessionKey: "session",
+        remoteNodeId: "node-a",
+      })).rejects.toThrow("stateDir 必须是 0700 普通目录且不能是 symlink");
     } finally {
-      await directory.cleanup();
+      await Promise.all([directory.cleanup(), external.cleanup()]);
     }
   });
 });

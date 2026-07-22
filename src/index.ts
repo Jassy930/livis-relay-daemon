@@ -249,6 +249,11 @@ async function commandServe(args: string[]): Promise<void> {
   const { context, guard } = await loadProfileOperationContext(args, "serve-start");
   let daemon: RelayDaemon | null = null;
   try {
+    if (context.config.execution.backend === "claude") {
+      throw new Error(
+        "Claude backend 尚未实现；execution.backend=claude 时 serve 失败关闭，不会退回 Hermes 或 Codex",
+      );
+    }
     const upstreamProof = await refreshOrRequireSupportedProof(context, guard);
     daemon = RelayDaemon.create({
       config: context.config,
@@ -465,8 +470,10 @@ async function commandDoctor(args: string[]): Promise<void> {
     checks.push({ name: "profile", ok: true, detail: context.profile.id });
     checks.push({
       name: "execution_backend",
-      ok: true,
-      detail: context.config.execution.backend,
+      ok: context.config.execution.backend !== "claude",
+      detail: context.config.execution.backend === "claude"
+        ? "claude（尚未实现；serve 将失败关闭，不会回退到其他 backend）"
+        : context.config.execution.backend,
     });
     checks.push({
       name: "protocol_acknowledgement",
@@ -482,6 +489,11 @@ async function commandDoctor(args: string[]): Promise<void> {
     }
   } catch (error) {
     checks.push({ name: "config", ok: false, detail: errorMessage(error) });
+    process.stdout.write(`${JSON.stringify({ ok: false, checks }, null, 2)}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (context.config.execution.backend === "claude") {
     process.stdout.write(`${JSON.stringify({ ok: false, checks }, null, 2)}\n`);
     process.exitCode = 1;
     return;
@@ -547,7 +559,11 @@ async function commandDoctor(args: string[]): Promise<void> {
       detail: `${errorMessage(error)}\n审核范围：[${backendMinimumVersion}, ${backendMaximumVersion})`,
     });
   }
-  const store = new JobStore(join(context.config.stateDir, "relay.db"), IdentityStore.scopeKey(context.identity));
+  const store = new JobStore(
+    join(context.config.stateDir, "relay.db"),
+    IdentityStore.scopeKey(context.identity),
+    { legacyV4JobBackend: context.config.execution.legacyV4JobBackend ?? undefined },
+  );
   const integrity = store.integrityCheck();
   checks.push({ name: "sqlite_integrity", ok: integrity === "ok", detail: integrity });
   const quarantines = store.listQuarantinedSessions();
@@ -602,14 +618,24 @@ async function commandReleaseSession(args: string[]): Promise<void> {
   const sessionKey = args.find((arg) => !arg.startsWith("--") && arg !== "session" && arg !== "release");
   if (!sessionKey) {
     throw new Error(
-      "用法：session release <sessionKey>；执行前必须停止 daemon，并确认所选后端的旧执行进程与工具副作用均已退出",
+      "用法：session release <sessionKey>；执行前必须停止 daemon、备份状态，并确认旧执行进程与工具副作用均已退出；Codex recovery 会退役旧 thread 绑定",
     );
   }
   const context = await loadContext(optionValue(args, "--config"));
-  const store = new JobStore(join(context.config.stateDir, "relay.db"), IdentityStore.scopeKey(context.identity));
+  const store = new JobStore(
+    join(context.config.stateDir, "relay.db"),
+    IdentityStore.scopeKey(context.identity),
+    { legacyV4JobBackend: context.config.execution.legacyV4JobBackend ?? undefined },
+  );
+  const codexResetRequired = store.getBackendSession("codex", sessionKey)?.recoveryRequired === true;
   const released = store.releaseSessionRecovery(sessionKey);
   store.close();
-  process.stdout.write(`${JSON.stringify({ released, sessionKey })}\n`);
+  process.stdout.write(`${JSON.stringify({
+    released,
+    sessionKey,
+    retiredBackendSessions: released && codexResetRequired ? ["codex"] : [],
+    nextStartCreatesNewThread: released && codexResetRequired,
+  })}\n`);
   if (!released) process.exitCode = 1;
 }
 

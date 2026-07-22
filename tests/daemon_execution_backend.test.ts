@@ -105,6 +105,19 @@ async function daemonFixture(prefix: string): Promise<{
     sessionHash: "a".repeat(64),
     cwd: join(directory.path, "workspace"),
     cliVersion: "0.145.0",
+    accountType: "chatgpt",
+    accountSubjectSha256: "b".repeat(64),
+    accountIdentityStrength: "subject",
+    requestedModel: null,
+    effectiveModel: "gpt-5.6-sol",
+    modelProvider: "openai",
+    securityConfigSha256: "c".repeat(64),
+    featureSnapshotSha256: "d".repeat(64),
+    checkpointTurnId: null,
+    checkpointTurnStatus: null,
+    checkpointTurnCount: 0,
+    checkpointTurnsSha256: "e".repeat(64),
+    checkpointedAt: 100,
   });
   internals.store.bindBackendThread("codex", sessionKey, "thread-test");
   return {
@@ -120,7 +133,7 @@ async function daemonFixture(prefix: string): Promise<{
 }
 
 function enqueue(internals: DaemonInternals, sessionKey: string, jobId: string): void {
-  internals.store.ingest(incomingJob(jobId), sessionKey);
+  internals.store.ingest(incomingJob(jobId), sessionKey, "codex");
   internals.store.markAcked(jobId);
 }
 
@@ -132,6 +145,7 @@ describe("RelayDaemon execution backend 接线", () => {
       fixture.internals.store.ingest(
         incomingJob(jobId, "禁止执行", "node-unauthorized"),
         fixture.sessionKey,
+        "codex",
       );
       fixture.internals.store.markAcked(jobId);
       let outboxNotifications = 0;
@@ -226,7 +240,7 @@ describe("RelayDaemon execution backend 接线", () => {
     }
   });
 
-  test("cancel 与 turn/start accepted 并发时补记 turnId 并进入人工恢复", async () => {
+  test("cancel 与 turn/start accepted 并发时补记 turnId 并等待权威 terminal", async () => {
     const fixture = await daemonFixture("livis-daemon-codex-accept-cancel-");
     try {
       enqueue(fixture.internals, fixture.sessionKey, "job-accept-cancel");
@@ -242,11 +256,11 @@ describe("RelayDaemon execution backend 接线", () => {
         runGeneration: claimed.runGeneration,
         turnId: "turn-cancel-race",
       });
-      expect(fixture.internals.store.require(claimed.jobId).status).toBe("CancelUnknown");
+      expect(fixture.internals.store.require(claimed.jobId).status).toBe("Cancelling");
       const session = fixture.internals.store.getBackendSession("codex", fixture.sessionKey)!;
       expect(session.activeTurnId).toBe("turn-cancel-race");
-      expect(session.recoveryRequired).toBeTrue();
-      expect(fixture.internals.store.listQuarantinedSessions()).toHaveLength(1);
+      expect(session.recoveryRequired).toBeFalse();
+      expect(fixture.internals.store.listQuarantinedSessions()).toHaveLength(0);
     } finally {
       await fixture.cleanup();
     }
@@ -276,7 +290,7 @@ describe("RelayDaemon execution backend 接线", () => {
       expect(fixture.internals.store.getBackendSession("codex", fixture.sessionKey)?.recoveryRequired).toBeTrue();
       expect(fixture.daemon.releaseSessionQuarantine(fixture.sessionKey)).toBeTrue();
       expect(fixture.internals.store.listQuarantinedSessions()).toHaveLength(0);
-      expect(fixture.internals.store.getBackendSession("codex", fixture.sessionKey)?.activeJobId).toBeNull();
+      expect(fixture.internals.store.getBackendSession("codex", fixture.sessionKey)).toBeNull();
     } finally {
       await fixture.cleanup();
     }

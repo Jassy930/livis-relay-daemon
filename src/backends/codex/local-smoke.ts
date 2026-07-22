@@ -81,8 +81,15 @@ export interface CodexAppServerLocalSmokeReport {
     stateDirOutsideTemporaryRoots: true;
     workspaceRead: true;
     workspaceWrite: true;
+    agentHomeWrite: true;
+    agentTmpWrite: true;
+    agentEnvironmentPinned: true;
     codexHomeReadDenied: true;
     codexHomeWriteDenied: true;
+    hostHomeReadDenied: true;
+    hostHomeWriteDenied: true;
+    hostTmpReadDenied: true;
+    hostTmpWriteDenied: true;
     sensitiveEnvironmentHidden: true;
   };
   appServerStderrObserved: boolean;
@@ -205,12 +212,22 @@ async function runReadIsolationCanary(
   await requireStateOutsideTemporaryRoots(layout.stateDir);
   const workspaceMarker = "livis-workspace-read-canary-v1\n";
   const codexHomeMarker = "livis-codex-home-deny-read-canary-v1\n";
+  const hostHomeMarker = "livis-host-home-deny-read-canary-v1\n";
+  const hostTmpMarker = "livis-host-tmp-deny-read-canary-v1\n";
   const workspaceMarkerPath = join(layout.workspace, ".livis-workspace-read-canary");
   const codexHomeMarkerPath = join(layout.codexHome, ".livis-deny-read-canary");
+  const hostHomeMarkerPath = join(layout.hostHome, ".livis-deny-read-canary");
+  const hostTmpMarkerPath = join(layout.hostTmpDir, ".livis-deny-read-canary");
   const workspaceWritePath = join(layout.workspace, ".livis-workspace-write-canary");
+  const agentHomeWritePath = join(layout.agentHome, ".livis-agent-home-write-canary");
+  const agentTmpWritePath = join(layout.agentTmpDir, ".livis-agent-tmp-write-canary");
   const codexHomeWritePath = join(layout.codexHome, ".livis-deny-write-canary");
+  const hostHomeWritePath = join(layout.hostHome, ".livis-deny-write-canary");
+  const hostTmpWritePath = join(layout.hostTmpDir, ".livis-deny-write-canary");
   await durableAtomicWritePrivate(workspaceMarkerPath, workspaceMarker);
   await durableAtomicWritePrivate(codexHomeMarkerPath, codexHomeMarker);
+  await durableAtomicWritePrivate(hostHomeMarkerPath, hostHomeMarker);
+  await durableAtomicWritePrivate(hostTmpMarkerPath, hostTmpMarker);
 
   const common = {
     cwd: layout.workspace,
@@ -244,6 +261,32 @@ async function runReadIsolationCanary(
     );
   }
 
+  const agentHomeWrite = inspectCommandExec(
+    await client.request("command/exec", {
+      ...common,
+      command: ["/usr/bin/touch", agentHomeWritePath],
+    }),
+    "Codex agent HOME 写入 canary",
+  );
+  if (agentHomeWrite.exitCode !== 0) {
+    throw new Error(
+      `Codex 读取隔离 canary 无法写入 agent HOME：exit=${agentHomeWrite.exitCode} stderr=${JSON.stringify(agentHomeWrite.stderr.slice(0, 512))}`,
+    );
+  }
+
+  const agentTmpWrite = inspectCommandExec(
+    await client.request("command/exec", {
+      ...common,
+      command: ["/usr/bin/touch", agentTmpWritePath],
+    }),
+    "Codex agent TMPDIR 写入 canary",
+  );
+  if (agentTmpWrite.exitCode !== 0) {
+    throw new Error(
+      `Codex 读取隔离 canary 无法写入 agent TMPDIR：exit=${agentTmpWrite.exitCode} stderr=${JSON.stringify(agentTmpWrite.stderr.slice(0, 512))}`,
+    );
+  }
+
   const codexHomeRead = inspectCommandExec(
     await client.request("command/exec", {
       ...common,
@@ -266,6 +309,50 @@ async function runReadIsolationCanary(
     throw new Error("Codex 读取隔离 canary 仍可写入专用 CODEX_HOME");
   }
 
+  const hostHomeRead = inspectCommandExec(
+    await client.request("command/exec", {
+      ...common,
+      command: ["/bin/cat", hostHomeMarkerPath],
+    }),
+    "Codex app-server HOME 读取 canary",
+  );
+  if (hostHomeRead.exitCode === 0 || hostHomeRead.stdout.includes(hostHomeMarker.trim())) {
+    throw new Error("Codex 读取隔离 canary 仍可读取 app-server HOME");
+  }
+
+  const hostHomeWrite = inspectCommandExec(
+    await client.request("command/exec", {
+      ...common,
+      command: ["/usr/bin/touch", hostHomeWritePath],
+    }),
+    "Codex app-server HOME 写入 canary",
+  );
+  if (hostHomeWrite.exitCode === 0) {
+    throw new Error("Codex 读取隔离 canary 仍可写入 app-server HOME");
+  }
+
+  const hostTmpRead = inspectCommandExec(
+    await client.request("command/exec", {
+      ...common,
+      command: ["/bin/cat", hostTmpMarkerPath],
+    }),
+    "Codex app-server TMPDIR 读取 canary",
+  );
+  if (hostTmpRead.exitCode === 0 || hostTmpRead.stdout.includes(hostTmpMarker.trim())) {
+    throw new Error("Codex 读取隔离 canary 仍可读取 app-server TMPDIR");
+  }
+
+  const hostTmpWrite = inspectCommandExec(
+    await client.request("command/exec", {
+      ...common,
+      command: ["/usr/bin/touch", hostTmpWritePath],
+    }),
+    "Codex app-server TMPDIR 写入 canary",
+  );
+  if (hostTmpWrite.exitCode === 0) {
+    throw new Error("Codex 读取隔离 canary 仍可写入 app-server TMPDIR");
+  }
+
   const environmentRead = inspectCommandExec(
     await client.request("command/exec", {
       ...common,
@@ -276,18 +363,24 @@ async function runReadIsolationCanary(
   if (environmentRead.exitCode !== 0) {
     throw new Error("Codex 环境变量 canary 执行失败");
   }
-  const environmentNames = new Set(
-    environmentRead.stdout
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => {
-        const separator = line.indexOf("=");
-        return separator >= 0 ? line.slice(0, separator) : line;
-      }),
-  );
+  const environmentValues = new Map<string, string>();
+  for (const line of environmentRead.stdout.split("\n").filter(Boolean)) {
+    const separator = line.indexOf("=");
+    if (separator >= 0) {
+      environmentValues.set(line.slice(0, separator), line.slice(separator + 1));
+    }
+  }
   if (
-    environmentNames.has("CODEX_HOME") ||
-    [...environmentNames].some((name) => name.startsWith("OPENAI_") || name.startsWith("LIVIS_"))
+    environmentValues.get("HOME") !== layout.agentHome ||
+    environmentValues.get("TMPDIR") !== layout.agentTmpDir
+  ) {
+    throw new Error("Codex sandbox 子进程 HOME/TMPDIR 未固定到 agent workspace");
+  }
+  if (
+    environmentValues.has("CODEX_HOME") ||
+    [...environmentValues.keys()].some(
+      (name) => name.startsWith("OPENAI_") || name.startsWith("LIVIS_"),
+    )
   ) {
     throw new Error("Codex sandbox 子进程仍继承了敏感宿主环境变量");
   }
@@ -295,8 +388,15 @@ async function runReadIsolationCanary(
     stateDirOutsideTemporaryRoots: true,
     workspaceRead: true,
     workspaceWrite: true,
+    agentHomeWrite: true,
+    agentTmpWrite: true,
+    agentEnvironmentPinned: true,
     codexHomeReadDenied: true,
     codexHomeWriteDenied: true,
+    hostHomeReadDenied: true,
+    hostHomeWriteDenied: true,
+    hostTmpReadDenied: true,
+    hostTmpWriteDenied: true,
     sensitiveEnvironmentHidden: true,
   };
 }
@@ -396,6 +496,7 @@ export async function runCodexAppServerLocalSmoke(
     );
     validateDisabledCodexFeatures(
       await client.request("experimentalFeature/list", { cursor: null, limit: 256 }),
+      cliVersion,
     );
     readIsolationCanary = options.verifyReadIsolation === true
       ? await runReadIsolationCanary(client, layout, requestTimeoutMs)
@@ -431,7 +532,9 @@ export async function runCodexAppServerLocalSmoke(
     );
     if (
       resumedAccount.accountType !== account.accountType ||
-      resumedAccount.requiresOpenaiAuth !== account.requiresOpenaiAuth
+      resumedAccount.requiresOpenaiAuth !== account.requiresOpenaiAuth ||
+      resumedAccount.accountSubjectSha256 !== account.accountSubjectSha256 ||
+      resumedAccount.identityStrength !== account.identityStrength
     ) {
       throw new Error("Codex smoke 重启后的账号状态发生变化");
     }
@@ -440,6 +543,7 @@ export async function runCodexAppServerLocalSmoke(
     );
     validateDisabledCodexFeatures(
       await resumeClient.request("experimentalFeature/list", { cursor: null, limit: 256 }),
+      cliVersion,
     );
     const resumed = await resumeClient.threadResume({
       threadId,

@@ -11,6 +11,7 @@ import {
   sha256,
   versionLessThan,
 } from "./util.ts";
+import type { ExecutionBackendKind, LegacyV4JobBackendKind } from "./types.ts";
 
 export interface RelayConfig {
   schemaVersion: 1;
@@ -24,7 +25,12 @@ export interface RelayConfig {
     maxFrameBytes: number;
   };
   execution: {
-    backend: "hermes" | "codex";
+    backend: ExecutionBackendKind;
+    /**
+     * 仅用于含待派发 job 的 SQLite v4→v5 一次性迁移。必须填写这些旧 job
+     * 实际入库时使用的后端，不能用切换后的目标后端猜测。
+     */
+    legacyV4JobBackend?: LegacyV4JobBackendKind | null;
   };
   connector: {
     socketPath: string;
@@ -52,6 +58,8 @@ export interface RelayConfig {
     command: string;
     model: string | null;
     requestTimeoutMs: number;
+    turnTimeoutMs: number;
+    interruptGraceMs: number;
     shutdownTimeoutMs: number;
     acknowledgeRemoteExecution: boolean;
   };
@@ -63,6 +71,8 @@ export const MAX_RELAY_MAX_FRAME_BYTES = 16_777_216;
 export const CODEX_MINIMUM_VERSION = "0.145.0";
 export const CODEX_MAXIMUM_EXCLUSIVE_VERSION = "0.146.0";
 export const DEFAULT_CODEX_REQUEST_TIMEOUT_MS = 30_000;
+export const DEFAULT_CODEX_TURN_TIMEOUT_MS = 15 * 60 * 1_000;
+export const DEFAULT_CODEX_INTERRUPT_GRACE_MS = 5_000;
 export const DEFAULT_CODEX_SHUTDOWN_TIMEOUT_MS = 5_000;
 
 function relayMaxFrameBytes(value: unknown): number {
@@ -113,8 +123,16 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
   const hermes = objectAt(root, "hermes");
   const codex = optionalObjectAt(root, "codex");
   const executionBackend = execution?.backend ?? "hermes";
-  if (executionBackend !== "hermes" && executionBackend !== "codex") {
-    throw new Error("config.execution.backend 只支持 hermes 或 codex");
+  if (executionBackend !== "hermes" && executionBackend !== "codex" && executionBackend !== "claude") {
+    throw new Error("config.execution.backend 只支持 hermes、codex 或 claude");
+  }
+  const legacyV4JobBackend = execution?.legacyV4JobBackend ?? null;
+  if (
+    legacyV4JobBackend !== null &&
+    legacyV4JobBackend !== "hermes" &&
+    legacyV4JobBackend !== "codex"
+  ) {
+    throw new Error("config.execution.legacyV4JobBackend 只支持 v4 已实现的 hermes 或 codex");
   }
   if (codex?.acknowledgeRemoteExecution !== undefined &&
       typeof codex.acknowledgeRemoteExecution !== "boolean") {
@@ -178,6 +196,7 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
     },
     execution: {
       backend: executionBackend,
+      legacyV4JobBackend,
     },
     connector: {
       socketPath: expandHome(asNonEmptyString(connector.socketPath, "config.connector.socketPath")),
@@ -216,6 +235,12 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
       requestTimeoutMs: codex?.requestTimeoutMs === undefined
         ? DEFAULT_CODEX_REQUEST_TIMEOUT_MS
         : asPositiveInteger(codex.requestTimeoutMs, "config.codex.requestTimeoutMs"),
+      turnTimeoutMs: codex?.turnTimeoutMs === undefined
+        ? DEFAULT_CODEX_TURN_TIMEOUT_MS
+        : asPositiveInteger(codex.turnTimeoutMs, "config.codex.turnTimeoutMs"),
+      interruptGraceMs: codex?.interruptGraceMs === undefined
+        ? DEFAULT_CODEX_INTERRUPT_GRACE_MS
+        : asPositiveInteger(codex.interruptGraceMs, "config.codex.interruptGraceMs"),
       shutdownTimeoutMs: codex?.shutdownTimeoutMs === undefined
         ? DEFAULT_CODEX_SHUTDOWN_TIMEOUT_MS
         : asPositiveInteger(codex.shutdownTimeoutMs, "config.codex.shutdownTimeoutMs"),
@@ -271,6 +296,7 @@ export async function initializeConfig(options: {
     },
     execution: {
       backend: "hermes",
+      legacyV4JobBackend: null,
     },
     connector: {
       socketPath: resolve(stateDir, "connector.sock"),
@@ -298,6 +324,8 @@ export async function initializeConfig(options: {
       command: "codex",
       model: null,
       requestTimeoutMs: DEFAULT_CODEX_REQUEST_TIMEOUT_MS,
+      turnTimeoutMs: DEFAULT_CODEX_TURN_TIMEOUT_MS,
+      interruptGraceMs: DEFAULT_CODEX_INTERRUPT_GRACE_MS,
       shutdownTimeoutMs: DEFAULT_CODEX_SHUTDOWN_TIMEOUT_MS,
       acknowledgeRemoteExecution: false,
     },

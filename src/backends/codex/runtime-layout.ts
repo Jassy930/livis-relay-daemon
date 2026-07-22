@@ -19,6 +19,8 @@ export const CODEX_REMOTE_PERMISSION_PROFILE = "livis-remote";
  */
 export function codexRemoteConfig(workspace: string): string {
   const canonicalWorkspace = resolve(workspace);
+  const agentHome = join(canonicalWorkspace, ".agent-home");
+  const agentTmpDir = join(canonicalWorkspace, ".agent-tmp");
   return `default_permissions = "${CODEX_REMOTE_PERMISSION_PROFILE}"
 approval_policy = "never"
 approvals_reviewer = "user"
@@ -36,6 +38,7 @@ enabled = false
 [shell_environment_policy]
 inherit = "core"
 exclude = ["CODEX_HOME", "OPENAI_*", "LIVIS_*"]
+set = { HOME = ${JSON.stringify(agentHome)}, TMPDIR = ${JSON.stringify(agentTmpDir)} }
 
 [permissions.${CODEX_REMOTE_PERMISSION_PROFILE}]
 description = "LiViS 远程会话：仅访问 daemon 托管 workspace"
@@ -66,8 +69,10 @@ export interface CodexRuntimeLayout {
   sessionHash: string;
   sessionRoot: string;
   workspace: string;
-  runtimeHome: string;
-  tmpDir: string;
+  hostHome: string;
+  hostTmpDir: string;
+  agentHome: string;
+  agentTmpDir: string;
   configPath: string;
   identities: Readonly<Record<string, DirectoryIdentity>>;
 }
@@ -150,11 +155,23 @@ export async function ensureCodexRuntimeLayout(options: {
   );
   const sessionRoot = join(sessionsRoot, sessionHash);
   const workspace = join(sessionRoot, "workspace");
-  const runtimeHome = join(workspace, ".home");
-  const tmpDir = join(workspace, ".tmp");
+  const hostHome = join(sessionRoot, "host-home");
+  const hostTmpDir = join(sessionRoot, "host-tmp");
+  const agentHome = join(workspace, ".agent-home");
+  const agentTmpDir = join(workspace, ".agent-tmp");
   const configPath = join(codexHome, "config.toml");
   const expectedConfig = codexRemoteConfig(workspace);
-  for (const path of [backendRoot, codexHome, sessionsRoot, sessionRoot, workspace, runtimeHome, tmpDir]) {
+  for (const path of [
+    backendRoot,
+    codexHome,
+    sessionsRoot,
+    sessionRoot,
+    workspace,
+    hostHome,
+    hostTmpDir,
+    agentHome,
+    agentTmpDir,
+  ]) {
     if (!isWithin(stateDir, path)) {
       throw new Error(`Codex runtime 路径逃逸出 stateDir：${path}`);
     }
@@ -168,8 +185,10 @@ export async function ensureCodexRuntimeLayout(options: {
     [sessionsRoot, "Codex sessions 目录"],
     [sessionRoot, "Codex session 目录"],
     [workspace, "Codex workspace 目录"],
-    [runtimeHome, "Codex runtime HOME 目录"],
-    [tmpDir, "Codex runtime TMPDIR 目录"],
+    [hostHome, "Codex app-server HOME 目录"],
+    [hostTmpDir, "Codex app-server TMPDIR 目录"],
+    [agentHome, "Codex agent HOME 目录"],
+    [agentTmpDir, "Codex agent TMPDIR 目录"],
   ] as const) {
     identities[path] = await ensurePrivateDirectory(path, label);
   }
@@ -192,8 +211,10 @@ export async function ensureCodexRuntimeLayout(options: {
     sessionHash,
     sessionRoot,
     workspace,
-    runtimeHome,
-    tmpDir,
+    hostHome,
+    hostTmpDir,
+    agentHome,
+    agentTmpDir,
     configPath,
     identities,
   };
@@ -259,8 +280,8 @@ export async function buildCodexEnvironment(
     const value = source[key];
     if (value !== undefined) environment[key] = value;
   }
-  environment.HOME = layout.runtimeHome;
-  environment.TMPDIR = layout.tmpDir;
+  environment.HOME = layout.hostHome;
+  environment.TMPDIR = layout.hostTmpDir;
   environment.CODEX_HOME = layout.codexHome;
   return environment;
 }
