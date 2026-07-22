@@ -28,7 +28,12 @@ export function testConfig(stateDir: string): RelayConfig {
     profile: "profile.json",
     profileSha256: sha256("test-profile"),
     stateDir,
-    relay: { nodeName: "测试电脑", handshakeTimeoutMs: 1000, reconnectMaxMs: 1000 },
+    relay: {
+      nodeName: "测试电脑",
+      handshakeTimeoutMs: 1000,
+      reconnectMaxMs: 1000,
+      maxFrameBytes: 1024 * 1024,
+    },
     connector: {
       socketPath: join(stateDir, "connector.sock"),
       helloTimeoutMs: 500,

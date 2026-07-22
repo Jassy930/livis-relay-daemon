@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { join } from "node:path";
 import type { IdaasClient } from "../src/auth/idaas.ts";
 import type { RelayConfig } from "../src/config.ts";
@@ -6,15 +7,17 @@ import type { RelayIdentity } from "../src/identity.ts";
 import { Logger } from "../src/logger.ts";
 import {
   parseIncomingRelayJob,
+  RELAY_IDENTIFIER_MAX_BYTES,
   serializeResult,
 } from "../src/protocol/livis.ts";
 import type { ProtocolProfile } from "../src/protocol/profile.ts";
 import {
   RelayClient,
+  relayFrameByteLength,
   type RelayClientHandlers,
 } from "../src/relay/client.ts";
 import { SecretStore } from "../src/secrets.ts";
-import { JobStore } from "../src/state/store.ts";
+import { JobStore, PENDING_CANCEL_MAX_ROWS } from "../src/state/store.ts";
 import type { RelayEnvelope } from "../src/types.ts";
 import {
   incomingJob,
@@ -45,6 +48,7 @@ class FakeLivisRelay {
   private readonly queued: CapturedEnvelope[] = [];
   private readonly waiters: EnvelopeWaiter[] = [];
   readonly history: CapturedEnvelope[] = [];
+  readonly closeHistory: Array<{ socket: Bun.ServerWebSocket<FakeSocketData>; code: number }> = [];
   url = "";
 
   async start(): Promise<void> {
@@ -75,7 +79,8 @@ class FakeLivisRelay {
             relay.queued.push(captured);
           }
         },
-        close(socket) {
+        close(socket, code) {
+          relay.closeHistory.push({ socket, code });
           relay.sockets.delete(socket);
         },
       },
@@ -143,6 +148,10 @@ class FakeLivisRelay {
 
   count(type: string): number {
     return this.history.filter((captured) => captured.envelope.type === type).length;
+  }
+
+  closeCode(socket: Bun.ServerWebSocket<FakeSocketData>): number | null {
+    return this.closeHistory.find((entry) => entry.socket === socket)?.code ?? null;
   }
 }
 
@@ -302,6 +311,89 @@ describe("RelayClient fake LiViS end-to-end", () => {
       onConnected: async () => undefined,
     };
   }
+
+  test("整帧按 UTF-8 字节计数", () => {
+    expect(relayFrameByteLength("你")).toBe(3);
+    expect(relayFrameByteLength([Buffer.from("abc"), Buffer.from("你好")])).toBe(9);
+  });
+
+  test("ws 在解析和 handler 前以 1009 拒绝超出 relay 整帧上限的消息", async () => {
+    config.relay.maxFrameBytes = 512;
+    let incomingCalls = 0;
+    let cancelCalls = 0;
+    const relayClient = createClient({
+      onIncoming: async () => { incomingCalls += 1; },
+      onCancel: async () => { cancelCalls += 1; },
+      onConnected: async () => undefined,
+    });
+    relayClient.start();
+    const socket = await fakeRelay.handshake(relayClient);
+    const oversized = messageEnvelope("oversized-frame");
+    oversized.payload = { ...oversized.payload, padding: "x".repeat(600) };
+    fakeRelay.send(socket, oversized);
+
+    await waitFor(() => fakeRelay.closeCode(socket) !== null, 1_000, "oversized frame close");
+    expect(fakeRelay.closeCode(socket)).toBe(1009);
+    expect(incomingCalls).toBe(0);
+    expect(cancelCalls).toBe(0);
+    expect(store.listRecent()).toHaveLength(0);
+    expect(fakeRelay.count("ack_send_message")).toBe(0);
+  });
+
+  test("超长 send/cancel 标识在 handler 前拒绝且不写 jobs 或 pending_cancels", async () => {
+    let incomingCalls = 0;
+    let cancelCalls = 0;
+    const relayClient = createClient({
+      onIncoming: async () => { incomingCalls += 1; },
+      onCancel: async () => { cancelCalls += 1; },
+      onConnected: async () => undefined,
+    });
+    relayClient.start();
+    const socket = await fakeRelay.handshake(relayClient);
+    const oversizedId = "j".repeat(RELAY_IDENTIFIER_MAX_BYTES + 1);
+    fakeRelay.send(socket, messageEnvelope(oversizedId));
+    fakeRelay.send(socket, cancelEnvelope(oversizedId));
+    await Bun.sleep(30);
+
+    expect(incomingCalls).toBe(0);
+    expect(cancelCalls).toBe(0);
+    expect(store.listRecent()).toHaveLength(0);
+    const database = new Database(join(directory.path, "relay.db"), { readonly: true });
+    const pending = database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM pending_cancels")
+      .get()?.count ?? 0;
+    database.close();
+    expect(pending).toBe(0);
+    expect(fakeRelay.count("ack_send_message")).toBe(0);
+    expect(fakeRelay.count("ack_cancel_chat")).toBe(0);
+  });
+
+  test("pending cancel 满额时拒绝新 intent 且不发送成功 ACK", async () => {
+    const database = new Database(join(directory.path, "relay.db"));
+    const insert = database.query(
+      "INSERT INTO pending_cancels(scope_key,job_id,created_at) VALUES(?,?,?)",
+    );
+    const now = Date.now();
+    const fill = database.transaction(() => {
+      for (let index = 0; index < PENDING_CANCEL_MAX_ROWS; index += 1) {
+        insert.run("account-test:test-agent-id", `pending-${index}`, now);
+      }
+    });
+    fill.immediate();
+    database.close();
+
+    const relayClient = createClient(durableHandlers());
+    relayClient.start();
+    const socket = await fakeRelay.handshake(relayClient);
+    fakeRelay.send(socket, cancelEnvelope("new-overflow-cancel"));
+    await Bun.sleep(30);
+
+    expect(fakeRelay.count("ack_cancel_chat")).toBe(0);
+    const verify = new Database(join(directory.path, "relay.db"), { readonly: true });
+    const count = verify.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM pending_cancels")
+      .get()?.count ?? 0;
+    verify.close();
+    expect(count).toBe(PENDING_CANCEL_MAX_ROWS);
+  });
 
   test("durable commit 完成后才发送 ack_send_message", async () => {
     const allowCommit = deferred<void>();

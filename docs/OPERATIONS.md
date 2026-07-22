@@ -31,6 +31,7 @@ bun run src/index.ts init \
 
 - 保持 `security.allowAllNodes=false`。
 - 将唯一获准且稳定的 LiViS `node_id` 作为 `security.allowedNodeIds` 的唯一元素；不要填写多个值。
+- `relay.maxFrameBytes` 控制远端 WebSocket 完整消息的 UTF-8 字节上限；默认 1048576，允许范围为 1 到 16777216。旧配置不含该字段时自动采用默认值。
 - 不扩大 Hermes 审核版本范围，除非已按升级 runbook 验证。
 
 一期暂将 `node_id` 视为设备来源标识，一套 daemon、config、state directory 和专用 Hermes profile 只支持该一个设备。配置解析器仍接受数组是格式兼容，不代表支持多设备；不得通过追加第二个 ID、开启 `allowAllNodes` 或直接替换原 ID 来接入另一设备。设备更换、跨设备会话和旧状态迁移均需另行设计与验收。
@@ -178,3 +179,14 @@ bun run src/index.ts session release '<sessionKey>'
 ```
 
 不得只为清除状态而跳过前两步。
+
+## 9. Relay 资源边界告警
+
+日志出现 `WebSocket frame 超过配置的字节上限`、外部标识 `超过字节上限` 或 `pending cancel intent 已达到总量上限` 时，不要直接扩大限制：
+
+1. 确认消息是否来自预期 Relay，并检查上游是否发生重投风暴或协议漂移；
+2. unknown cancel 满额时，新 intent 不会落盘，也不会回复成功 ACK；等待已有 intent 被匹配消费或超过 24 小时 TTL 后再重试；
+3. 只有已确认合法消息确实需要更大帧时才调整 `relay.maxFrameBytes`，且不得超过 16777216；
+4. 监控 `relay.db`、WAL/SHM、进程 RSS 与消息速率。
+
+该门禁只限制单帧、外部标识和临时 cancel intent。它没有实现 jobs/outbox 自动清理，也没有给大量合法小帧的处理队列增加流量整形；历史数据清理由安全手册中的停机流程负责。
