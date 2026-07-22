@@ -2,7 +2,7 @@
 name: livis-bridge
 label: LiViS Relay Bridge
 kind: platform
-version: 0.1.0
+version: 0.1.1
 description: >
   Thin Hermes platform adapter for the local livis-relayd Unix socket.
   The Bun daemon exclusively owns LiViS OAuth, remote WebSocket, SQLite,
@@ -26,6 +26,11 @@ requires_env:
     description: >-
       Must be true after configuring a final-only, read-only Hermes profile
     prompt: "Confirm phase-1 read-only profile (true)"
+    password: false
+  - name: LIVIS_HOME_CHANNEL
+    description: >-
+      Local-only home channel fixed to livis:<agent_id>; remote /sethome is rejected
+    prompt: "LiViS home channel (livis:<agent_id>)"
     password: false
 optional_env:
   - name: LIVIS_RELAY_CONNECT_TIMEOUT

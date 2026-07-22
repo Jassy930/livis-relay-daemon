@@ -4,6 +4,13 @@
 
 ## [未发布]
 
+### 安全
+
+- Hermes bridge 0.1.1 在建立 job 映射、发送 connector v1 `accepted` 和进入 dispatcher 前拒绝全部远程斜杠命令及 Hermes 0.15.1 的自然语言重启别名；active session、blocking approval 或状态不可读时同样通过当前 lease 的 v1 `failed` 失败关闭。拒绝结果等待 daemon 的 durable `result_stored`，ACK 超时会清理本地 waiter 并关闭 connector；offer tombstone 与 admission reservation 关闭 cancel 和相邻 job 的接纳竞态。daemon 内部 cancel `/stop` 保持独立路径，不引入 connector v2 或 JobStore schema 迁移。
+- Hermes home channel 改为本地必填的 `LIVIS_HOME_CHANNEL=livis:<agent_id>`，并强制关闭 gateway 启停通知；远程 `/sethome` 不再是初始化或 canary 步骤。
+- daemon 与新配置的版本统一提升为 0.1.1，并内建 bridge 0.1.1 安全下限；存量配置若仍允许 0.1.0 会在启动前失败关闭，必须在停服升级中显式更新并同步安装 bridge。
+- bridge 会把非有限、不可解析或超出平台日期范围的远端 job timestamp 降级为当前 UTC 时间，避免异常元数据在输入门禁结算前中止 background task 并遗留 `Dispatching` job。
+
 ### 修复
 
 - Codex failed turn 现在识别 0.145.0 实测到的 legacy history 投影缺陷：权威 `turn/completed=failed` 可能被同一 thread 的 `thread/read` 回读成 `systemError + completed tail`。例外版本 allowlist 只含精确 `0.145.0`；只有当前 failed 通知绑定同一 turn，或同一 app-server client epoch 的内存 marker、raw turns hash 与 SQLite checkpoint 完全一致时，才把 tail 的业务语义归一化为 failed。raw history 状态不改写，fresh start、重启、recovery、其他状态组合和其他版本仍失败关闭。provider 原始错误、JSON-RPC message/data 与 app-server stderr 不写入 JobStore/Relay/共享日志，失效凭据会以脱敏分类在同一事务中完成失败结算与 quarantine，关闭失败继续向上报告。提交 `65f00c1` 的一次性真实 canary 运行态为非支持的 `account_type=chatgpt`；它只验证 structured `unauthorized` 会收口为 `Failed + Pending outbox + failed ledger + active clear + credential quarantine`，不再误落成 `Interrupted + recovery_required`，不能作为 API-key 凭据或成功模型 turn 的证据。

@@ -30,7 +30,7 @@ import type { RelayEnvelope, StoredJob } from "./types.ts";
 import { UpstreamChecker } from "./upstream/checker.ts";
 import { saveSupportedProof } from "./upstream/proof.ts";
 
-export const DAEMON_VERSION = "0.1.0";
+export const DAEMON_VERSION = "0.1.1";
 const UPSTREAM_RECHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const UPSTREAM_PROOF_EXPIRED_REASON = "supported proof 已过期；必须在线复核通过后才能继续派发";
 const CODEX_CREDENTIAL_REJECTED_QUARANTINE_REASON =

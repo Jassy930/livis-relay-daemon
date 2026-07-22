@@ -84,6 +84,8 @@ export const DEFAULT_CODEX_REQUEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_CODEX_TURN_TIMEOUT_MS = 15 * 60 * 1_000;
 export const DEFAULT_CODEX_INTERRUPT_GRACE_MS = 5_000;
 export const DEFAULT_CODEX_SHUTDOWN_TIMEOUT_MS = 5_000;
+export const MINIMUM_SAFE_BRIDGE_VERSION = "0.1.1";
+const MINIMUM_SAFE_BRIDGE_VERSION_TRIPLET: [number, number, number] = [0, 1, 1];
 
 function relayMaxFrameBytes(value: unknown): number {
   const parsed = asPositiveInteger(value, "config.relay.maxFrameBytes");
@@ -265,6 +267,12 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
   if (!bridgeMinimum || !bridgeMaximum || !versionLessThan(bridgeMinimum, bridgeMaximum)) {
     throw new Error("config.hermes bridge 版本范围必须是有效的 [minimum, maximumExclusive)");
   }
+  if (versionLessThan(bridgeMinimum, MINIMUM_SAFE_BRIDGE_VERSION_TRIPLET)) {
+    throw new Error(
+      `config.hermes.bridgeMinimumVersion 不能低于 daemon 安全下限 ${MINIMUM_SAFE_BRIDGE_VERSION}；` +
+      "请在停服升级中显式更新配置并同步安装 bridge",
+    );
+  }
   return {
     schemaVersion: 1,
     profile: asNonEmptyString(root.profile, "config.profile"),
@@ -403,7 +411,7 @@ export async function initializeConfig(options: {
       minimumVersion: "0.15.1",
       maximumExclusiveVersion: "0.15.2",
       bridgeImplementation: "livis-hermes-bridge",
-      bridgeMinimumVersion: "0.1.0",
+      bridgeMinimumVersion: MINIMUM_SAFE_BRIDGE_VERSION,
       bridgeMaximumExclusiveVersion: "0.2.0",
     },
     codex: {

@@ -1,6 +1,6 @@
 {
   "name": "livis-relay-daemon",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "使用版本化协议配置与可插拔 Agent connector 的 LiViS 共享 Relay Daemon",

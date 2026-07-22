@@ -148,13 +148,30 @@ backend 切换只允许发生在其他 backend 没有 `Received/Acked/Dispatchin
 
 ```text
 hello / hello_ack
-job → accepted → result|failed
+job → accepted → result|failed → result_stored
+job → failed → result_stored（前置门禁拒绝）
 cancel → cancelled
-result_stored
 ping / pong
 ```
 
 所有执行消息携带 `jobId + leaseId`。daemon 只接受当前 lease，旧 connector 或迟到结果不能完成新执行。
+
+远程 job 在 bridge 内的前置路径固定为：
+
+```text
+job
+  → 构造 MessageEvent
+  → Hermes 0.15.1 plaintext command 归一化
+  → slash/home-channel/session/approval 门禁
+      ├─ 拒绝：failed（不建执行关联映射，仅保留 offer tombstone；不发 accepted、不进 dispatcher）
+      └─ 放行：建立 job/lease/chat 映射 → accepted → handle_message
+```
+
+`LIVIS_HOME_CHANNEL=livis:<agent_id>` 是本地 channel ID；Hermes 根据该 source 计算自己的 `agent:main:livis:dm:...` session key，两者不能混用。bridge 必须使用 bound message handler 所属 GatewayRunner 的 `_session_key_for_source()`，并以同一个 Hermes session key 读取 `_active_sessions` 与 blocking approval。stale owner task 可以先由 Hermes 自身 `_heal_stale_session_lock()` 清理；仍 active、仍有 blocking approval 或任一状态不可安全读取时都失败关闭。
+
+bridge 在收到 job frame 时先登记 `jobId + leaseId` offer tombstone，因此 cancel 即使抢在 job task 启动或 `accepted` 完成前到达，也只结算当前 lease，不会把尚未执行的远程输入转换成 Hermes `/stop`。门禁放行后，bridge 在任何 `await` 前为 Hermes session 建立 admission reservation；直到 `handle_message()` 已建立 Hermes 自身的 active-session 状态前，相邻 job 都会被拒绝。拒绝路径绑定收到该 job 的 websocket 实例，发送 v1 `failed` 后必须等 daemon 持久化失败与 outbox 并回 `result_stored`；ACK 超时或 lease 不匹配时只关闭原连接，不能误关等待期间建立的新 generation。远端 job timestamp 只作事件显示元数据；非有限、不可解析或超出平台日期范围的值会降级为 bridge 当前 UTC 时间，不能在门禁结算前中止 job task。
+
+daemon 的 cancel 不复用上述远程文本入口：`cancel` 在已有 lease/source 映射上由 `_handle_cancel()` 合成内部 `MessageType.COMMAND /stop`，随后回 `cancelled` 并进入既有 `CancelUnknown`/quarantine 裁决。这样既关闭远程控制命令，又不破坏 daemon 的 best-effort 中断通道。
 
 daemon 会为每次接纳的 `hello` 分配仅存于本机进程的 connector generation。失活连接被 takeover 时，daemon 先 fence 旧 socket，并通过 `onDisconnected` 完整执行 `markConnectorDisconnected`：`Dispatching/Running` 转为 `Interrupted`，`Cancelling` 转为 `CancelUnknown`，同时隔离相关 session。只有这一次持久化结算完成后，新 generation 才会进入 ready 并触发派发；首次 SQLite/I/O 失败不会把 generation 永久标成已处理，takeover 或迟到 `close` 仍可重试。旧 socket 的延迟 `close` 或入站消息会同时按 socket 实例和 generation 拒绝，即使新旧连接复用同一 `connectorId` 也不会跨代影响。
 
@@ -230,7 +247,7 @@ backend。只有非认证失败才允许下一次 `turn/start` 按上游语义�
 LiViS 与执行后端使用不同门禁：
 
 1. LiViS：版本化 protocol profile、artifact 哈希、wire marker、`wireContractRevision + credentialMode`、active profile SHA pin、runtime contract digest、24 小时 supported proof 与本地脱敏 S2 probe artifact。
-2. Hermes：外置公共 platform plugin、connector hello、bridge 版本区间、Hermes runtime 版本区间和真实包 smoke test。
+2. Hermes：外置公共 platform plugin、connector hello、bridge 版本区间、Hermes runtime 版本区间和真实包 smoke test；daemon 0.1.1 内建 bridge 0.1.1 安全下限，存量配置不能把该下限降回 0.1.0。
 3. Codex：CLI `[0.145.0, 0.146.0)` 版本窗、专用登录、固定 app-server argv/config、
    精确 enabled feature allowlist 与快照摘要、thread/rollout/sandbox 安全回读和真实恶意
    凭据负向 canary。

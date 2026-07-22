@@ -71,7 +71,7 @@ function connectorServer(socketPath: string): ConnectorServer {
     hermesMinimumVersion: "0.15.1",
     hermesMaximumExclusiveVersion: "0.15.2",
     bridgeImplementation: "livis-hermes-bridge",
-    bridgeMinimumVersion: "0.1.0",
+    bridgeMinimumVersion: "0.1.1",
     bridgeMaximumExclusiveVersion: "0.2.0",
   }, handlers, new Logger("test.offline-guard", "error"));
 }

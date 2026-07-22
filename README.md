@@ -26,6 +26,7 @@ flowchart LR
 - 不支持多设备同时接入、跨设备共享后端会话或原地换设备；稳定 session key 固定为 `livis:<agentId>`。
 - Hermes 必须使用专用 profile、专用工作区和只读工具集；Codex 必须使用 state directory 内的专用 `CODEX_HOME`、API key 凭据和 workspace，OAuth/ChatGPT 与 Bedrock 账号不属于支持范围。Codex 只能使用默认 OpenAI 或显式 custom Responses provider；custom endpoint 是 API key、prompt、会话上下文与工具结果的数据出口，必须由操作者单独确认。
 - 不支持远程审批、附件、token stream、tool progress、管理命令和远程 `/update`。
+- Hermes home channel 只能由本地 `LIVIS_HOME_CHANNEL=livis:<agent_id>` 固定；远程 `/sethome` 不属于初始化步骤。
 - 取消语义为 `best_effort`；无法证明工具线程退出时进入 `CancelUnknown` 并隔离 session。
 
 ## 可靠性与安全特性
@@ -44,6 +45,7 @@ flowchart LR
 - Codex 完整编码态可显式配置经审核的 `toolchainReadRoots`；这些目录只读加入 permission profile 与 PATH，仍不增加 writable root，且不得指向 `/`、state directory、用户 HOME 或含凭据/业务数据的宽泛目录。
 - Codex app-server 使用 workspace 外的宿主 HOME/TMPDIR，agent 使用 workspace 内独立 HOME/TMPDIR；关闭时按独立 POSIX 进程组执行 `SIGTERM → SIGKILL → 收口确认`。
 - Codex app-server 只在无内存/SQLite active attempt、无 recovery/quarantine 且持久 Store anchor 未漂移的 idle 状态自动恢复；daemon 生命周期累计最多按 `250/1000/5000 ms` 尝试三次，只恢复并回读同一 thread。活动 turn 期间退出仍失败关闭并要求人工处置，绝不自动重放。
+- Hermes bridge 在建立 job 映射、发送 `accepted` 和进入 dispatcher 之前，拒绝全部斜杠命令及 Hermes 0.15.1 会归一化的自然语言重启别名；active session、blocking approval 或状态不可读时同样失败关闭。daemon 内部 cancel 生成的 `/stop` 仍走独立控制路径。
 - LiViS profile 按 SHA-256 固定；未知 wire protocol、版本或 artifact 漂移默认拒绝。
 - `login/serve` 要求近期 supported proof；daemon 每 6 小时在线复核。
 - `wireContractRevision + credentialMode` 同时绑定 profile、runtime digest 与 supported proof；机器可读 registry、append-only 历史门禁和本地脱敏 probe artifact 防止 wire 代码静默漂移或覆写旧基线。
