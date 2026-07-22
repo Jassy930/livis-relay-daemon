@@ -331,22 +331,39 @@ export class JobStore {
   }
 
   requestCancel(jobId: string): StoredJob | null {
-    const current = this.get(jobId);
-    if (!current) {
-      this.database
-        .query("INSERT OR IGNORE INTO pending_cancels(scope_key,job_id,created_at) VALUES(?,?,?)")
-        .run(this.scopeKey, jobId, Date.now());
-      return null;
-    }
-    if (["Succeeded", "Failed", "Rejected", "Cancelled", "CancelUnknown"].includes(current.status)) {
-      return current;
-    }
     const now = Date.now();
-    const nextStatus: JobStatus = ["Dispatching", "Running"].includes(current.status) ? "Cancelling" : "Cancelled";
-    this.database
-      .query("UPDATE jobs SET cancel_requested=1, status=?, completed_at=CASE WHEN ?='Cancelled' THEN ? ELSE completed_at END, updated_at=? WHERE scope_key=? AND job_id=?")
-      .run(nextStatus, nextStatus, now, now, this.scopeKey, jobId);
-    return this.require(jobId);
+    const transaction = this.database.transaction(() => {
+      // cancel 可能先于 job 到达；与状态转移共用 IMMEDIATE 事务，避免另一
+      // 实例在“查无 job”和写入 intent 之间插入并开始派发。
+      this.database
+        .query(`INSERT OR IGNORE INTO pending_cancels(scope_key,job_id,created_at)
+                SELECT ?,?,?
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM jobs WHERE scope_key=? AND job_id=?
+                )`)
+        .run(this.scopeKey, jobId, now, this.scopeKey, jobId);
+
+      // 只允许尚未派发的 job 直接结束，或活跃执行进入 Cancelling。
+      // Cancelling、Interrupted 和所有终态都不匹配 WHERE，重复 cancel
+      // 因而幂等，迟到 cancel 也不能让已完成状态发生回退。
+      this.database
+        .query(`UPDATE jobs
+                SET cancel_requested=1,
+                    status=CASE
+                      WHEN status IN ('Dispatching','Running') THEN 'Cancelling'
+                      ELSE 'Cancelled'
+                    END,
+                    completed_at=CASE
+                      WHEN status IN ('Received','Acked') THEN ?
+                      ELSE completed_at
+                    END,
+                    updated_at=?
+                WHERE scope_key=? AND job_id=?
+                  AND status IN ('Received','Acked','Dispatching','Running')`)
+        .run(now, now, this.scopeKey, jobId);
+    });
+    transaction.immediate();
+    return this.get(jobId);
   }
 
   markCancelUnknown(jobId: string, leaseId: string, reason: string): StoredJob {

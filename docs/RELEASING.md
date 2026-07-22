@@ -15,7 +15,7 @@
 1. 更新上述版本和 `CHANGELOG.md`。
 2. 在独立 Git 仓库的干净 checkout 中执行 `bun install --frozen-lockfile` 和 `uv sync --frozen`。
 3. 用 `git add` 更新候选 index，再执行 `bun run check`。其中 `release:check` 直接读取 `git ls-files -z` 与 index blob，不以 `.gitignore` 或工作区文件清单代替 tracked-files 审计。
-4. 确认公开树不包含 live profile、token、数据库、日志、artifact、`node_modules` 或 `.venv`。
+4. 确认公开树不包含 live profile、token、数据库、日志、私有 probe/raw trace、上游 artifact、`node_modules` 或 `.venv`。
 5. 等待 GitHub Actions 的 macOS/Linux 与 Python 3.11–3.13 矩阵通过。
 6. 从 Git tracked files 的干净 checkout 构建 Hermes plugin 归档，只包含 `plugin.yaml`、`__init__.py`、`adapter.py`、README、LICENSE 和 NOTICE。
 7. 对发布归档生成 SHA-256，做一次解压、plugin 加载和 UDS canary。
@@ -31,6 +31,9 @@
 - Markdown、RST、TXT 文档可为安全审计和来源说明提及生产域名；
 - 官方 OAuth client identity 只以 SHA-256 指纹识别，所有文本文件均无例外，仓库不保存或打印原始值；
 - 私钥头在任意文本文件中都会被拒绝。
+- `protocol-probes/` 默认全部拒绝；只有 Git index 中 `src/protocol/wire-contract-registry.json` 精确登记、mode 为 `100644`、SHA-256 和内部 contract 均匹配的 canonical 脱敏 S2 artifact 可以发布。任意其他 JSON、私有回执、raw frame、trace、HAR、pcap 或改名文件一律拒绝。
+
+`bun run wire-contract:append-only:check` 还会把候选 Git index 与 base commit 比较：既有 registry definition 和 artifact 原始字节不可删除、改名或原地修改；每个候选最多新增一个 revision，且必须成为 current 接受 generator 重建校验。没有新增时不得切换 current。CI checkout 使用完整历史，并从 PR base SHA 或 push before SHA 取基线；基线不可读或不是当前 HEAD 祖先时失败关闭。首次 bootstrap 只有在 base 同时没有 registry 和任何 `protocol-probes/` 文件时才允许，且只能登记一个 current revision。
 
 该门禁只证明当前 Git index 未命中这些规则，不代替提交历史扫描、GitHub secret scanning 或人工 diff 审阅。
 

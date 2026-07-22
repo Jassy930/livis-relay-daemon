@@ -3,7 +3,7 @@ import type { RelayConfig } from "../config.ts";
 import type { RelayIdentity } from "../identity.ts";
 import type { Logger } from "../logger.ts";
 import { errorMessage } from "../logger.ts";
-import type { ProtocolProfile } from "../protocol/profile.ts";
+import { runtimeContractSha256, type ProtocolProfile } from "../protocol/profile.ts";
 import {
   buildAckEnvelope,
   buildConnectEnvelope,
@@ -63,6 +63,9 @@ export class RelayClient {
       agentId: this.identity.agentId,
       deviceId: this.identity.deviceId,
       profile: this.profile.id,
+      wireContractRevision: this.profile.wireContractRevision,
+      credentialMode: this.profile.credentialMode,
+      runtimeContractSha256: runtimeContractSha256(this.profile),
     };
   }
 

@@ -177,11 +177,20 @@ export class IdaasClient {
   async revoke(): Promise<void> {
     const currentSecrets = await this.secrets.get();
     if (currentSecrets.refreshToken) {
-      await this.postForm("/revoke", {
-        token: currentSecrets.refreshToken,
-        token_type_hint: "refresh_token",
-        client_id: this.profile.oauth.clientId,
-      }).catch(() => undefined);
+      let response: Response;
+      try {
+        response = await this.postForm("/revoke", {
+          token: currentSecrets.refreshToken,
+          token_type_hint: "refresh_token",
+          client_id: this.profile.oauth.clientId,
+        });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`撤销 refresh token 失败：${detail}；本地 refresh token 已保留`, { cause: error });
+      }
+      if (!response.ok) {
+        throw new Error(`撤销 refresh token 失败：HTTP ${response.status}；本地 refresh token 已保留`);
+      }
     }
     await this.secrets.clearRefreshToken();
     this.accessToken = null;

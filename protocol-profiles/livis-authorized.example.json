@@ -1,8 +1,10 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "id": "livis-authorized-profile-example",
   "officialPluginVersion": "0.0.0",
   "wireProtocolVersion": 1,
+  "wireContractRevision": "livis-relay-v1-access-refresh-r1",
+  "credentialMode": "access-and-refresh-token",
   "endpoints": {
     "idaasBaseUrl": "https://idaas.example.invalid/api",
     "relayWebSocketUrl": "wss://relay.example.invalid/api/v1/ws",

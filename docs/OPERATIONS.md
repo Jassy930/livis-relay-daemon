@@ -13,6 +13,8 @@ bun run check
 
 公开仓库只提供无效占位值的 [`protocol-profiles/livis-authorized.example.json`](../protocol-profiles/livis-authorized.example.json)。从有权管理相关服务的一方取得参数，将 profile 保存到仓库外的私有位置；不要直接使用 example 连接服务。
 
+当前只接受 protocol profile schema v2，并要求 `wireContractRevision=livis-relay-v1-access-refresh-r1` 与 `credentialMode=access-and-refresh-token` 精确匹配代码 registry。两者描述当前仍向 Relay 发送 refresh token 的兼容基线，不代表服务端要求或目标安全策略。
+
 ## 3. 初始化
 
 ```bash
@@ -23,11 +25,15 @@ bun run src/index.ts init \
 
 `init` 会把已审核 LiViS profile 复制到 state directory，并把该文件的 SHA-256 固定到配置。它不会登录、绑定或启动服务。
 
+已有 schema v1 部署必须按[protocol profile v1→v2 迁移 runbook](UPSTREAM-UPGRADE.md#现有部署的-protocol-profile-schema-v1v2-迁移)处理：先确认 connector socket 父目录是 state directory 内的私有非 symlink 目录，再停止 daemon/Hermes 并禁用服务管理器自动拉起，执行零写入 dry-run，最后显式 apply。命令会保存原 config/profile 和 PREPARED receipt，以 config durable rename 为 apply 唯一提交点，隔离旧/新 supported proof，且不触碰 SQLite。迁移后必须重新执行 `upstream check` 与 `doctor --online` 才能启动；回滚 v1 后必须切回旧 daemon 并重新生成 proof，不得旁路校验。
+
 随后编辑配置：
 
 - 保持 `security.allowAllNodes=false`。
-- 将获准的稳定 LiViS node ID 填入 `security.allowedNodeIds`。
+- 将唯一获准且稳定的 LiViS `node_id` 作为 `security.allowedNodeIds` 的唯一元素；不要填写多个值。
 - 不扩大 Hermes 审核版本范围，除非已按升级 runbook 验证。
+
+一期暂将 `node_id` 视为设备来源标识，一套 daemon、config、state directory 和专用 Hermes profile 只支持该一个设备。配置解析器仍接受数组是格式兼容，不代表支持多设备；不得通过追加第二个 ID、开启 `allowAllNodes` 或直接替换原 ID 来接入另一设备。设备更换、跨设备会话和旧状态迁移均需另行设计与验收。
 
 ## 4. 生成近期 upstream 证明
 
@@ -44,6 +50,18 @@ bun run src/index.ts login
 ```
 
 完成 Device Flow 后，refresh token 保存在 daemon state directory。不要把 connector token 或 refresh token 粘贴到聊天、日志和 shell history。
+
+### 安全登出与账号边界
+
+`logout` 只负责向 IDaaS 撤销 refresh token 并在远端返回 2xx 后清除本地副本；它不是运行中 daemon 的控制通道。执行前应确认没有活跃 job 或待投递结果，再停止专用 Hermes Gateway 和 `livis-relayd`：
+
+```bash
+bun run src/index.ts logout
+```
+
+只有看到“已撤销并清除本地 refresh token”才表示远端确认成功。网络失败或远端非 2xx 时命令以失败退出，并故意保留本地 token，便于恢复网络后重试；不要为消除错误而手工删除凭据。
+
+一期尚未把 OAuth 账号 subject 与 `identity.json`、SQLite job/outbox 做持久化绑定，因此不支持在同一个 state directory 中直接切换账号。需要使用另一账号时，应使用独立配置和独立 state directory；不得用 `login --force` 覆盖原账号 token 后继续复用旧 outbox。
 
 ## 6. 安装 Hermes plugin
 
@@ -86,9 +104,11 @@ HERMES_HOME="$LIVIS_HERMES_HOME" hermes plugins enable livis-bridge
 ```bash
 LIVIS_RELAY_SOCKET=$HOME/.livis-relay/connector.sock
 LIVIS_RELAY_TOKEN=<使用 connector-token 命令读取>
-LIVIS_ALLOWED_USERS=<与 daemon 一致的逗号分隔 node ID>
+LIVIS_ALLOWED_USERS=<与 security.allowedNodeIds 完全相同的唯一 node_id>
 LIVIS_PHASE1_READ_ONLY_ACK=true
 ```
+
+启动前读回 daemon 与 Hermes 两处 allowlist，确认它们完全相同且都只有一个值。`LIVIS_ALLOWED_USERS` 的逗号列表语法不代表一期允许配置多个设备。
 
 读取 connector token：
 
