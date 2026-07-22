@@ -1,28 +1,30 @@
-# LiViS 共享 Relay Daemon（一期：Hermes）
+# LiViS 共享 Relay Daemon（一期：Hermes 默认，Codex 实验后端）
 
 [![CI](https://github.com/Jassy930/livis-relay-daemon/actions/workflows/ci.yml/badge.svg)](https://github.com/Jassy930/livis-relay-daemon/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-这是一个独立于 LiViS 官方 OpenClaw 插件、也独立于 Hermes core 的本地 relay daemon。当前协议实现基于对 LiViS v2.0.0 wire 行为的静态观察，把消息可靠地交给专用 Hermes Gateway；服务端事实、历史 canary 与未知项以[协议证据边界](docs/LIVIS-RELAY-PROTOCOL-BOUNDARY.md)为准。
+这是一个独立于 LiViS 官方 OpenClaw 插件、Hermes core 与 Codex 的本地 relay daemon。当前协议实现基于对 LiViS v2.0.0 wire 行为的静态观察，由 daemon 持有消息、执行租约和 durable outbox，再把请求交给默认 Hermes backend 或显式启用的实验性 Codex app-server backend；服务端事实、历史 canary 与未知项以[协议证据边界](docs/LIVIS-RELAY-PROTOCOL-BOUNDARY.md)为准。
 
-> 当前属于实验性的第三方兼容实现，不是理想或 Hermes 官方组件，也不代表任何官方背书。本仓库不包含或再分发官方 bundle；使用者在连接相关服务前，应自行确认适用的服务条款、协议权限和数据合规要求。
+> 当前属于实验性的第三方兼容实现，不是理想、Hermes、Codex 或 OpenAI 官方组件，也不代表任何官方背书。本仓库不包含或再分发官方 bundle；使用者在连接相关服务前，应自行确认适用的服务条款、协议权限和数据合规要求。
 
 公开仓库不附带可直连生产服务的 live profile，也不默认复用任何官方 OAuth 客户端身份。运行前必须准备自己有权使用的 profile，详见 [`protocol-profiles/README.md`](protocol-profiles/README.md)。
 
 ```mermaid
 flowchart LR
     L["理想同学 / LiViS Relay"] <-->|"OAuth + WSS"| D["livis-relayd\nBun / SQLite"]
-    D <-->|"UDS WebSocket\nBearer + lease"| P["Hermes livis-bridge plugin"]
+    D -->|"显式选择一个 backend"| B{"ExecutionBackend"}
+    B <-->|"UDS WebSocket\nBearer + lease"| P["Hermes livis-bridge plugin"]
     P <--> H["专用 Hermes Gateway\n只读工具配置"]
+    B <-->|"stdio JSON-RPC\nthread / turn"| C["daemon 托管 Codex app-server\n私有 CODEX_HOME + workspace"]
 ```
 
 ## 一期边界
 
-- 只接 Hermes，不接 AionUI/AionCore。
+- 默认只接 Hermes；Codex 必须显式配置并确认远程执行，Claude Code 尚未实现。
 - 只支持纯文本、单个 final result。
 - 一期暂将 LiViS `node_id` 视为设备来源标识；每套 daemon、config 与 state directory 只允许一个预先配置的 `node_id`。
-- 不支持多设备同时接入、跨设备共享 Hermes 会话或原地换设备。
-- Hermes 必须使用专用 profile、专用工作区和只读工具集。
+- 不支持多设备同时接入、跨设备共享后端会话或原地换设备；稳定 session key 固定为 `livis:<agentId>`。
+- Hermes 必须使用专用 profile、专用工作区和只读工具集；Codex 必须使用 state directory 内的专用 `CODEX_HOME` 和 workspace。
 - 不支持远程审批、附件、token stream、tool progress、管理命令和远程 `/update`。
 - 取消语义为 `best_effort`；无法证明工具线程退出时进入 `CancelUnknown` 并隔离 session。
 
@@ -33,11 +35,13 @@ flowchart LR
 - `lease_id + run_generation` fencing，同 session 单活。
 - cancel/final 使用 CAS 决定唯一赢家；ambiguous execution 不自动重跑。
 - Hermes connector 只开放权限 `0600` 的 Unix socket，不监听 TCP。
+- Codex 由 daemon 通过 stdio app-server 直接管理；JobStore schema v4 持久化 thread/cwd/version 与 active job/lease/generation/turn。
+- Codex 只在 terminal `turn/completed` 后返回一个 agent final，工具网络关闭、workspace 是唯一可写根，审批请求默认拒绝。
 - LiViS profile 按 SHA-256 固定；未知 wire protocol、版本或 artifact 漂移默认拒绝。
 - `login/serve` 要求近期 supported proof；daemon 每 6 小时在线复核。
 - `wireContractRevision + credentialMode` 同时绑定 profile、runtime digest 与 supported proof；机器可读 registry、append-only 历史门禁和本地脱敏 probe artifact 防止 wire 代码静默漂移或覆写旧基线。
 - schema v1→v2 迁移采用固定 contract 人工确认、私有 PREPARED/备份、source→target 重建校验、持久化 guard、proof quarantine 和可自愈显式回滚；迁移命令不打开 SQLite。
-- Hermes runtime 与 bridge 都必须位于审核版本区间，未知未来版本不会自动放行。
+- Hermes runtime/bridge 与 Codex CLI 都必须位于各自审核版本区间；Codex 当前固定为 `[0.145.0, 0.146.0)`，未知未来版本不会自动放行。
 
 ## 开发验证
 
@@ -46,7 +50,8 @@ flowchart LR
 - macOS 或 Linux；不支持 Windows。
 - Bun 1.3.14+；CI 与锁文件基线为 1.3.14。
 - uv 0.11+ 与 Python 3.11–3.13。
-- 本地 Hermes 版本须位于配置中的已审核范围。
+- 使用 Hermes 时，本地 Hermes 版本须位于配置中的已审核范围。
+- 使用 Codex 时，Codex CLI 必须位于 `[0.145.0, 0.146.0)`，并为 daemon 专用 `CODEX_HOME` 单独登录。
 
 ### 开发环境快速准备
 
@@ -70,15 +75,18 @@ git clone https://github.com/Jassy930/livis-relay-daemon.git && cd livis-relay-d
 
 验证结果必须绑定精确提交，不能沿用 README 中的固定测试数量或旧 canary 结论。当前候选应在精确 staged tree 上运行 `bun run check`；实际测试数量以该次输出为准。
 
-2026-07-18 曾在旧代码基线上留下 Hermes 0.15.1 前台纯文本闭环的高层人工摘要；同期 LaunchAgent 记录也只证明服务存活、online doctor、Relay handshake 与 connector ready。它们都早于当前 protocol profile v2、单设备边界、Relay 资源门禁和 JobStore v3，且没有绑定当前最终提交的完整 receipt，因此只作历史参考，不能证明当前版本或 launchd 常驻消息闭环已经通过。证据边界和当前验收步骤见 [`docs/HERMES-CANARY.md`](docs/HERMES-CANARY.md)。
+2026-07-18 曾在旧代码基线上留下 Hermes 0.15.1 前台纯文本闭环的高层人工摘要；同期 LaunchAgent 记录也只证明服务存活、online doctor、Relay handshake 与 connector ready。它们都早于后续 protocol profile v2、单设备边界、Relay 资源门禁和 JobStore v3，更早于当前 JobStore v4，且没有绑定当前最终提交的完整 receipt，因此只作历史参考，不能证明当前版本或 launchd 常驻消息闭环已经通过。证据边界和当前验收步骤见 [`docs/HERMES-CANARY.md`](docs/HERMES-CANARY.md)。
 
-仓库提供 Relay LaunchAgent 模板和双服务运行手册，但安装、加载、启停与真实消息 canary 都是操作者在获授权环境中的显式步骤；合并文档或 `plutil -lint` 通过不代表用户服务已被修改，也不代表 LiViS 消息已完成 `Succeeded → Delivered → App 回显` 闭环。
+Codex 的真实 `thread/start` 安全回读已经命中 workspace-only、无工具网络和审批关闭边界；但由于验证环境的外层 sandbox 无法可靠嵌套 Seatbelt，恶意凭据读取负向 canary 尚未完成。因此 Codex 仍是 Draft/受控开发功能，不应宣称生产上线，完整门禁见 [`docs/CODEX-APPSERVER.md`](docs/CODEX-APPSERVER.md)。
+
+仓库提供 Relay LaunchAgent 模板、Hermes 双服务运行手册和 Codex 单服务边界，但安装、加载、启停与真实消息 canary 都是操作者在获授权环境中的显式步骤；合并文档或 `plutil -lint` 通过不代表用户服务已被修改，也不代表 LiViS 消息已完成 `Succeeded → Delivered → App 回显` 闭环。
 
 ## 使用入口
 
 - [LiViS 服务端协议证据与支持边界](docs/LIVIS-RELAY-PROTOCOL-BOUNDARY.md)
 - [本地协议探针](docs/PROTOCOL-PROBES.md)
 - [运行手册](docs/OPERATIONS.md)
+- [Codex app-server 执行后端](docs/CODEX-APPSERVER.md)
 - [Hermes 实网 canary](docs/HERMES-CANARY.md)
 - [官方升级与回滚](docs/UPSTREAM-UPGRADE.md)
 - [普通 profile 激活事务](docs/PROFILE-ACTIVATION.md)
@@ -93,4 +101,4 @@ git clone https://github.com/Jassy930/livis-relay-daemon.git && cd livis-relay-d
 
 ## 许可证
 
-本项目自主实现的代码采用 [MIT License](LICENSE)。LiViS、理想、Hermes、OpenClaw 等名称、服务、协议和商标不因本项目许可证而获得授权，详见 [NOTICE](NOTICE.md)。
+本项目自主实现的代码采用 [MIT License](LICENSE)。LiViS、理想、Hermes、Codex、OpenAI、OpenClaw 等名称、服务、协议和商标不因本项目许可证而获得授权，详见 [NOTICE](NOTICE.md)。

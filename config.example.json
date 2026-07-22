@@ -9,6 +9,9 @@
     "reconnectMaxMs": 60000,
     "maxFrameBytes": 1048576
   },
+  "execution": {
+    "backend": "hermes"
+  },
   "connector": {
     "socketPath": "~/.livis-relay/connector.sock",
     "helloTimeoutMs": 10000,
@@ -30,5 +33,12 @@
     "bridgeImplementation": "livis-hermes-bridge",
     "bridgeMinimumVersion": "0.1.0",
     "bridgeMaximumExclusiveVersion": "0.2.0"
+  },
+  "codex": {
+    "command": "codex",
+    "model": null,
+    "requestTimeoutMs": 30000,
+    "shutdownTimeoutMs": 5000,
+    "acknowledgeRemoteExecution": false
   }
 }

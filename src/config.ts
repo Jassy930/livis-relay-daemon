@@ -23,6 +23,9 @@ export interface RelayConfig {
     reconnectMaxMs: number;
     maxFrameBytes: number;
   };
+  execution: {
+    backend: "hermes" | "codex";
+  };
   connector: {
     socketPath: string;
     helloTimeoutMs: number;
@@ -45,11 +48,22 @@ export interface RelayConfig {
     bridgeMinimumVersion: string;
     bridgeMaximumExclusiveVersion: string;
   };
+  codex: {
+    command: string;
+    model: string | null;
+    requestTimeoutMs: number;
+    shutdownTimeoutMs: number;
+    acknowledgeRemoteExecution: boolean;
+  };
 }
 
 export const DEFAULT_CONFIG_PATH = "~/.livis-relay/config.json";
 export const DEFAULT_RELAY_MAX_FRAME_BYTES = 1_048_576;
 export const MAX_RELAY_MAX_FRAME_BYTES = 16_777_216;
+export const CODEX_MINIMUM_VERSION = "0.145.0";
+export const CODEX_MAXIMUM_EXCLUSIVE_VERSION = "0.146.0";
+export const DEFAULT_CODEX_REQUEST_TIMEOUT_MS = 30_000;
+export const DEFAULT_CODEX_SHUTDOWN_TIMEOUT_MS = 5_000;
 
 function relayMaxFrameBytes(value: unknown): number {
   const parsed = asPositiveInteger(value, "config.relay.maxFrameBytes");
@@ -67,6 +81,19 @@ function objectAt(parent: Record<string, unknown>, key: string): Record<string, 
   return value as Record<string, unknown>;
 }
 
+function optionalObjectAt(
+  parent: Record<string, unknown>,
+  key: string,
+): Record<string, unknown> | undefined {
+  if (parent[key] === undefined) return undefined;
+  return objectAt(parent, key);
+}
+
+function optionalNonEmptyString(value: unknown, label: string): string | null {
+  if (value === undefined || value === null) return null;
+  return asNonEmptyString(value, label);
+}
+
 function stringArray(value: unknown, label: string): string[] {
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.trim() === "")) {
     throw new Error(`${label} 必须是非空字符串数组`);
@@ -80,14 +107,37 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
     throw new Error("只支持 schemaVersion=1 的配置");
   }
   const relay = objectAt(root, "relay");
+  const execution = optionalObjectAt(root, "execution");
   const connector = objectAt(root, "connector");
   const security = objectAt(root, "security");
   const hermes = objectAt(root, "hermes");
+  const codex = optionalObjectAt(root, "codex");
+  const executionBackend = execution?.backend ?? "hermes";
+  if (executionBackend !== "hermes" && executionBackend !== "codex") {
+    throw new Error("config.execution.backend 只支持 hermes 或 codex");
+  }
+  if (codex?.acknowledgeRemoteExecution !== undefined &&
+      typeof codex.acknowledgeRemoteExecution !== "boolean") {
+    throw new Error("config.codex.acknowledgeRemoteExecution 必须是布尔值");
+  }
   if (typeof security.acknowledgeUnofficialProtocol !== "boolean") {
     throw new Error("config.security.acknowledgeUnofficialProtocol 必须是布尔值");
   }
   if (typeof security.allowAllNodes !== "boolean") {
     throw new Error("config.security.allowAllNodes 必须是布尔值");
+  }
+  const allowAllNodes = security.allowAllNodes;
+  const allowedNodeIds = stringArray(security.allowedNodeIds, "config.security.allowedNodeIds");
+  const codexCommand = codex?.command === undefined
+    ? "codex"
+    : asNonEmptyString(codex.command, "config.codex.command");
+  if (executionBackend === "codex" && (allowAllNodes || allowedNodeIds.length !== 1)) {
+    throw new Error(
+      "Codex backend 只支持单设备：config.security.allowAllNodes 必须为 false，且 allowedNodeIds 必须恰好包含一个 nodeId",
+    );
+  }
+  if (executionBackend === "codex" && !isAbsolute(codexCommand)) {
+    throw new Error("Codex backend 的 config.codex.command 必须是绝对路径");
   }
   const stateDirRaw = asNonEmptyString(root.stateDir, "config.stateDir");
   const hermesMinimumVersion = asNonEmptyString(hermes.minimumVersion, "config.hermes.minimumVersion");
@@ -126,6 +176,9 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
         ? DEFAULT_RELAY_MAX_FRAME_BYTES
         : relayMaxFrameBytes(relay.maxFrameBytes),
     },
+    execution: {
+      backend: executionBackend,
+    },
     connector: {
       socketPath: expandHome(asNonEmptyString(connector.socketPath, "config.connector.socketPath")),
       helloTimeoutMs: asPositiveInteger(connector.helloTimeoutMs, "config.connector.helloTimeoutMs"),
@@ -137,8 +190,8 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
     },
     security: {
       acknowledgeUnofficialProtocol: security.acknowledgeUnofficialProtocol,
-      allowAllNodes: security.allowAllNodes,
-      allowedNodeIds: stringArray(security.allowedNodeIds, "config.security.allowedNodeIds"),
+      allowAllNodes,
+      allowedNodeIds,
       maxInputChars: asPositiveInteger(security.maxInputChars, "config.security.maxInputChars"),
       maxOutputChars: asPositiveInteger(security.maxOutputChars, "config.security.maxOutputChars"),
       unauthorizedMessage: asNonEmptyString(
@@ -156,6 +209,17 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
       ),
       bridgeMinimumVersion,
       bridgeMaximumExclusiveVersion: bridgeMaximumVersion,
+    },
+    codex: {
+      command: codexCommand,
+      model: optionalNonEmptyString(codex?.model, "config.codex.model"),
+      requestTimeoutMs: codex?.requestTimeoutMs === undefined
+        ? DEFAULT_CODEX_REQUEST_TIMEOUT_MS
+        : asPositiveInteger(codex.requestTimeoutMs, "config.codex.requestTimeoutMs"),
+      shutdownTimeoutMs: codex?.shutdownTimeoutMs === undefined
+        ? DEFAULT_CODEX_SHUTDOWN_TIMEOUT_MS
+        : asPositiveInteger(codex.shutdownTimeoutMs, "config.codex.shutdownTimeoutMs"),
+      acknowledgeRemoteExecution: codex?.acknowledgeRemoteExecution === true,
     },
   };
 }
@@ -205,6 +269,9 @@ export async function initializeConfig(options: {
       reconnectMaxMs: 60_000,
       maxFrameBytes: DEFAULT_RELAY_MAX_FRAME_BYTES,
     },
+    execution: {
+      backend: "hermes",
+    },
     connector: {
       socketPath: resolve(stateDir, "connector.sock"),
       helloTimeoutMs: 10_000,
@@ -226,6 +293,13 @@ export async function initializeConfig(options: {
       bridgeImplementation: "livis-hermes-bridge",
       bridgeMinimumVersion: "0.1.0",
       bridgeMaximumExclusiveVersion: "0.2.0",
+    },
+    codex: {
+      command: "codex",
+      model: null,
+      requestTimeoutMs: DEFAULT_CODEX_REQUEST_TIMEOUT_MS,
+      shutdownTimeoutMs: DEFAULT_CODEX_SHUTDOWN_TIMEOUT_MS,
+      acknowledgeRemoteExecution: false,
     },
   };
   await atomicWritePrivate(configPath, `${JSON.stringify(config, null, 2)}\n`);

@@ -139,6 +139,62 @@ describe("配置与协议 profile", () => {
     expect(() => parseRelayConfig(JSON.stringify(invalidHermesRange), "/tmp/config.json")).toThrow("版本范围");
   });
 
+  test("旧配置默认使用 Hermes，Codex 配置失败关闭并使用固定版本窗", () => {
+    const config = testConfig("/tmp/test-state");
+    const legacy = structuredClone(config) as unknown as Record<string, unknown>;
+    delete legacy.execution;
+    delete legacy.codex;
+    const parsedLegacy = parseRelayConfig(JSON.stringify(legacy), "/tmp/config.json");
+    expect(parsedLegacy.execution.backend).toBe("hermes");
+    expect(parsedLegacy.codex.acknowledgeRemoteExecution).toBeFalse();
+
+    const codex = parseRelayConfig(JSON.stringify({
+      ...config,
+      execution: { backend: "codex" },
+      codex: {
+        command: "/opt/homebrew/bin/codex",
+        model: "gpt-5.6-sol",
+        requestTimeoutMs: 12_000,
+        shutdownTimeoutMs: 4_000,
+        acknowledgeRemoteExecution: true,
+      },
+    }), "/tmp/config.json");
+    expect(codex.execution.backend).toBe("codex");
+    expect(codex.codex).toEqual({
+      command: "/opt/homebrew/bin/codex",
+      model: "gpt-5.6-sol",
+      requestTimeoutMs: 12_000,
+      shutdownTimeoutMs: 4_000,
+      acknowledgeRemoteExecution: true,
+    });
+
+    expect(() => parseRelayConfig(JSON.stringify({
+      ...config,
+      execution: { backend: "claude" },
+    }), "/tmp/config.json")).toThrow("只支持 hermes 或 codex");
+    expect(() => parseRelayConfig(JSON.stringify({
+      ...config,
+      execution: { backend: "codex" },
+      codex: { ...config.codex, acknowledgeRemoteExecution: "yes" },
+    }), "/tmp/config.json")).toThrow("必须是布尔值");
+    for (const security of [
+      { ...config.security, allowAllNodes: true },
+      { ...config.security, allowedNodeIds: [] },
+      { ...config.security, allowedNodeIds: ["node-1", "node-2"] },
+    ]) {
+      expect(() => parseRelayConfig(JSON.stringify({
+        ...config,
+        execution: { backend: "codex" },
+        security,
+      }), "/tmp/config.json")).toThrow("Codex backend 只支持单设备");
+    }
+    expect(() => parseRelayConfig(JSON.stringify({
+      ...config,
+      execution: { backend: "codex" },
+      codex: { ...config.codex, command: "codex" },
+    }), "/tmp/config.json")).toThrow("必须是绝对路径");
+  });
+
   test("旧配置兼容 relay 帧默认上限，并拒绝无效或过大的显式值", () => {
     const config = testConfig("/tmp/test-state");
     const legacy = structuredClone(config) as unknown as Record<string, unknown>;

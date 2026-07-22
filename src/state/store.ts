@@ -1,7 +1,14 @@
 import { Database } from "bun:sqlite";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import type { IncomingRelayJob, JobStatus, OutboxStatus, StoredJob, StoredOutbox } from "../types.ts";
+import type {
+  IncomingRelayJob,
+  JobStatus,
+  OutboxStatus,
+  StoredBackendSession,
+  StoredJob,
+  StoredOutbox,
+} from "../types.ts";
 import { sha256 } from "../util.ts";
 
 export const PENDING_CANCEL_TTL_MS = 24 * 60 * 60 * 1_000;
@@ -43,6 +50,23 @@ interface JobViewRow {
   outbox_updated_at: number | null;
   delivered_at: number | null;
   acked_at: number | null;
+}
+
+interface BackendSessionRow {
+  scope_key: string;
+  backend: string;
+  session_key: string;
+  session_hash: string;
+  thread_id: string | null;
+  cwd: string;
+  cli_version: string;
+  active_job_id: string | null;
+  active_lease_id: string | null;
+  active_run_generation: number | null;
+  active_turn_id: string | null;
+  recovery_required: number;
+  created_at: number;
+  updated_at: number;
 }
 
 const JOB_VIEW = `
@@ -99,6 +123,25 @@ function rowToJob(row: JobViewRow): StoredJob {
   };
 }
 
+function rowToBackendSession(row: BackendSessionRow): StoredBackendSession {
+  return {
+    scopeKey: row.scope_key,
+    backend: row.backend,
+    sessionKey: row.session_key,
+    sessionHash: row.session_hash,
+    threadId: row.thread_id,
+    cwd: row.cwd,
+    cliVersion: row.cli_version,
+    activeJobId: row.active_job_id,
+    activeLeaseId: row.active_lease_id,
+    activeRunGeneration: row.active_run_generation,
+    activeTurnId: row.active_turn_id,
+    recoveryRequired: row.recovery_required === 1,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 function businessPayloadHash(input: IncomingRelayJob): string {
   return sha256(JSON.stringify({
     fromNodeId: input.fromNodeId,
@@ -108,6 +151,16 @@ function businessPayloadHash(input: IncomingRelayJob): string {
 }
 
 export class JobConflictError extends Error {}
+
+export class BackendSessionConflictError extends Error {}
+
+export interface EnsureBackendSessionInput {
+  backend: string;
+  sessionKey: string;
+  sessionHash: string;
+  cwd: string;
+  cliVersion: string;
+}
 
 export interface JobStoreOptions {
   /** 仅供确定性迁移 harness 在尝试 IMMEDIATE 写锁前建立进程间屏障。 */
@@ -167,6 +220,13 @@ export class JobStore {
         FROM jobs
         WHERE scope_key=? AND status IN ('Dispatching','Running','Cancelling')
       `).run(now, this.scopeKey);
+      // 保留 active attempt 作为人工恢复证据。重启只把会话标成需要恢复，
+      // 不清除 turn/job 映射，也绝不据此自动重放后端请求。
+      this.database
+        .query(`UPDATE backend_sessions
+                SET recovery_required=1, updated_at=?
+                WHERE scope_key=? AND active_job_id IS NOT NULL`)
+        .run(now, this.scopeKey);
       const cancelUnknown = this.database
         .query("UPDATE jobs SET status='CancelUnknown', completed_at=?, updated_at=? WHERE scope_key=? AND status='Cancelling'")
         .run(now, now, this.scopeKey).changes;
@@ -229,6 +289,569 @@ export class JobStore {
       throw new Error(`job 不存在：${jobId}`);
     }
     return job;
+  }
+
+  getBackendSession(backend: string, sessionKey: string): StoredBackendSession | null {
+    const row = this.database
+      .query<BackendSessionRow, [string, string, string]>(
+        `SELECT * FROM backend_sessions
+         WHERE scope_key=? AND backend=? AND session_key=?`,
+      )
+      .get(this.scopeKey, backend, sessionKey);
+    return row ? rowToBackendSession(row) : null;
+  }
+
+  ensureBackendSession(input: EnsureBackendSessionInput): StoredBackendSession {
+    const now = Date.now();
+    const transaction = this.database.transaction(() => {
+      this.database
+        .query(`INSERT INTO backend_sessions(
+                  scope_key,backend,session_key,session_hash,cwd,cli_version,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(scope_key,backend,session_key) DO NOTHING`)
+        .run(
+          this.scopeKey,
+          input.backend,
+          input.sessionKey,
+          input.sessionHash,
+          input.cwd,
+          input.cliVersion,
+          now,
+          now,
+        );
+      const row = this.database
+        .query<BackendSessionRow, [string, string, string]>(
+          `SELECT * FROM backend_sessions
+           WHERE scope_key=? AND backend=? AND session_key=?`,
+        )
+        .get(this.scopeKey, input.backend, input.sessionKey);
+      if (!row) {
+        throw new BackendSessionConflictError("backend session 唯一目录或路径发生冲突");
+      }
+      if (
+        row.session_hash !== input.sessionHash ||
+        row.cwd !== input.cwd ||
+        row.cli_version !== input.cliVersion
+      ) {
+        throw new BackendSessionConflictError(
+          `backend session immutable metadata 不一致：${input.backend}/${input.sessionKey}`,
+        );
+      }
+      return rowToBackendSession(row);
+    });
+    return transaction.immediate();
+  }
+
+  bindBackendThread(backend: string, sessionKey: string, threadId: string): StoredBackendSession {
+    const transaction = this.database.transaction(() => {
+      const current = this.getBackendSession(backend, sessionKey);
+      if (!current) {
+        throw new Error(`backend session 不存在：${backend}/${sessionKey}`);
+      }
+      if (current.threadId === threadId) return current;
+      if (current.threadId !== null) {
+        throw new BackendSessionConflictError(
+          `backend session 已绑定不同 thread：${backend}/${sessionKey}`,
+        );
+      }
+      const result = this.database
+        .query(`UPDATE backend_sessions
+                SET thread_id=?, updated_at=?
+                WHERE scope_key=? AND backend=? AND session_key=?
+                  AND thread_id IS NULL AND recovery_required=0
+                  AND NOT EXISTS (
+                    SELECT 1 FROM session_quarantine quarantine
+                    WHERE quarantine.scope_key=backend_sessions.scope_key
+                      AND quarantine.session_key=backend_sessions.session_key
+                  )`)
+        .run(threadId, Date.now(), this.scopeKey, backend, sessionKey);
+      if (result.changes !== 1) {
+        throw new BackendSessionConflictError(
+          `backend session 当前不可绑定 thread：${backend}/${sessionKey}`,
+        );
+      }
+      return this.getBackendSession(backend, sessionKey)!;
+    });
+    return transaction.immediate();
+  }
+
+  /**
+   * 在同一写事务中领取 job 并保留 backend attempt。只有该方法成功返回后，
+   * 调用方才可以向 app-server 发送 turn/start。
+   */
+  claimForBackendDispatch(
+    jobId: string,
+    backend: string,
+    connectorId: string,
+    leaseId: string,
+  ): StoredJob | null {
+    const now = Date.now();
+    const transaction = this.database.transaction(() => {
+      const claimed = this.database
+        .query(`UPDATE jobs AS target
+                SET status='Dispatching', connector_id=?, lease_id=?,
+                    run_generation=run_generation+1, updated_at=?
+                WHERE target.scope_key=? AND target.job_id=?
+                  AND target.status IN ('Received','Acked') AND target.cancel_requested=0
+                  AND EXISTS (
+                    SELECT 1 FROM backend_sessions backend_session
+                    WHERE backend_session.scope_key=target.scope_key
+                      AND backend_session.backend=?
+                      AND backend_session.session_key=target.session_key
+                      AND backend_session.thread_id IS NOT NULL
+                      AND backend_session.active_job_id IS NULL
+                      AND backend_session.recovery_required=0
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM jobs active
+                    WHERE active.scope_key=target.scope_key
+                      AND active.session_key=target.session_key
+                      AND active.job_id<>target.job_id
+                      AND active.status IN ('Dispatching','Running','Cancelling')
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM session_quarantine q
+                    WHERE q.scope_key=target.scope_key AND q.session_key=target.session_key
+                  )`)
+        .run(connectorId, leaseId, now, this.scopeKey, jobId, backend);
+      if (claimed.changes !== 1) return false;
+
+      const attempt = this.database
+        .query<{ session_key: string; run_generation: number }, [string, string, string]>(
+          `SELECT session_key,run_generation FROM jobs
+           WHERE scope_key=? AND job_id=? AND lease_id=? AND status='Dispatching'`,
+        )
+        .get(this.scopeKey, jobId, leaseId);
+      if (!attempt) throw new Error("backend dispatch claim 未能读回当前 attempt");
+      const reserved = this.database
+        .query(`UPDATE backend_sessions
+                SET active_job_id=?, active_lease_id=?, active_run_generation=?, updated_at=?
+                WHERE scope_key=? AND backend=? AND session_key=?
+                  AND thread_id IS NOT NULL AND active_job_id IS NULL
+                  AND recovery_required=0`)
+        .run(
+          jobId,
+          leaseId,
+          attempt.run_generation,
+          now,
+          this.scopeKey,
+          backend,
+          attempt.session_key,
+        );
+      if (reserved.changes !== 1) {
+        throw new Error("backend session attempt reservation 与 job claim 不一致");
+      }
+      return true;
+    });
+    return transaction.immediate() ? this.require(jobId) : null;
+  }
+
+  resetUnsentBackendDispatch(
+    jobId: string,
+    backend: string,
+    leaseId: string,
+    runGeneration: number,
+  ): boolean {
+    const now = Date.now();
+    const transaction = this.database.transaction(() => {
+      const reset = this.database
+        .query(`UPDATE jobs
+                SET status='Acked', connector_id=NULL, lease_id=NULL, updated_at=?
+                WHERE scope_key=? AND job_id=? AND status='Dispatching'
+                  AND lease_id=? AND run_generation=?
+                  AND EXISTS (
+                    SELECT 1 FROM backend_sessions backend_session
+                    WHERE backend_session.scope_key=jobs.scope_key
+                      AND backend_session.backend=?
+                      AND backend_session.session_key=jobs.session_key
+                      AND backend_session.active_job_id=jobs.job_id
+                      AND backend_session.active_lease_id=?
+                      AND backend_session.active_run_generation=?
+                      AND backend_session.active_turn_id IS NULL
+                      AND backend_session.recovery_required=0
+                  )`)
+        .run(
+          now,
+          this.scopeKey,
+          jobId,
+          leaseId,
+          runGeneration,
+          backend,
+          leaseId,
+          runGeneration,
+        );
+      if (reset.changes !== 1) return false;
+      const cleared = this.database
+        .query(`UPDATE backend_sessions
+                SET active_job_id=NULL, active_lease_id=NULL,
+                    active_run_generation=NULL, active_turn_id=NULL, updated_at=?
+                WHERE scope_key=? AND backend=? AND active_job_id=?
+                  AND active_lease_id=? AND active_run_generation=?
+                  AND active_turn_id IS NULL AND recovery_required=0`)
+        .run(now, this.scopeKey, backend, jobId, leaseId, runGeneration);
+      if (cleared.changes !== 1) {
+        throw new Error("backend unsent reset 未能原子清除 session attempt");
+      }
+      return true;
+    });
+    return transaction.immediate();
+  }
+
+  finishUnsentBackendCancellation(
+    jobId: string,
+    backend: string,
+    leaseId: string,
+    runGeneration: number,
+  ): StoredJob | null {
+    const now = Date.now();
+    const transaction = this.database.transaction(() => {
+      const cancelled = this.database
+        .query(`UPDATE jobs
+                SET status='Cancelled', completed_at=?, updated_at=?
+                WHERE scope_key=? AND job_id=? AND status='Cancelling'
+                  AND cancel_requested=1 AND lease_id=? AND run_generation=?
+                  AND EXISTS (
+                    SELECT 1 FROM backend_sessions backend_session
+                    WHERE backend_session.scope_key=jobs.scope_key
+                      AND backend_session.backend=?
+                      AND backend_session.session_key=jobs.session_key
+                      AND backend_session.active_job_id=jobs.job_id
+                      AND backend_session.active_lease_id=?
+                      AND backend_session.active_run_generation=?
+                      AND backend_session.active_turn_id IS NULL
+                      AND backend_session.recovery_required=0
+                  )`)
+        .run(
+          now,
+          now,
+          this.scopeKey,
+          jobId,
+          leaseId,
+          runGeneration,
+          backend,
+          leaseId,
+          runGeneration,
+        );
+      if (cancelled.changes !== 1) return false;
+      const cleared = this.database
+        .query(`UPDATE backend_sessions
+                SET active_job_id=NULL, active_lease_id=NULL,
+                    active_run_generation=NULL, active_turn_id=NULL, updated_at=?
+                WHERE scope_key=? AND backend=? AND active_job_id=?
+                  AND active_lease_id=? AND active_run_generation=?
+                  AND active_turn_id IS NULL AND recovery_required=0`)
+        .run(now, this.scopeKey, backend, jobId, leaseId, runGeneration);
+      if (cleared.changes !== 1) {
+        throw new Error("backend unsent cancellation 未能原子清除 session attempt");
+      }
+      return true;
+    });
+    return transaction.immediate() ? this.require(jobId) : null;
+  }
+
+  /** turn/start 返回 turnId 后，和 Running 状态在同一事务提交。 */
+  markBackendRunning(
+    jobId: string,
+    backend: string,
+    leaseId: string,
+    runGeneration: number,
+    turnId: string,
+  ): StoredJob | null {
+    const now = Date.now();
+    const transaction = this.database.transaction(() => {
+      const running = this.database
+        .query(`UPDATE jobs
+                SET status='Running', updated_at=?
+                WHERE scope_key=? AND job_id=? AND status='Dispatching'
+                  AND lease_id=? AND run_generation=? AND cancel_requested=0
+                  AND EXISTS (
+                    SELECT 1 FROM backend_sessions backend_session
+                    WHERE backend_session.scope_key=jobs.scope_key
+                      AND backend_session.backend=?
+                      AND backend_session.session_key=jobs.session_key
+                      AND backend_session.active_job_id=jobs.job_id
+                      AND backend_session.active_lease_id=?
+                      AND backend_session.active_run_generation=?
+                      AND backend_session.active_turn_id IS NULL
+                      AND backend_session.recovery_required=0
+                  )`)
+        .run(
+          now,
+          this.scopeKey,
+          jobId,
+          leaseId,
+          runGeneration,
+          backend,
+          leaseId,
+          runGeneration,
+        );
+      if (running.changes !== 1) {
+        const duplicate = this.database
+          .query<{ present: number }, [string, string, string, number, string, string, string]>(
+            `SELECT 1 AS present
+             FROM jobs
+             JOIN backend_sessions backend_session
+               ON backend_session.scope_key=jobs.scope_key
+              AND backend_session.session_key=jobs.session_key
+             WHERE jobs.scope_key=? AND jobs.job_id=? AND jobs.status='Running'
+               AND jobs.lease_id=? AND jobs.run_generation=?
+               AND backend_session.backend=?
+               AND backend_session.active_job_id=jobs.job_id
+               AND backend_session.active_lease_id=?
+               AND backend_session.active_run_generation=jobs.run_generation
+               AND backend_session.active_turn_id=?
+               AND backend_session.recovery_required=0`,
+          )
+          .get(this.scopeKey, jobId, leaseId, runGeneration, backend, leaseId, turnId);
+        return duplicate !== null;
+      }
+      const bound = this.database
+        .query(`UPDATE backend_sessions
+                SET active_turn_id=?, updated_at=?
+                WHERE scope_key=? AND backend=? AND active_job_id=?
+                  AND active_lease_id=? AND active_run_generation=?
+                  AND active_turn_id IS NULL AND recovery_required=0`)
+        .run(turnId, now, this.scopeKey, backend, jobId, leaseId, runGeneration);
+      if (bound.changes !== 1) {
+        throw new Error("backend turnId 与 Running 状态未能原子绑定");
+      }
+      return true;
+    });
+    return transaction.immediate() ? this.require(jobId) : null;
+  }
+
+  finishBackendSuccess(
+    jobId: string,
+    backend: string,
+    leaseId: string,
+    runGeneration: number,
+    turnId: string,
+    resultJson: string,
+  ): StoredJob | null {
+    return this.finishBackendWithOutbox(
+      jobId,
+      backend,
+      leaseId,
+      runGeneration,
+      turnId,
+      "Succeeded",
+      resultJson,
+      null,
+    );
+  }
+
+  finishBackendFailure(
+    jobId: string,
+    backend: string,
+    leaseId: string,
+    runGeneration: number,
+    turnId: string,
+    resultJson: string,
+    error: string,
+  ): StoredJob | null {
+    return this.finishBackendWithOutbox(
+      jobId,
+      backend,
+      leaseId,
+      runGeneration,
+      turnId,
+      "Failed",
+      resultJson,
+      error,
+    );
+  }
+
+  markBackendCancelUnknown(
+    jobId: string,
+    backend: string,
+    leaseId: string,
+    runGeneration: number,
+    turnId: string | null,
+    reason: string,
+  ): StoredJob | null {
+    return this.markBackendRecoveryTerminal(
+      jobId,
+      backend,
+      leaseId,
+      runGeneration,
+      turnId,
+      "CancelUnknown",
+      reason,
+    );
+  }
+
+  markBackendInterrupted(
+    jobId: string,
+    backend: string,
+    leaseId: string,
+    runGeneration: number,
+    turnId: string | null,
+    reason: string,
+  ): StoredJob | null {
+    return this.markBackendRecoveryTerminal(
+      jobId,
+      backend,
+      leaseId,
+      runGeneration,
+      turnId,
+      "Interrupted",
+      reason,
+    );
+  }
+
+  markBackendDisconnected(backend: string, connectorId: string, reason: string): number {
+    const now = Date.now();
+    const transaction = this.database.transaction(() => {
+      this.database
+        .query(`INSERT OR IGNORE INTO session_quarantine(
+                  scope_key,session_key,reason,created_at
+                )
+                SELECT jobs.scope_key,jobs.session_key,?,?
+                FROM jobs
+                JOIN backend_sessions backend_session
+                  ON backend_session.scope_key=jobs.scope_key
+                 AND backend_session.backend=?
+                 AND backend_session.session_key=jobs.session_key
+                 AND backend_session.active_job_id=jobs.job_id
+                 AND backend_session.active_lease_id=jobs.lease_id
+                 AND backend_session.active_run_generation=jobs.run_generation
+                WHERE jobs.scope_key=? AND jobs.connector_id=?
+                  AND jobs.status IN ('Dispatching','Running','Cancelling')
+                  AND backend_session.recovery_required=0`)
+        .run(reason, now, backend, this.scopeKey, connectorId);
+      const marked = this.database
+        .query(`UPDATE backend_sessions
+                SET recovery_required=1, updated_at=?
+                WHERE scope_key=? AND backend=? AND recovery_required=0
+                  AND EXISTS (
+                    SELECT 1 FROM jobs
+                    WHERE jobs.scope_key=backend_sessions.scope_key
+                      AND jobs.session_key=backend_sessions.session_key
+                      AND jobs.job_id=backend_sessions.active_job_id
+                      AND jobs.lease_id=backend_sessions.active_lease_id
+                      AND jobs.run_generation=backend_sessions.active_run_generation
+                      AND jobs.connector_id=?
+                      AND jobs.status IN ('Dispatching','Running','Cancelling')
+                  )`)
+        .run(now, this.scopeKey, backend, connectorId);
+      const cancelUnknown = this.database
+        .query(`UPDATE jobs
+                SET status='CancelUnknown', cancel_requested=1,
+                    error=COALESCE(error,?), completed_at=?, updated_at=?
+                WHERE scope_key=? AND connector_id=? AND status='Cancelling'
+                  AND EXISTS (
+                    SELECT 1 FROM backend_sessions backend_session
+                    WHERE backend_session.scope_key=jobs.scope_key
+                      AND backend_session.backend=?
+                      AND backend_session.session_key=jobs.session_key
+                      AND backend_session.active_job_id=jobs.job_id
+                      AND backend_session.active_lease_id=jobs.lease_id
+                      AND backend_session.active_run_generation=jobs.run_generation
+                      AND backend_session.recovery_required=1
+                  )`)
+        .run(reason, now, now, this.scopeKey, connectorId, backend).changes;
+      const interrupted = this.database
+        .query(`UPDATE jobs
+                SET status='Interrupted', error=COALESCE(error,?),
+                    completed_at=?, updated_at=?
+                WHERE scope_key=? AND connector_id=?
+                  AND status IN ('Dispatching','Running')
+                  AND EXISTS (
+                    SELECT 1 FROM backend_sessions backend_session
+                    WHERE backend_session.scope_key=jobs.scope_key
+                      AND backend_session.backend=?
+                      AND backend_session.session_key=jobs.session_key
+                      AND backend_session.active_job_id=jobs.job_id
+                      AND backend_session.active_lease_id=jobs.lease_id
+                      AND backend_session.active_run_generation=jobs.run_generation
+                      AND backend_session.recovery_required=1
+                  )`)
+        .run(reason, now, now, this.scopeKey, connectorId, backend).changes;
+      const changed = cancelUnknown + interrupted;
+      if (marked.changes !== changed) {
+        throw new Error("backend disconnect 的 job 与 session recovery 数量不一致");
+      }
+      return changed;
+    });
+    return transaction.immediate();
+  }
+
+  releaseBackendSessionRecovery(backend: string, sessionKey: string): boolean {
+    const now = Date.now();
+    const transaction = this.database.transaction(() => {
+      const released = this.database
+        .query(`UPDATE backend_sessions
+                SET active_job_id=NULL, active_lease_id=NULL,
+                    active_run_generation=NULL, active_turn_id=NULL,
+                    recovery_required=0, updated_at=?
+                WHERE scope_key=? AND backend=? AND session_key=?
+                  AND recovery_required=1
+                  AND active_job_id IS NOT NULL
+                  AND EXISTS (
+                    SELECT 1 FROM jobs
+                    WHERE jobs.scope_key=backend_sessions.scope_key
+                      AND jobs.job_id=backend_sessions.active_job_id
+                      AND jobs.status IN (
+                        'Succeeded','Cancelled','CancelUnknown','Interrupted','Failed','Rejected'
+                      )
+                  )`)
+        .run(now, this.scopeKey, backend, sessionKey);
+      if (released.changes !== 1) return false;
+      this.database
+        .query("DELETE FROM session_quarantine WHERE scope_key=? AND session_key=?")
+        .run(this.scopeKey, sessionKey);
+      return true;
+    });
+    return transaction.immediate();
+  }
+
+  /**
+   * 离线人工释放 session 时以数据库中的历史 recovery 证据为准，而不是以
+   * 当前 config 选择的 backend 为准。这样从 Codex 切回 Hermes 也不能只删
+   * 通用 quarantine、遗留 active attempt 后绕过恢复所有权。
+   */
+  releaseSessionRecovery(sessionKey: string): boolean {
+    const now = Date.now();
+    const transaction = this.database.transaction(() => {
+      const recovery = this.database
+        .query<{ total: number; releasable: number }, [string, string]>(
+          `SELECT COUNT(*) AS total,
+                  COALESCE(SUM(CASE WHEN EXISTS (
+                    SELECT 1 FROM jobs
+                    WHERE jobs.scope_key=backend_sessions.scope_key
+                      AND jobs.job_id=backend_sessions.active_job_id
+                      AND jobs.status IN (
+                        'Succeeded','Cancelled','CancelUnknown','Interrupted','Failed','Rejected'
+                      )
+                  ) THEN 1 ELSE 0 END),0) AS releasable
+           FROM backend_sessions
+           WHERE scope_key=? AND session_key=? AND recovery_required=1`,
+        )
+        .get(this.scopeKey, sessionKey) ?? { total: 0, releasable: 0 };
+
+      if (recovery.total === 0) {
+        return this.database
+          .query("DELETE FROM session_quarantine WHERE scope_key=? AND session_key=?")
+          .run(this.scopeKey, sessionKey).changes === 1;
+      }
+      if (recovery.releasable !== recovery.total) return false;
+
+      const released = this.database
+        .query(`UPDATE backend_sessions
+                SET active_job_id=NULL, active_lease_id=NULL,
+                    active_run_generation=NULL, active_turn_id=NULL,
+                    recovery_required=0, updated_at=?
+                WHERE scope_key=? AND session_key=? AND recovery_required=1`)
+        .run(now, this.scopeKey, sessionKey);
+      if (released.changes !== recovery.total) {
+        throw new Error("session recovery 释放数量与已验证历史证据不一致");
+      }
+      this.database
+        .query("DELETE FROM session_quarantine WHERE scope_key=? AND session_key=?")
+        .run(this.scopeKey, sessionKey);
+      return true;
+    });
+    return transaction.immediate();
   }
 
   markAcked(jobId: string): StoredJob {
@@ -569,6 +1192,28 @@ export class JobStore {
       .map((row) => ({ sessionKey: row.session_key, reason: row.reason, createdAt: row.created_at }));
   }
 
+  getSessionQuarantine(
+    sessionKey: string,
+  ): { sessionKey: string; reason: string; createdAt: number } | null {
+    const row = this.database
+      .query<{ session_key: string; reason: string; created_at: number }, [string, string]>(
+        `SELECT session_key,reason,created_at FROM session_quarantine
+         WHERE scope_key=? AND session_key=?`,
+      )
+      .get(this.scopeKey, sessionKey);
+    return row
+      ? { sessionKey: row.session_key, reason: row.reason, createdAt: row.created_at }
+      : null;
+  }
+
+  quarantineSession(sessionKey: string, reason: string): boolean {
+    return this.database
+      .query(`INSERT OR IGNORE INTO session_quarantine(
+                scope_key,session_key,reason,created_at
+              ) VALUES(?,?,?,?)`)
+      .run(this.scopeKey, sessionKey, reason, Date.now()).changes === 1;
+  }
+
   releaseSessionQuarantine(sessionKey: string): boolean {
     return this.database
       .query("DELETE FROM session_quarantine WHERE scope_key=? AND session_key=?")
@@ -584,6 +1229,160 @@ export class JobStore {
     this.database
       .query("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
       .run(key, value);
+  }
+
+  private markBackendRecoveryTerminal(
+    jobId: string,
+    backend: string,
+    leaseId: string,
+    runGeneration: number,
+    turnId: string | null,
+    status: "CancelUnknown" | "Interrupted",
+    reason: string,
+  ): StoredJob | null {
+    const now = Date.now();
+    const transaction = this.database.transaction(() => {
+      const fromStatus = status === "CancelUnknown"
+        ? "status='Cancelling'"
+        : "status IN ('Dispatching','Running')";
+      const terminal = this.database
+        .query(`UPDATE jobs
+                SET status=?,
+                    cancel_requested=CASE WHEN ?='CancelUnknown' THEN 1 ELSE cancel_requested END,
+                    error=COALESCE(error,?),
+                    completed_at=?, updated_at=?
+                WHERE scope_key=? AND job_id=? AND ${fromStatus}
+                  AND lease_id=? AND run_generation=?
+                  AND EXISTS (
+                    SELECT 1 FROM backend_sessions backend_session
+                    WHERE backend_session.scope_key=jobs.scope_key
+                      AND backend_session.backend=?
+                      AND backend_session.session_key=jobs.session_key
+                      AND backend_session.active_job_id=jobs.job_id
+                      AND backend_session.active_lease_id=?
+                      AND backend_session.active_run_generation=?
+                      AND (
+                        backend_session.active_turn_id IS ?
+                        OR (
+                          backend_session.active_turn_id IS NULL
+                          AND ? IS NOT NULL
+                        )
+                      )
+                      AND backend_session.recovery_required=0
+                  )`)
+        .run(
+          status,
+          status,
+          reason,
+          now,
+          now,
+          this.scopeKey,
+          jobId,
+          leaseId,
+          runGeneration,
+          backend,
+          leaseId,
+          runGeneration,
+          turnId,
+          turnId,
+        );
+      if (terminal.changes !== 1) return false;
+      this.database
+        .query(`INSERT OR IGNORE INTO session_quarantine(
+                  scope_key,session_key,reason,created_at
+                )
+                SELECT scope_key,session_key,?,? FROM jobs
+                WHERE scope_key=? AND job_id=?`)
+        .run(reason, now, this.scopeKey, jobId);
+      const marked = this.database
+        .query(`UPDATE backend_sessions
+                SET active_turn_id=COALESCE(active_turn_id,?),
+                    recovery_required=1, updated_at=?
+                WHERE scope_key=? AND backend=? AND active_job_id=?
+                  AND active_lease_id=? AND active_run_generation=?
+                  AND (
+                    active_turn_id IS ?
+                    OR (active_turn_id IS NULL AND ? IS NOT NULL)
+                  )
+                  AND recovery_required=0`)
+        .run(
+          turnId,
+          now,
+          this.scopeKey,
+          backend,
+          jobId,
+          leaseId,
+          runGeneration,
+          turnId,
+          turnId,
+        );
+      if (marked.changes !== 1) {
+        throw new Error("backend terminal recovery 与 session quarantine 未能原子提交");
+      }
+      return true;
+    });
+    return transaction.immediate() ? this.require(jobId) : null;
+  }
+
+  private finishBackendWithOutbox(
+    jobId: string,
+    backend: string,
+    leaseId: string,
+    runGeneration: number,
+    turnId: string,
+    status: "Succeeded" | "Failed",
+    resultJson: string,
+    error: string | null,
+  ): StoredJob | null {
+    const now = Date.now();
+    const transaction = this.database.transaction(() => {
+      const finished = this.database
+        .query(`UPDATE jobs
+                SET status=?, error=?, completed_at=?, updated_at=?
+                WHERE scope_key=? AND job_id=? AND status='Running'
+                  AND lease_id=? AND run_generation=? AND cancel_requested=0
+                  AND EXISTS (
+                    SELECT 1 FROM backend_sessions backend_session
+                    WHERE backend_session.scope_key=jobs.scope_key
+                      AND backend_session.backend=?
+                      AND backend_session.session_key=jobs.session_key
+                      AND backend_session.active_job_id=jobs.job_id
+                      AND backend_session.active_lease_id=?
+                      AND backend_session.active_run_generation=?
+                      AND backend_session.active_turn_id=?
+                      AND backend_session.recovery_required=0
+                  )`)
+        .run(
+          status,
+          error,
+          now,
+          now,
+          this.scopeKey,
+          jobId,
+          leaseId,
+          runGeneration,
+          backend,
+          leaseId,
+          runGeneration,
+          turnId,
+        );
+      if (finished.changes !== 1) return false;
+      this.upsertOutbox(jobId, resultJson, now);
+      const cleared = this.database
+        .query(`UPDATE backend_sessions
+                SET active_job_id=NULL, active_lease_id=NULL,
+                    active_run_generation=NULL, active_turn_id=NULL,
+                    recovery_required=0, updated_at=?
+                WHERE scope_key=? AND backend=? AND active_job_id=?
+                  AND active_lease_id=? AND active_run_generation=?
+                  AND active_turn_id=? AND recovery_required=0`)
+        .run(now, this.scopeKey, backend, jobId, leaseId, runGeneration, turnId);
+      if (cleared.changes !== 1) {
+        throw new Error("backend terminal、outbox 与 session clear 未能原子提交");
+      }
+      return true;
+    });
+    return transaction.immediate() ? this.require(jobId) : null;
   }
 
   private finishWithOutbox(
@@ -702,10 +1501,11 @@ export class JobStore {
     const transaction = this.database.transaction(() => {
       const row = this.database.query<{ user_version: number }, []>("PRAGMA user_version").get();
       const version = row?.user_version ?? 0;
-      if (version !== 0 && version !== 1 && version !== 2 && version !== 3) {
+      if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4) {
         throw new Error(`不支持的数据库 schema 版本：${version}`);
       }
-      if (version === 3) {
+      if (version === 4) {
+        this.assertBackendSessionsSchemaV4();
         return;
       }
       if (version === 1) {
@@ -731,82 +1531,82 @@ export class JobStore {
           CREATE INDEX idx_outbox_delivery ON outbox(scope_key,status,next_attempt_at,updated_at);
           CREATE INDEX IF NOT EXISTS idx_pending_cancels_gc
             ON pending_cancels(created_at,scope_key,job_id);
-          PRAGMA user_version=3;
         `);
-        this.assertMigratedSchemaV3();
-        return;
       }
-      this.database.exec(`
-      CREATE TABLE meta (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-      CREATE TABLE jobs (
-        scope_key TEXT NOT NULL,
-        job_id TEXT NOT NULL,
-        msg_id TEXT NOT NULL,
-        payload_hash TEXT NOT NULL,
-        from_node_id TEXT NOT NULL,
-        from_node_type TEXT,
-        input_text TEXT NOT NULL,
-        raw_payload TEXT NOT NULL,
-        status TEXT NOT NULL,
-        session_key TEXT NOT NULL,
-        connector_id TEXT,
-        lease_id TEXT,
-        run_generation INTEGER NOT NULL DEFAULT 0,
-        error TEXT,
-        cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),
-        input_timestamp INTEGER NOT NULL,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        completed_at INTEGER,
-        PRIMARY KEY(scope_key,job_id)
-      );
-      CREATE TABLE outbox (
-        scope_key TEXT NOT NULL,
-        job_id TEXT NOT NULL,
-        status TEXT NOT NULL,
-        result_json TEXT NOT NULL,
-        retry_count INTEGER NOT NULL DEFAULT 0,
-        last_message_id TEXT,
-        next_attempt_at INTEGER,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        delivered_at INTEGER,
-        acked_at INTEGER,
-        PRIMARY KEY(scope_key,job_id),
-        FOREIGN KEY(scope_key,job_id) REFERENCES jobs(scope_key,job_id) ON DELETE CASCADE
-      );
-      CREATE TABLE outbox_delivery_attempts (
-        scope_key TEXT NOT NULL,
-        message_id TEXT NOT NULL,
-        job_id TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        PRIMARY KEY(scope_key,message_id),
-        FOREIGN KEY(scope_key,job_id) REFERENCES outbox(scope_key,job_id) ON DELETE CASCADE
-      );
-      CREATE TABLE session_quarantine (
-        scope_key TEXT NOT NULL,
-        session_key TEXT NOT NULL,
-        reason TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        PRIMARY KEY(scope_key,session_key)
-      );
-      CREATE TABLE pending_cancels (
-        scope_key TEXT NOT NULL,
-        job_id TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        PRIMARY KEY(scope_key,job_id)
-      );
-      CREATE INDEX idx_jobs_dispatch ON jobs(scope_key,status,cancel_requested,session_key,created_at);
-      CREATE INDEX idx_jobs_connector ON jobs(scope_key,connector_id,status);
-      CREATE INDEX idx_outbox_delivery ON outbox(scope_key,status,next_attempt_at,updated_at);
-      CREATE INDEX idx_outbox_attempt_job ON outbox_delivery_attempts(scope_key,job_id);
-      CREATE INDEX idx_pending_cancels_gc ON pending_cancels(created_at,scope_key,job_id);
-      PRAGMA user_version=3;
-      `);
-      this.assertMigratedSchemaV3();
+      if (version === 0) {
+        this.database.exec(`
+        CREATE TABLE meta (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+        CREATE TABLE jobs (
+          scope_key TEXT NOT NULL,
+          job_id TEXT NOT NULL,
+          msg_id TEXT NOT NULL,
+          payload_hash TEXT NOT NULL,
+          from_node_id TEXT NOT NULL,
+          from_node_type TEXT,
+          input_text TEXT NOT NULL,
+          raw_payload TEXT NOT NULL,
+          status TEXT NOT NULL,
+          session_key TEXT NOT NULL,
+          connector_id TEXT,
+          lease_id TEXT,
+          run_generation INTEGER NOT NULL DEFAULT 0,
+          error TEXT,
+          cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),
+          input_timestamp INTEGER NOT NULL,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          completed_at INTEGER,
+          PRIMARY KEY(scope_key,job_id)
+        );
+        CREATE TABLE outbox (
+          scope_key TEXT NOT NULL,
+          job_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          result_json TEXT NOT NULL,
+          retry_count INTEGER NOT NULL DEFAULT 0,
+          last_message_id TEXT,
+          next_attempt_at INTEGER,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          delivered_at INTEGER,
+          acked_at INTEGER,
+          PRIMARY KEY(scope_key,job_id),
+          FOREIGN KEY(scope_key,job_id) REFERENCES jobs(scope_key,job_id) ON DELETE CASCADE
+        );
+        CREATE TABLE outbox_delivery_attempts (
+          scope_key TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          job_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY(scope_key,message_id),
+          FOREIGN KEY(scope_key,job_id) REFERENCES outbox(scope_key,job_id) ON DELETE CASCADE
+        );
+        CREATE TABLE session_quarantine (
+          scope_key TEXT NOT NULL,
+          session_key TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY(scope_key,session_key)
+        );
+        CREATE TABLE pending_cancels (
+          scope_key TEXT NOT NULL,
+          job_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY(scope_key,job_id)
+        );
+        CREATE INDEX idx_jobs_dispatch ON jobs(scope_key,status,cancel_requested,session_key,created_at);
+        CREATE INDEX idx_jobs_connector ON jobs(scope_key,connector_id,status);
+        CREATE INDEX idx_outbox_delivery ON outbox(scope_key,status,next_attempt_at,updated_at);
+        CREATE INDEX idx_outbox_attempt_job ON outbox_delivery_attempts(scope_key,job_id);
+        CREATE INDEX idx_pending_cancels_gc ON pending_cancels(created_at,scope_key,job_id);
+        `);
+      }
+      this.createBackendSessionsSchemaV4();
+      this.database.exec("PRAGMA user_version=4;");
+      this.assertMigratedSchemaV4();
     });
     // 先取得 RESERVED 写锁，再读取 user_version。两个 opener 因而不会
     // 同时基于旧版本作迁移裁决；回调抛错时 Bun 会回滚全部 DDL/DML。
@@ -814,14 +1614,87 @@ export class JobStore {
     transaction.immediate();
   }
 
-  private assertMigratedSchemaV3(): void {
+  private createBackendSessionsSchemaV4(): void {
+    this.database.exec(`
+      CREATE TABLE backend_sessions (
+        scope_key TEXT NOT NULL,
+        backend TEXT NOT NULL CHECK(length(backend) BETWEEN 1 AND 32),
+        session_key TEXT NOT NULL,
+        session_hash TEXT NOT NULL
+          CHECK(length(session_hash)=64 AND session_hash NOT GLOB '*[^0-9a-f]*'),
+        thread_id TEXT CHECK(thread_id IS NULL OR length(thread_id) BETWEEN 1 AND 256),
+        cwd TEXT NOT NULL CHECK(length(cwd) BETWEEN 1 AND 4096),
+        cli_version TEXT NOT NULL CHECK(length(cli_version) BETWEEN 1 AND 64),
+        active_job_id TEXT,
+        active_lease_id TEXT,
+        active_run_generation INTEGER,
+        active_turn_id TEXT
+          CHECK(active_turn_id IS NULL OR length(active_turn_id) BETWEEN 1 AND 256),
+        recovery_required INTEGER NOT NULL DEFAULT 0
+          CHECK(recovery_required IN (0,1)),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(scope_key,backend,session_key),
+        FOREIGN KEY(scope_key,active_job_id)
+          REFERENCES jobs(scope_key,job_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+        CHECK(thread_id IS NOT NULL OR active_job_id IS NULL),
+        CHECK(
+          (active_job_id IS NULL AND active_lease_id IS NULL
+            AND active_run_generation IS NULL AND active_turn_id IS NULL)
+          OR
+          (active_job_id IS NOT NULL AND active_lease_id IS NOT NULL
+            AND active_run_generation IS NOT NULL AND active_run_generation > 0)
+        ),
+        CHECK(recovery_required=0 OR active_job_id IS NOT NULL)
+      );
+      CREATE UNIQUE INDEX idx_backend_sessions_hash
+        ON backend_sessions(session_hash);
+      CREATE UNIQUE INDEX idx_backend_sessions_cwd
+        ON backend_sessions(cwd);
+      CREATE UNIQUE INDEX idx_backend_sessions_thread
+        ON backend_sessions(backend,thread_id) WHERE thread_id IS NOT NULL;
+      CREATE UNIQUE INDEX idx_backend_sessions_active_job
+        ON backend_sessions(scope_key,active_job_id) WHERE active_job_id IS NOT NULL;
+      CREATE INDEX idx_backend_sessions_recovery
+        ON backend_sessions(scope_key,recovery_required,updated_at);
+    `);
+  }
+
+  private assertBackendSessionsSchemaV4(): void {
+    const columns = this.database
+      .query<{ name: string }, []>("PRAGMA table_info(backend_sessions)")
+      .all()
+      .map((column) => column.name);
+    const expected = [
+      "scope_key",
+      "backend",
+      "session_key",
+      "session_hash",
+      "thread_id",
+      "cwd",
+      "cli_version",
+      "active_job_id",
+      "active_lease_id",
+      "active_run_generation",
+      "active_turn_id",
+      "recovery_required",
+      "created_at",
+      "updated_at",
+    ];
+    if (columns.length !== expected.length || expected.some((column) => !columns.includes(column))) {
+      throw new Error("SQLite v4 backend_sessions schema 不完整");
+    }
+  }
+
+  private assertMigratedSchemaV4(): void {
     const integrity = this.database.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get();
     if (integrity?.integrity_check !== "ok") {
-      throw new Error(`SQLite v3 迁移完整性检查失败：${integrity?.integrity_check ?? "unknown"}`);
+      throw new Error(`SQLite v4 迁移完整性检查失败：${integrity?.integrity_check ?? "unknown"}`);
     }
     const foreignKeyViolations = this.database.query<Record<string, unknown>, []>("PRAGMA foreign_key_check").all();
     if (foreignKeyViolations.length > 0) {
-      throw new Error(`SQLite v3 迁移外键检查失败：${JSON.stringify(foreignKeyViolations)}`);
+      throw new Error(`SQLite v4 迁移外键检查失败：${JSON.stringify(foreignKeyViolations)}`);
     }
+    this.assertBackendSessionsSchemaV4();
   }
 }

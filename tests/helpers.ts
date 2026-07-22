@@ -34,6 +34,9 @@ export function testConfig(stateDir: string): RelayConfig {
       reconnectMaxMs: 1000,
       maxFrameBytes: 1024 * 1024,
     },
+    execution: {
+      backend: "hermes",
+    },
     connector: {
       socketPath: join(stateDir, "connector.sock"),
       helloTimeoutMs: 500,
@@ -55,6 +58,13 @@ export function testConfig(stateDir: string): RelayConfig {
       bridgeImplementation: "livis-hermes-bridge",
       bridgeMinimumVersion: "0.1.0",
       bridgeMaximumExclusiveVersion: "0.2.0",
+    },
+    codex: {
+      command: "codex",
+      model: null,
+      requestTimeoutMs: 30_000,
+      shutdownTimeoutMs: 5_000,
+      acknowledgeRemoteExecution: false,
     },
   };
 }

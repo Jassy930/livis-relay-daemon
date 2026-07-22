@@ -25,16 +25,20 @@ bun run src/index.ts init \
 
 `init` 会把已审核 LiViS profile 复制到 state directory，并把该文件的 SHA-256 固定到配置。它不会登录、绑定或启动服务。
 
-已有 schema v1 部署必须按[protocol profile v1→v2 迁移 runbook](UPSTREAM-UPGRADE.md#现有部署的-protocol-profile-schema-v1v2-迁移)处理：先确认 connector socket 父目录是 state directory 内的私有非 symlink 目录，再停止 daemon/Hermes 并禁用服务管理器自动拉起，执行零写入 dry-run，最后显式 apply。命令会保存原 config/profile 和 PREPARED receipt，以 config durable rename 为 apply 唯一提交点，隔离旧/新 supported proof，且不触碰 SQLite。迁移后必须重新执行 `upstream check` 与 `doctor --online` 才能启动；回滚 v1 后必须切回旧 daemon 并重新生成 proof，不得旁路校验。
+已有 schema v1 部署必须按[protocol profile v1→v2 迁移 runbook](UPSTREAM-UPGRADE.md#现有部署的-protocol-profile-schema-v1v2-迁移)处理：先确认 connector socket 父目录是 state directory 内的私有非 symlink 目录，再停止 daemon；Hermes 模式还要停止 Gateway，并禁用服务管理器自动拉起。执行零写入 dry-run 后才可显式 apply。命令会保存原 config/profile 和 PREPARED receipt，以 config durable rename 为 apply 唯一提交点，隔离旧/新 supported proof，且不触碰 SQLite。迁移后必须重新执行 `upstream check` 与 `doctor --online` 才能启动；回滚 v1 后必须切回旧 daemon 并重新生成 proof，不得旁路校验。
 
 随后编辑配置：
 
 - 保持 `security.allowAllNodes=false`。
 - 将唯一获准且稳定的 LiViS `node_id` 作为 `security.allowedNodeIds` 的唯一元素；不要填写多个值。
 - `relay.maxFrameBytes` 控制远端 WebSocket 完整消息的 UTF-8 字节上限；默认 1048576，允许范围为 1 到 16777216。旧配置不含该字段时自动采用默认值。
-- 不扩大 Hermes 审核版本范围，除非已按升级 runbook 验证。
+- `execution.backend` 缺省为 `hermes`；不要仅因为配置中存在 `codex` 段就认为已经启用。
+- Hermes 模式不扩大 runtime/bridge 审核范围，除非已按升级 runbook 验证。
+- Codex 模式必须保持唯一 node allowlist、CLI `[0.145.0, 0.146.0)` 版本窗，并在审阅
+  [Codex app-server 执行后端](CODEX-APPSERVER.md)后显式设置
+  `codex.acknowledgeRemoteExecution=true`。Claude Code 当前不可选。
 
-一期暂将 `node_id` 视为设备来源标识，一套 daemon、config、state directory 和专用 Hermes profile 只支持该一个设备。配置解析器仍接受数组是格式兼容，不代表支持多设备；不得通过追加第二个 ID、开启 `allowAllNodes` 或直接替换原 ID 来接入另一设备。设备更换、跨设备会话和旧状态迁移均需另行设计与验收。
+一期暂将 `node_id` 视为设备来源标识，一套 daemon、config、state directory 和所选 backend 只支持该一个设备。配置解析器接受数组是格式兼容，不代表支持多设备；Codex 模式还会在代码级拒绝 `allowAllNodes=true` 或非单元素 allowlist，并把唯一 node ID 纳入 immutable session hash。不得通过追加第二个 ID、开启 `allowAllNodes` 或直接替换原 ID 来接入另一设备；原地换设备会拒绝复用旧 Codex thread。设备更换、跨设备会话和旧状态迁移均需另行设计与验收。
 
 ## 4. 生成近期 upstream 证明
 
@@ -65,7 +69,7 @@ bun run src/index.ts login
 
 ### 安全登出与账号边界
 
-`logout` 只负责向 IDaaS 撤销 refresh token 并在远端返回 2xx 后清除本地副本；它不是运行中 daemon 的控制通道。执行前应确认没有活跃 job 或待投递结果，再停止专用 Hermes Gateway 和 `livis-relayd`：
+`logout` 只负责向 IDaaS 撤销 refresh token 并在远端返回 2xx 后清除本地副本；它不是运行中 daemon 的控制通道。执行前应确认没有活跃 job 或待投递结果，再停止 `livis-relayd`；Hermes 模式还须先停止专用 Gateway：
 
 ```bash
 bun run src/index.ts logout
@@ -75,7 +79,12 @@ bun run src/index.ts logout
 
 一期尚未把 OAuth 账号 subject 与 `identity.json`、SQLite job/outbox 做持久化绑定，因此不支持在同一个 state directory 中直接切换账号。需要使用另一账号时，应使用独立配置和独立 state directory；不得用 `login --force` 覆盖原账号 token 后继续复用旧 outbox。
 
-## 6. 安装 Hermes plugin
+## 6. 准备执行后端
+
+一套 daemon 只能选择一个 backend。默认 Hermes 的运维步骤见 6.1；显式 Codex 的
+私有登录与目录步骤见 6.2。两者不能同时启动，也不能共享会话或工作区。
+
+### 6.1 安装 Hermes plugin
 
 先创建不复制默认凭据、skills、会话或 Gateway 状态的隔离 profile：
 
@@ -230,11 +239,70 @@ gateway:
 
 该目录不是 wheel，也不能直接通过 monorepo 根执行 `hermes plugins install owner/repo`；开发、升级和卸载边界见 [`hermes-plugin/README.md`](../hermes-plugin/README.md)。
 
+### 6.2 登录并启用 Codex app-server
+
+Codex 是 daemon 内部子进程，不安装 Hermes plugin，也不启动 Hermes Gateway。先确认
+CLI 版本位于 `[0.145.0, 0.146.0)`，并记录绝对路径：
+
+```bash
+command -v codex
+/绝对路径/codex --version
+```
+
+不得复用用户日常的 `~/.codex`。初始化 LiViS 配置后，在可信本地终端为 state
+directory 下的专用 `CODEX_HOME` 登录。macOS 默认目录示例：
+
+```bash
+STATE_DIR="$HOME/.livis-relay"
+CODEX_HOME="$STATE_DIR/backends/codex/home"
+
+test -d "$STATE_DIR" && ! test -L "$STATE_DIR"
+test "$(cd "$STATE_DIR" && pwd -P)" = "$STATE_DIR"
+test "$(stat -f '%Lp' "$STATE_DIR")" = 700
+install -d -m 0700 "$CODEX_HOME"
+
+env CODEX_HOME="$CODEX_HOME" /绝对路径/codex login --device-auth
+env CODEX_HOME="$CODEX_HOME" /绝对路径/codex login status
+```
+
+Linux 将权限检查替换为 `stat -c '%a'`。API key 登录只能从标准输入交给
+`codex login --with-api-key`，不得写入 argv、config、日志或 shell history。不要手写
+`<stateDir>/backends/codex/home/config.toml`；daemon 会生成固定安全配置并在每次执行前
+读回，已有内容不一致时失败关闭。
+
+随后在 config 中显式选择 backend；`command` 应替换为刚才读回的绝对路径：
+
+```json
+{
+  "execution": {
+    "backend": "codex"
+  },
+  "codex": {
+    "command": "/绝对路径/codex",
+    "model": null,
+    "requestTimeoutMs": 30000,
+    "shutdownTimeoutMs": 5000,
+    "acknowledgeRemoteExecution": true
+  }
+}
+```
+
+只有在审阅 workspace 写权限、无工具网络、审批拒绝、terminal-only final、取消与
+quarantine 边界后才可把 acknowledgement 设为 `true`。Codex 模式代码级要求
+`security.allowAllNodes=false` 且 `security.allowedNodeIds` 恰好一个；唯一 node ID
+会绑定 immutable session hash，直接替换 ID 会拒绝复用旧 thread。
+
+`doctor --online` 应显示 `execution_backend=codex`、remote execution acknowledgement
+为 true、Codex 版本命中窗口、SQLite integrity 正常且无 quarantine。它不检查专用
+账号是否真的可创建 thread；最终还要由 `serve` 的 `account/read`、permission profile
+和 thread sandbox 回读共同放行。恶意凭据读取负向 canary 尚未完成，因此本模式当前
+只用于 Draft PR/受控开发，不得宣称生产上线。
+
 ## 7. 启动顺序
 
-1. 启动 `livis-relayd`。
-2. 启动专用 Hermes Gateway。
-3. 查看状态与日志。
+Hermes 模式：先启动 `livis-relayd`，再启动专用 Hermes Gateway。Codex 模式只启动
+`livis-relayd`；daemon 会自行创建/恢复 thread 并管理 app-server 子进程，不得另行
+常驻启动第二个 app-server。
 
 ```bash
 bun run src/index.ts serve
@@ -242,16 +310,24 @@ bun run src/index.ts status
 bun run src/index.ts doctor --online
 ```
 
+Codex 模式的 `status` 必须显示 `daemon.execution.kind=codex`、
+`daemon.execution.ready=true`、稳定 thread ID 和位于 state directory 内的 workspace；
+Hermes 模式则要求 connector ready。
+无论哪种模式，服务在线都不等于消息闭环。
+
 生产运行可参考：
 
 - `packaging/launchd/com.local.livis-relayd.plist.example`
 - `packaging/systemd/livis-relayd.service.example`
 
-替换模板中的绝对路径后再加载服务；daemon 和 Hermes Gateway 必须是两个独立服务。
+替换模板中的绝对路径后再加载服务。Hermes 模式下 daemon 和 Gateway 必须是两个
+独立服务；Codex 模式只加载 daemon 服务，并确保 `codex.command` 的绝对路径可执行。
 
 ### macOS LaunchAgent
 
-以下命令是获授权主机上的操作手册，不是本仓库验证流程的一部分。本次模板维护不会执行 `launchctl`，也不会安装、启动或停止用户服务。
+本节只适用于 Hermes backend 的双 LaunchAgent 部署。以下命令是获授权主机上的操作
+手册，不是本仓库验证流程的一部分。本次模板维护不会执行 `launchctl`，也不会安装、
+启动或停止用户服务。
 
 #### 7.1 部署边界与稳定 checkout
 
@@ -281,7 +357,7 @@ bun run check
 - active protocol profile 是当前支持的 schema v2，supported proof 未过期；
 - Hermes runtime 固定在 `[0.15.1, 0.15.2)`，bridge 固定在配置允许范围；未知版本保持失败关闭；
 - state directory 位于仓库外并为 `0700`，config、proof、token 与数据库文件不进入部署 checkout；
-- 若旧 `relay.db` 尚未由当前代码打开，先按第 8 节停服备份，再允许 JobStore v3 自动迁移。
+- 若旧 `relay.db` 尚未由当前代码打开，先按第 8 节停服备份，再允许 JobStore v4 自动迁移。
 
 #### 7.2 安装 Relay 与 Hermes LaunchAgent
 
@@ -1029,7 +1105,7 @@ Hermes 的 stdout/stderr 路径以 runtime 生成的 plist 为准，先用 `plut
 升级必须在停服窗口完成：
 
 1. 按 Hermes → Relay 顺序停止两个 LaunchAgent，并确认 label 均不再运行。
-2. 完整备份 state directory；JobStore v3 场景必须包含 `relay.db`、WAL 和 SHM。备份前不要运行会打开数据库的新版 `serve`、`doctor` 或 `session release`。
+2. 完整备份 state directory；JobStore v4 场景必须包含 `relay.db`、WAL 和 SHM。备份前不要运行会打开数据库的新版 `serve`、`doctor` 或 `session release`。
 3. 在稳定 checkout 中获取并切换到精确已审阅提交，确认工作树干净，执行 `bun install --frozen-lockfile` 与 `bun run check`。
 4. 按第 6 节把当前提交中的 bridge 三个文件重新安装到隔离 Hermes profile；不要从 LiViS 通道执行 `/update`，也不要在其他 Gateway 运行期间执行未经评审的全局 Hermes 更新。
 5. 若 active protocol profile 仍为 schema v1，只能按升级 runbook 在停服状态执行 `profile migrate-v2` 并重新生成 proof；普通 `upstream activate` 不能替代 schema migration，也不得由 launchd 自动猜测或旁路迁移。
@@ -1077,19 +1153,19 @@ bun run src/index.ts doctor --online --config "$CONFIG"
 
 普通回滚只恢复 `profile` 与 `profileSha256`，不会恢复 relay、security、Hermes、connector 或 stateDir 等其他字段；旧 profile 无法重新得到 current supported proof 时不得启动。schema v1→v2 migration 的回滚是另一套 `profile rollback-migration` 状态机，不能混用普通 activation 备份。
 
-回滚到不认识 JobStore v3 的旧 daemon 时，必须同时恢复升级前的完整数据库备份；只切回 checkout 或只回滚 protocol profile 都不安全。Hermes runtime 或 bridge 变更后仍须保持 `[0.15.1, 0.15.2)` 的 fail-closed 支持窗，除非独立升级评审已经修改代码、配置和 canary 证据。
+回滚到不认识 JobStore v4 的旧 daemon 时，必须同时恢复升级前的完整数据库备份；只切回 checkout 或只回滚 protocol profile 都不安全。Hermes runtime 或 bridge 变更后仍须保持 `[0.15.1, 0.15.2)` 的 fail-closed 支持窗，除非独立升级评审已经修改代码、配置和 canary 证据。
 
 #### 7.6 分层验收
 
 验收必须分层记录，不能用前一层替代后一层：
 
 1. **静态部署**：两个 plist 均通过 `plutil -lint`，绝对路径存在，无占位符或秘密，稳定 checkout 精确命中已审阅提交。
-2. **服务与连接就绪**：两个独立 label 正常；`bun run src/index.ts doctor --online` 和 `status` 显示当前 protocol profile v2、wire revision/mode、未过期 proof、Relay handshake、connector ready、JobStore v3 integrity 及无意外 quarantine。
+2. **服务与连接就绪**：两个独立 label 正常；`bun run src/index.ts doctor --online` 和 `status` 显示当前 protocol profile v2、wire revision/mode、未过期 proof、Relay handshake、connector ready、JobStore v4 integrity 及无意外 quarantine。
 3. **真实消息闭环**：从唯一获准设备发送带随机后缀的单条纯文本 canary，App 收到预期纯文本；同一 job 在 daemon 中为 `Succeeded`，outbox 为 `Delivered`，Hermes 日志存在对应 inbound/response，且没有第二 final、fallback send 或权限错误。
 
 “LaunchAgent 已加载”“服务在线”“Relay 已握手”或“connector ready”都不等于消息闭环。只有第 3 层在精确部署提交、profile、Hermes 0.15.1/bridge 版本和时间上留下脱敏记录后，才能写成 launchd canary 通过；未执行时必须明确写“未验证”。
 
-## 8. 结果 ACK 退避与 JobStore v3 升级
+## 8. 结果 ACK 退避与 JobStore v4 升级
 
 `status` 中的 `recentJobs[].outboxStatus=AckFailed` 表示结果在当前 ACK 快速重试
 周期耗尽后进入持久化退避；`outboxNextAttemptAt` 是下一次尝试的 Unix 毫秒时间。
@@ -1097,21 +1173,24 @@ bun run src/index.ts doctor --online --config "$CONFIG"
 直接收敛为 `Delivered`。
 
 本版本第一次由 `serve`、`doctor` 或 `session release` 打开旧 `relay.db` 时，会把
-JobStore schema v1/v2 自动升级为 v3。迁移在同一个 SQLite `BEGIN IMMEDIATE`
-事务中取得写锁后读取版本，并在提交前运行 integrity 与 foreign-key 检查；失败会
-保留原版本，不允许半迁移状态继续运行。部署步骤固定为：
+JobStore schema v1/v2/v3 自动升级为 v4；fresh 数据库直接创建为 v4。v3 已有的
+outbox 退避语义保持不变，v4 新增 `backend_sessions`，保存 Codex thread/cwd/version
+和 active job/lease/generation/turn recovery 证据。迁移在同一个 SQLite
+`BEGIN IMMEDIATE` 事务中取得写锁后读取版本，并在提交前运行 integrity 与
+foreign-key 检查；失败会保留原版本，不允许半迁移状态继续运行。部署步骤固定为：
 
-1. 停止 `livis-relayd` 与专用 Hermes Gateway，并禁用服务管理器自动拉起。
+1. 停止 `livis-relayd` 并禁用服务管理器自动拉起；Hermes 模式同时停止专用 Gateway，
+   Codex 模式确认 app-server 及其工具子进程均已退出。
 2. 完整备份 state directory，包括 `relay.db`、`relay.db-wal` 和
    `relay.db-shm`（若存在）；备份完成前不要运行上述任何会打开 JobStore 的命令。
 3. 使用新版本启动一次 daemon，再运行 `status` 与 `doctor --online`，确认 SQLite
-   integrity、Relay、connector 和 upstream proof 均正常。
+   integrity、Relay、所选 execution backend 和 upstream proof 均正常。
 
-JobStore v3 与 protocol profile schema v1→v2 是两条独立迁移：profile 命令明确
+JobStore v4 与 protocol profile schema v1→v2 是两条独立迁移：profile 命令明确
 不打开 SQLite，也不会升级或回滚 `relay.db`。如果一次部署同时执行两者，应在两项
-操作之前统一停服并备份整个 state directory。旧版 daemon 不认识 JobStore v3；
+操作之前统一停服并备份整个 state directory。旧版 daemon 不认识 JobStore v4；
 回滚程序或把 profile 回滚到 v1 时，仍必须同时恢复升级前的数据库备份，不能让旧版
-直接打开 v3 数据库。
+直接打开 v4 数据库。
 
 - 不要删除 `relay.db`，也不要重跑 Agent job；结果投递本来就是至少一次语义，手工
   重跑会扩大业务副作用。
@@ -1120,10 +1199,13 @@ JobStore v3 与 protocol profile schema v1→v2 是两条独立迁移：profile 
 
 ## 9. Session 隔离恢复
 
-看到 `CancelUnknown` 后：
+看到 `CancelUnknown`、`Interrupted` 对应的 session quarantine，或 Codex
+`backend_sessions.recovery_required` 后：
 
-1. 停止并重启专用 Hermes Gateway。
-2. 确认旧工具/子进程已经退出。
+1. 停止 daemon；Hermes 模式停止并重启专用 Gateway，Codex 模式确认旧 app-server
+   与全部工具子进程已经退出。
+2. 结合日志和外部系统检查可能已经发生的副作用；`turn/interrupt` 或 `/stop` 成功
+   都不能替代这一步。
 3. 从 `status` 查到隔离的 `sessionKey`。
 4. 执行：
 
@@ -1131,7 +1213,10 @@ JobStore v3 与 protocol profile schema v1→v2 是两条独立迁移：profile 
 bun run src/index.ts session release '<sessionKey>'
 ```
 
-不得只为清除状态而跳过前两步。
+`session release` 只清除已经落入终态的 recovery/active attempt 证据与对应
+quarantine，不会回滚文件或外部系统副作用，也不会删除 Codex thread。不得只为清除
+状态而跳过前两步；release 后必须再运行 `doctor --online`，确认无 quarantine 才能
+重启 daemon。
 
 ## 10. Relay 资源边界告警
 

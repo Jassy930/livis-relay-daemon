@@ -14,29 +14,60 @@
 ## 一期强制默认值
 
 - `allowAllNodes=false`；进入 `serve` 或实网 canary 前，`security.allowedNodeIds` 必须恰好包含一个获准 `node_id`。
+- `execution.backend` 缺省为 `hermes`。切换为 `codex` 时，代码会拒绝
+  `allowAllNodes=true` 或不等于一个元素的 `allowedNodeIds`，并且还必须显式设置
+  `codex.acknowledgeRemoteExecution=true`。
 - `LIVIS_ALLOW_ALL_USERS` 必须为空/false；`LIVIS_ALLOWED_USERS` 必须只包含与 daemon 完全相同的唯一 `node_id`，`*` 和多个值都不属于一期受支持配置。
 - `LIVIS_PHASE1_READ_ONLY_ACK=true` 只在专用 Hermes profile 已关闭写工具后设置。
 - Hermes streaming、tool progress、interim message、附件和远程审批全部关闭。
 - Hermes runtime 审核范围默认是 `[0.15.1, 0.15.2)`；bridge 范围是 `[0.1.0, 0.2.0)`。
+- Codex CLI 审核范围固定为 `[0.145.0, 0.146.0)`；必须使用 daemon state
+  directory 内单独登录的 `CODEX_HOME`，不得复用 `~/.codex`。
 - 未知版本、哈希、wire protocol 或运行契约变化 fail closed。
 
 ## 设备来源边界
 
 一期暂将 `from_node_id` 视为设备来源标识，但该值不是账号 subject，也不构成密码学设备认证。配置结构接受数组和逗号列表只是为了兼容现有格式，不表示多设备拓扑已经设计、验证或受到支持。
 
-一套 daemon、config、state directory 与专用 Hermes profile 只能绑定一个来源设备。不得同时放行第二个 `node_id`，不得在同一状态目录中原地替换 `node_id`，也不得假设不同设备可以继承同一个 Hermes session、job、quarantine 或 outbox。设备更换和多设备支持必须先定义上游 ID 稳定性、账号绑定、状态迁移、回滚与真实设备 canary，再作为独立方案评审。
+一套 daemon、config、state directory 与所选 execution backend 只能绑定一个来源设备。不得同时放行第二个 `node_id`，不得在同一状态目录中原地替换 `node_id`，也不得假设不同设备可以继承同一个 backend session、job、quarantine 或 outbox。Codex 的 immutable session hash 会绑定唯一 node ID，原地换设备必须因 metadata 冲突拒绝复用旧 thread。设备更换和多设备支持必须先定义上游 ID 稳定性、账号绑定、状态迁移、回滚与真实设备 canary，再作为独立方案评审。
 
-当前版本尚未在 daemon 与 Hermes 两侧把“恰好一个 ID”实现为代码级硬门禁：解析器仍接受多值配置，运行前必须人工读回双侧 allowlist。该残余意味着文档只定义受支持拓扑，不能被表述为已完成逐帧设备认证；尤其 `cancel_chat` 只有 `job_id`、没有来源 `node_id`，其身份边界仍依赖已建立的 Relay 连接和一期单设备部署约束。
+Codex 模式已经在 daemon 代码级硬门禁“恰好一个 ID”，Hermes plugin 的双侧 allowlist 仍需运行前人工读回一致。两种模式都不能被表述为密码学逐帧设备认证；尤其 `cancel_chat` 只有 `job_id`、没有来源 `node_id`，其身份边界仍依赖已建立的 Relay 连接和一期单设备部署约束。
 
 ## 本地权限
 
 - state directory：`0700`。
 - connector socket、配置、身份、secret、proof、candidate 与审批回执：`0600`。
+- Codex 的 `<stateDir>/backends/codex/home`、sessions、session root、workspace、
+  runtime HOME 与 TMPDIR 逐层要求 `0700` 且不能是 symlink；daemon 固定的
+  `config.toml` 为 `0600`。登录凭据由专用 Codex CLI 管理，仍受外层 `0700`
+  `CODEX_HOME` 保护，不得复制到 workspace。
 - schema v1→v2 迁移和 supported-proof writer 新建的私有目录会在 fsync 前显式固定并精确读回 `0700`；若上次进程在 `mkdir` 与固定权限之间退出，重试会受控修复只缺 owner 权限的已有目录。durable 临时文件与两类 guard 会在各自创建 fd 上显式固定并精确读回 `0600` 后才写入、同步或 rename。不能只依赖 `mkdir` / `open` 的 mode 参数，因为进程 umask 仍可能移除 owner 权限。
 - `config.connector.socketPath` 的父目录必须是 state directory 内的私有非 symlink 目录；profile 迁移会在该路径创建并持久化普通文件 guard。创建 fd 会保持打开到安全 release，以固定原 inode，并与当前路径交叉复核 dev/inode、link count、文件类型、权限和 nonce；父目录的类型、私有权限与 realpath 也会在每次所有权检查和 release 完成前重验。位于 `/tmp` 等共享目录或 state directory 外的 socket 不属于迁移支持边界。
 - connector 使用至少 32 字节随机 Bearer token，并做常量时间比较。
 - refresh token 只在 daemon state directory 持久化，不进入 SQLite、argv、普通日志或 Git。当前 v2.0.0 兼容基线仍会把它复制进 Relay `connect` / `token_refresh` 帧：历史高层 canary 发生在旧代码基线，但没有字段级 receipt，也不证明服务端要求该字段；这是待收口的显式安全例外。目标是 Relay 只接收短期 access token，但在真实 Relay canary 前不得宣称兼容，也不得设置静默泄露回退。证据和门禁见[服务端协议边界](LIVIS-RELAY-PROTOCOL-BOUNDARY.md)。
-- 一期不读取或发送文件，因此没有远程文件上传路径。
+- LiViS 一期没有附件或文件上传路径。Codex agent 可以读写其专用 workspace；该目录
+  必须只放允许远程执行影响的内容，不得包含 daemon secret、其他项目 checkout 或
+  用户默认 Codex profile。
+
+## Codex 工具沙箱
+
+Codex backend 只通过 `--strict-config --stdio` 启动，并禁用 plugins、remote plugin
+和 apps。daemon 在每次创建或恢复 thread 后必须读回：approval policy 为 `never`、
+active permission profile 为 `livis-remote`、sandbox 为 `workspaceWrite`、工具网络
+关闭，`runtimeWorkspaceRoots` 恰好为 daemon workspace，且 sandbox 不含额外
+writable root。新建 thread 和每次 turn 都显式发送 `environments=[]`，禁止接入账号
+默认或 thread sticky environment。所有 approval request 由 app-server client 默认拒绝。
+
+app-server 子进程只得到专用 `HOME`、`TMPDIR` 和 `CODEX_HOME`；agent shell 的环境
+策略会排除 `CODEX_HOME`、`OPENAI_*` 和 `LIVIS_*`，并且不额外放行 `/tmp` 或继承的
+`TMPDIR`。工具无网络不等于 Codex 模型控制面无网络；app-server 仍需使用专用账号
+访问模型服务。
+
+当前真实 thread 安全回读已确认上述字段，但恶意 agent 读取 workspace 外凭据的负向
+canary 因验证环境外层 sandbox 无法可靠嵌套 Seatbelt 而尚未完成。Codex 后端因此仍是
+Draft 上线门禁，不能宣称生产安全；代表性 macOS/Linux 主机上的负向 canary、取消和
+崩溃隔离回执完成前不得放宽 sandbox。详细矩阵见
+[Codex app-server 执行后端](CODEX-APPSERVER.md#当前上线门禁)。
 
 ## Upstream 门禁
 
@@ -51,13 +82,17 @@
 
 ## 认证生命周期
 
-- `logout` 不是运行中 daemon 的控制通道；执行前必须停止专用 Hermes Gateway 与 daemon，避免进程继续使用内存中的 access token 或已缓存 refresh token。
+- LiViS `logout` 不是运行中 daemon 的控制通道；执行前必须停止 daemon，以及 Hermes
+  模式下的专用 Gateway，避免进程继续使用内存中的 access token 或已缓存 refresh token。
 - IDaaS revoke 只有返回 2xx 才允许删除本地 refresh token；网络失败或远端拒绝时保留本地凭据并明确失败，供操作者重试。
 - 一期没有 OAuth 账号 subject 与 identity/outbox 的迁移契约，不支持在同一 state directory 直接切换账号；不同账号必须使用隔离的配置和状态目录。
+- Codex 登录与 LiViS OAuth 相互独立。执行 Codex logout 前必须停止 daemon 并确认
+  app-server/工具子进程退出，再把命令精确指向专用 `CODEX_HOME`；不得登出或复用
+  用户默认 `~/.codex`。
 
 ## 取消与隔离
 
-Hermes `/stop` 不能证明不合作的工具线程已退出。因此 connector 返回 `cancelled` 后，daemon 仍记录 `CancelUnknown` 并隔离 session。只有在重启专用 Hermes Gateway、确认旧工具进程已结束后，才允许人工执行 `session release`。
+Hermes `/stop` 和 Codex `turn/interrupt` 都不能证明不合作的工具线程或外部副作用已经停止。因此 backend 接受取消后，daemon 仍记录 `CancelUnknown` 并隔离 session。只有在停止所选 backend、确认旧 app-server/Gateway 及其工具子进程已结束并处置外部副作用后，才允许人工执行 `session release`。
 
 未知 job 的 `cancel_chat` 可以先于对应消息到达，但 intent 只保留 24 小时，全库最多保留 4096 条。重复 cancel 会刷新同一 intent 的有效期；满额后新的未知 job ID 会被拒绝且不发送成功 ACK，不会静默挤掉 TTL 内已有 intent。job 到达时会在同一 SQLite 事务中应用并删除匹配 intent。旧数据库启动时会删除过期 intent；当前 scope 已有匹配 job 的残留会先按当前状态应用取消，再删除 intent，其中未执行 job 进入 `Cancelled`，active job 进入 `Cancelling` 并在重启恢复中隔离为 `CancelUnknown`。若旧数据已超过上限，只确定性保留最新 4096 条。因此 cancel-before-message 只在 24 小时乱序窗口和容量未耗尽时保证。
 
@@ -72,12 +107,13 @@ Hermes `/stop` 不能证明不合作的工具线程已退出。因此 connector 
 
 ## 数据落盘与保留
 
-SQLite 默认明文保存 `from_node_id`、输入文本、原始 payload、job/lease 状态和最终结果。数据库依赖 state directory 的 `0700` 与数据库/WAL/SHM 的 `0600` 权限保护，不提供静态加密。
+SQLite 默认明文保存 `from_node_id`、输入文本、原始 payload、job/lease 状态、最终结果和 backend session 元数据。Codex workspace 与专用 `CODEX_HOME` 还会保存工作产物以及由 Codex CLI 管理的认证/thread 数据。它们依赖 state directory 的 `0700` 与数据库/WAL/SHM/配置文件的 `0600` 权限保护，不提供项目层静态加密。
 
 除上述临时 `pending_cancels` 外，一期仍没有 jobs、outbox 或投递尝试的自动保留期和后台 purge；这些记录会持续保留，直到操作者主动清理。合法但未授权 node 的请求仍保持原有回复语义：先持久化为 `Rejected` 并通过 outbox 返回配置的未授权提示，本次资源边界不改变这一行为。需要彻底清除历史时：
 
-1. 停止 daemon 和专用 Hermes Gateway；
+1. 停止 daemon；Hermes 模式同时停止专用 Gateway，Codex 模式确认 app-server 与工具子进程均已退出；
 2. 按组织要求备份或销毁 `relay.db`、`relay.db-wal`、`relay.db-shm`；
-3. 重新启动前执行 `doctor`，确认新数据库完整且 session quarantine 为空。
+3. 若需要彻底清除 Codex 历史，同时按组织要求处理 `<stateDir>/backends/codex`，不得只删 thread 或只改 SQLite；
+4. 重新启动前执行 `doctor`，确认新数据库完整且 session quarantine 为空。
 
 不要在服务运行期间直接删除或复制 WAL/SHM，也不要把数据库加入 issue、测试 fixture 或 Git 提交。

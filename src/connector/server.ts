@@ -45,6 +45,11 @@ export interface ConnectorServerHandlers {
 export interface ConnectorServerOptions {
   socketPath: string;
   connectorToken: string;
+  /**
+   * 缺省保持 Hermes connector v1 路由开启。Codex 等 daemon-owned backend
+   * 仍可复用同一 UDS 的 health/status 控制面，同时明确关闭 Hermes WS。
+   */
+  acceptHermesConnector?: boolean;
   helloTimeoutMs: number;
   resultStoreTimeoutMs: number;
   maxFrameBytes: number;
@@ -166,6 +171,9 @@ export class ConnectorServer {
         }
         if (url.pathname !== "/v1/connectors/hermes") {
           return new Response("Not Found", { status: 404 });
+        }
+        if (options.acceptHermesConnector === false) {
+          return new Response("Hermes connector is disabled", { status: 404 });
         }
         if (!this.authorized(request)) {
           return new Response("Unauthorized", { status: 401 });

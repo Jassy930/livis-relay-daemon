@@ -5,11 +5,16 @@
 `livis-relayd` 是 LiViS 协议与持久化状态的唯一所有者：
 
 - 独占 LiViS OAuth、refresh token、远端 WebSocket、ACK、重连和 SQLite。
-- Hermes plugin 只做本机 IPC 与 `MessageEvent` / `SendResult` 转换。
-- Hermes plugin 不连接 LiViS、不打开 relay SQLite，也不隐式启动 daemon。
-- daemon 与专用 Hermes Gateway 分别由 launchd/systemd 管理。
+- `ExecutionBackend` 只抽象执行生命周期，不转移 JobStore、lease 或 outbox 所有权。
+- 默认 Hermes backend 通过本机 connector IPC 与 `MessageEvent` / `SendResult` 转换；
+  plugin 不连接 LiViS、不打开 relay SQLite，也不隐式启动 daemon。
+- 显式 Codex backend 由 daemon 直接管理一个 `codex app-server --stdio` 子进程，不
+  经过 Hermes connector，也不把 thread 当作 job 状态真源。
+- Hermes 模式下 daemon 与专用 Hermes Gateway 分别由 launchd/systemd 管理；Codex
+  模式只管理 daemon 服务，app-server 随 daemon 启停。
 
-这种边界允许将来增加 AionCore connector，而不复制 LiViS 登录、协议和 durable outbox。
+这种边界允许以后评审新的执行后端，而不复制 LiViS 登录、协议和 durable outbox。
+Claude Code 当前尚未实现，不属于可选择 backend。
 
 这里的“协议所有者”描述本地状态职责，不代表项目掌握服务端规范。服务端已经接受、仅由官方客户端观察、只在 fake Relay 验证或仍未知的行为，统一登记在[LiViS 服务端协议证据与支持边界](LIVIS-RELAY-PROTOCOL-BOUNDARY.md)。
 
@@ -17,9 +22,20 @@
 
 一期暂将 LiViS 入站消息中的 `from_node_id` 视为设备来源标识。它是当前兼容协议中观察到的路由字段，不是 OAuth 账号身份，也不是密码学设备证明；上游一旦给出更明确的身份和轮换契约，必须重新审阅该假设。
 
-受支持的部署拓扑固定为一个 daemon、一个 config、一个 state directory、一个专用 Hermes profile 和恰好一个获准 `node_id`。`security.allowedNodeIds` 的数组形式和 Hermes `LIVIS_ALLOWED_USERS` 的逗号列表形式只是配置格式，不代表一期支持多个设备；`allowAllNodes` 与 `LIVIS_ALLOW_ALL_USERS` 必须保持关闭。
+受支持的部署拓扑固定为一个 daemon、一个 config、一个 state directory、一个执行
+backend 和恰好一个获准 `node_id`。Hermes 模式额外对应一个专用 profile；Codex
+模式额外对应一个 daemon 私有 `CODEX_HOME`、一个 session workspace 和一个持久
+thread。两种 backend 不得在同一 daemon 中同时启用或共享会话。
 
-当前 Hermes session、单 session 执行锁、quarantine、job 和 outbox 的状态所有权都只在“唯一来源设备”前提下成立。多设备路由、跨设备会话连续性、设备 ID 轮换、原地换设备和既有状态迁移均不在一期范围内；不得通过追加第二个 allowlist 值来绕过该边界。
+`security.allowedNodeIds` 的数组形式和 Hermes `LIVIS_ALLOWED_USERS` 的逗号列表形式只是
+配置格式，不代表一期支持多个设备；`allowAllNodes` 与 `LIVIS_ALLOW_ALL_USERS` 必须
+保持关闭。Codex 模式进一步在代码级要求 `allowAllNodes=false` 且 allowlist 恰好一个。
+
+当前 backend session、单 session 执行锁、quarantine、job 和 outbox 的状态所有权都
+只在“唯一来源设备”前提下成立。稳定 session key 为 `livis:<agentId>`；Codex 的
+immutable session hash 还绑定唯一获准 `node_id`，因此同一 state directory 原地换
+设备会拒绝复用旧 thread。多设备路由、跨设备会话连续性、设备 ID 轮换和既有状态迁移
+均不在一期范围内；不得通过追加第二个 allowlist 值来绕过该边界。
 
 ## 执行与投递是两套状态
 
@@ -53,13 +69,15 @@ Pending → Delivering → Delivered
 `Pending`、`Delivering` 或 `AckFailed` 收敛到 `Delivered`；从未投递的结果不接受
 ACK。
 
-JobStore schema v3 为 outbox 增加 `next_attempt_at`。fresh、v1 和 v2 数据库都在
+JobStore schema v3 曾为 outbox 增加 `next_attempt_at`；当前 schema v4 新增
+`backend_sessions`，保存 backend/session hash/cwd/CLI version/thread ID，以及活动
+job/lease/run generation/turn ID 与 recovery 标记。fresh、v1、v2 和 v3 数据库都在
 同一个 `BEGIN IMMEDIATE` 事务内完成版本读取、DDL、旧 `AckFailed` 恢复为
 `Pending`、完整性与外键检查以及最终版本提交。版本裁决发生在取得写锁之后，避免
 两个 opener 同时按旧版本迁移；任一步失败会回滚全部 DDL/DML 和
 `PRAGMA user_version`。
 
-取消意图在 SQLite `IMMEDIATE` 事务内按当前状态原子转移：`Received/Acked` 可直接进入 `Cancelled`，`Dispatching/Running` 只能进入 `Cancelling`。重复 cancel 保持 `Cancelling`，迟到 cancel 不会回退 `Interrupted` 或任何终态；connector 即使确认已发出 `/stop`，仍须由 daemon 记录 `CancelUnknown` 并隔离 session。
+取消意图在 SQLite `IMMEDIATE` 事务内按当前状态原子转移：`Received/Acked` 可直接进入 `Cancelled`，`Dispatching/Running` 只能进入 `Cancelling`。重复 cancel 保持 `Cancelling`，迟到 cancel 不会回退 `Interrupted` 或任何终态；Hermes connector 确认已发出 `/stop`，或 Codex app-server 接受 `turn/interrupt`，都不能证明工具副作用已经停止，daemon 仍须记录 `CancelUnknown` 并隔离 session。
 
 ## Relay 入站门禁与提前取消
 
@@ -87,13 +105,44 @@ daemon 会为每次接纳的 `hello` 分配仅存于本机进程的 connector ge
 
 Hermes `handle_message()` 会在后台完成，lease 必须保持到 `on_processing_complete()`。`send()` 只有收到 daemon 的 `result_stored` 后才向 Hermes 返回成功。
 
+## Codex app-server contract
+
+Codex 是 daemon 内部 backend，不使用 connector v1。daemon 为稳定
+`sessionKey=livis:<agentId>` 创建或恢复一个非 ephemeral thread，并固定：
+
+```text
+initialize → account/read → permissionProfile/list
+           → thread/start | thread/resume
+job claim  → turn/start → item/completed* → turn/completed
+cancel     → turn/interrupt
+```
+
+私有运行目录位于 `<stateDir>/backends/codex`；session workspace 是唯一工具可写根，
+工具网络关闭，审批策略为 `never`，所有 approval request 默认拒绝。daemon 在创建或
+恢复 thread 后读回 cwd、runtime workspace roots、permission profile、approval policy
+与 sandbox；任一字段或固定配置漂移都失败关闭。
+
+JobStore 先原子 claim job 并保留 backend attempt，随后才允许发送 `turn/start`。
+只有 transport 明确证明请求未写入时才可撤销 attempt；请求可能已写入、响应无法绑定
+turn、app-server 断连或 daemon 重启时，均保留 attempt 并进入
+`Interrupted`/`CancelUnknown`、recovery 和 quarantine，绝不自动重发或创建替代
+thread。
+
+`item/completed` 只在内存中收集 agent message。只有匹配当前 thread/turn 的 terminal
+`turn/completed` 才能把一个 final 写入 outbox；reasoning、工具输出、progress、错误
+重试通知和流式 commentary 均不会直接进入 LiViS。完整安全与恢复边界见
+[Codex app-server 执行后端](CODEX-APPSERVER.md)。
+
 ## 官方更新分层
 
-LiViS 与 Hermes 使用不同门禁：
+LiViS 与执行后端使用不同门禁：
 
 1. LiViS：版本化 protocol profile、artifact 哈希、wire marker、`wireContractRevision + credentialMode`、active profile SHA pin、runtime contract digest、24 小时 supported proof 与本地脱敏 S2 probe artifact。
 2. Hermes：外置公共 platform plugin、connector hello、bridge 版本区间、Hermes runtime 版本区间和真实包 smoke test。
-3. daemon：自身版本与上述 profile 分离；升级 daemon 不覆盖状态目录中的 active profile。
+3. Codex：CLI `[0.145.0, 0.146.0)` 版本窗、专用登录、固定 app-server argv、
+   thread/sandbox 安全回读和真实恶意凭据负向 canary。
+4. daemon：自身版本与上述 profile 分离；升级 daemon 不覆盖状态目录中的 active profile、
+   backend session 或 workspace。
 
 自动生成的 LiViS 候选只能改变官方版本和 upstream artifact 信息。IDaaS、relay、OAuth、wire identity、timing 或 wire protocol 变化属于运行契约变化，必须随新版 daemon 审核和迁移，不能用候选文件直接放行。
 

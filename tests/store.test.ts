@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { existsSync, statSync, writeFileSync } from "node:fs";
 import { Database } from "bun:sqlite";
 import {
+  BackendSessionConflictError,
   JobConflictError,
   JobStore,
   PENDING_CANCEL_MAX_ROWS,
@@ -26,6 +27,7 @@ interface DatabaseHealth {
   integrity: string;
   foreignKeyViolations: Array<Record<string, unknown>>;
   outboxColumns: string[];
+  backendSessionColumns: string[];
 }
 
 function databaseHealth(databasePath: string): DatabaseHealth {
@@ -40,23 +42,30 @@ function databaseHealth(databasePath: string): DatabaseHealth {
       .query<{ name: string }, []>("PRAGMA table_info(outbox)")
       .all()
       .map((column) => column.name);
-    return { version, integrity, foreignKeyViolations, outboxColumns };
+    const backendSessionColumns = database
+      .query<{ name: string }, []>("PRAGMA table_info(backend_sessions)")
+      .all()
+      .map((column) => column.name);
+    return { version, integrity, foreignKeyViolations, outboxColumns, backendSessionColumns };
   } finally {
     database.close();
   }
 }
 
-function expectHealthyV3(databasePath: string): void {
+function expectHealthyV4(databasePath: string): void {
   const health = databaseHealth(databasePath);
-  expect(health.version).toBe(3);
+  expect(health.version).toBe(4);
   expect(health.integrity).toBe("ok");
   expect(health.foreignKeyViolations).toEqual([]);
   expect(health.outboxColumns).toContain("next_attempt_at");
+  expect(health.backendSessionColumns).toContain("active_turn_id");
+  expect(health.backendSessionColumns).toContain("recovery_required");
 }
 
-function downgradeV3ToV2(databasePath: string): void {
+function downgradeV4ToV2(databasePath: string): void {
   const database = new Database(databasePath, { strict: true });
   database.exec(`
+    DROP TABLE backend_sessions;
     DROP INDEX idx_outbox_delivery;
     DROP INDEX idx_pending_cancels_gc;
     ALTER TABLE outbox DROP COLUMN next_attempt_at;
@@ -66,9 +75,10 @@ function downgradeV3ToV2(databasePath: string): void {
   database.close();
 }
 
-function downgradeV3ToV1(databasePath: string): void {
+function downgradeV4ToV1(databasePath: string): void {
   const database = new Database(databasePath, { strict: true });
   database.exec(`
+    DROP TABLE backend_sessions;
     DROP INDEX idx_outbox_delivery;
     DROP INDEX idx_pending_cancels_gc;
     DROP TABLE outbox_delivery_attempts;
@@ -76,6 +86,12 @@ function downgradeV3ToV1(databasePath: string): void {
     CREATE INDEX idx_outbox_delivery ON outbox(scope_key,status,updated_at);
     PRAGMA user_version=1;
   `);
+  database.close();
+}
+
+function downgradeV4ToV3(databasePath: string): void {
+  const database = new Database(databasePath, { strict: true });
+  database.exec("DROP TABLE backend_sessions; PRAGMA user_version=3;");
   database.close();
 }
 
@@ -154,13 +170,13 @@ describe("durable jobs + outbox", () => {
     store.startResultDelivery("job-migrated", "legacy-result-msg", false);
     store.close();
 
-    downgradeV3ToV1(databasePath);
+    downgradeV4ToV1(databasePath);
 
     store = new JobStore(databasePath, "account:agent");
     expect(store.findJobIdByOutboxMessageId("legacy-result-msg")).toBe("job-migrated");
     expect(store.integrityCheck()).toBe("ok");
     store.close();
-    expectHealthyV3(databasePath);
+    expectHealthyV4(databasePath);
     store = new JobStore(databasePath, "account:agent");
   });
 
@@ -175,7 +191,7 @@ describe("durable jobs + outbox", () => {
     store.markOutboxAckFailed("legacy-failed", Date.now() + 60_000);
     store.close();
 
-    downgradeV3ToV2(databasePath);
+    downgradeV4ToV2(databasePath);
 
     store = new JobStore(databasePath, "account:agent");
     const migrated = store.require("legacy-failed").outbox!;
@@ -400,12 +416,12 @@ describe("durable jobs + outbox", () => {
     expect(pendingCancelCount(databasePath)).toBe(PENDING_CANCEL_MAX_ROWS);
   });
 
-  test("schema v2 迁移到 v3 时补 GC 索引，并在 daemon 恢复时清除历史 intent", () => {
+  test("schema v2 迁移到 v4 时补 GC 索引，并在 daemon 恢复时清除历史 intent", () => {
     const databasePath = join(directory.path, "relay.db");
     store.ingest(incomingJob("matched-job"), "session-1");
     store.close();
 
-    downgradeV3ToV2(databasePath);
+    downgradeV4ToV2(databasePath);
     const legacy = new Database(databasePath);
     const insert = legacy.query(
       "INSERT INTO pending_cancels(scope_key,job_id,created_at) VALUES(?,?,?)",
@@ -434,7 +450,7 @@ describe("durable jobs + outbox", () => {
       .all().map((row) => row.name);
     migrated.close();
     expect(indexes).toContain("idx_pending_cancels_gc");
-    expect(version?.user_version).toBe(3);
+    expect(version?.user_version).toBe(4);
     expect(outboxColumns).toContain("next_attempt_at");
   });
 
@@ -504,25 +520,416 @@ describe("durable jobs + outbox", () => {
   });
 });
 
-describe("SQLite schema v3 migration", () => {
-  test("fresh 数据库直接创建 v3，重复打开保持完整", async () => {
-    const directory = await temporaryDirectory("livis-store-fresh-v3-");
+describe("backend session durability", () => {
+  const backend = "codex";
+  const sessionKey = "livis:agent";
+  const sessionHash = "a".repeat(64);
+  let directory: Awaited<ReturnType<typeof temporaryDirectory>>;
+  let databasePath: string;
+  let store: JobStore;
+
+  beforeEach(async () => {
+    directory = await temporaryDirectory("livis-backend-session-");
+    databasePath = join(directory.path, "relay.db");
+    store = new JobStore(databasePath, "account:agent");
+  });
+
+  afterEach(async () => {
+    store.close();
+    await directory.cleanup();
+  });
+
+  function ensureSession() {
+    return store.ensureBackendSession({
+      backend,
+      sessionKey,
+      sessionHash,
+      cwd: join(directory.path, "sessions", sessionHash, "workspace"),
+      cliVersion: "0.1.0",
+    });
+  }
+
+  function prepareRunningJob(jobId = "codex-job") {
+    ensureSession();
+    store.bindBackendThread(backend, sessionKey, "thread-1");
+    store.ingest(incomingJob(jobId), sessionKey);
+    store.markAcked(jobId);
+    const claimed = store.claimForBackendDispatch(jobId, backend, "codex:process-1", "lease-1")!;
+    expect(claimed.status).toBe("Dispatching");
+    return claimed;
+  }
+
+  test("ensure/get/bind thread 幂等且 immutable metadata 冲突失败关闭", () => {
+    const created = ensureSession();
+    expect(created.threadId).toBeNull();
+    expect(created.recoveryRequired).toBeFalse();
+    expect(store.getBackendSession(backend, sessionKey)).toEqual(created);
+    expect(ensureSession()).toEqual(created);
+
+    const bound = store.bindBackendThread(backend, sessionKey, "thread-1");
+    expect(bound.threadId).toBe("thread-1");
+    expect(store.bindBackendThread(backend, sessionKey, "thread-1").threadId).toBe("thread-1");
+    expect(() => store.bindBackendThread(backend, sessionKey, "thread-2"))
+      .toThrow(BackendSessionConflictError);
+    expect(() => store.ensureBackendSession({
+      backend,
+      sessionKey,
+      sessionHash,
+      cwd: join(directory.path, "different"),
+      cliVersion: "0.1.0",
+    })).toThrow(BackendSessionConflictError);
+  });
+
+  test("thread/start ambiguous quarantine 在人工 release 前阻止绑定", () => {
+    ensureSession();
+    expect(store.quarantineSession(sessionKey, "thread/start response 丢失")).toBeTrue();
+    expect(store.quarantineSession(sessionKey, "duplicate reason")).toBeFalse();
+    expect(store.getSessionQuarantine(sessionKey)?.reason).toBe("thread/start response 丢失");
+    expect(() => store.bindBackendThread(backend, sessionKey, "thread-unknown"))
+      .toThrow(BackendSessionConflictError);
+    expect(store.releaseSessionQuarantine(sessionKey)).toBeTrue();
+    expect(store.getSessionQuarantine(sessionKey)).toBeNull();
+    expect(store.bindBackendThread(backend, sessionKey, "thread-after-release").threadId)
+      .toBe("thread-after-release");
+  });
+
+  test("turnId 与 Running 同事务提交，写入失败不会留下半状态", () => {
+    const claimed = prepareRunningJob();
+    const database = new Database(databasePath);
+    database.exec(`
+      CREATE TRIGGER fail_turn_binding
+      BEFORE UPDATE OF active_turn_id ON backend_sessions
+      WHEN NEW.active_turn_id IS NOT NULL
+      BEGIN
+        SELECT RAISE(ABORT, 'injected turn binding failure');
+      END;
+    `);
+    database.close();
+
+    expect(() => store.markBackendRunning(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-1",
+    )).toThrow("injected turn binding failure");
+    expect(store.require(claimed.jobId).status).toBe("Dispatching");
+    expect(store.getBackendSession(backend, sessionKey)?.activeTurnId).toBeNull();
+
+    const cleanup = new Database(databasePath);
+    cleanup.exec("DROP TRIGGER fail_turn_binding;");
+    cleanup.close();
+    const running = store.markBackendRunning(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-1",
+    )!;
+    expect(running.status).toBe("Running");
+    expect(store.getBackendSession(backend, sessionKey)?.activeTurnId).toBe("turn-1");
+    expect(store.markBackendRunning(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-1",
+    )?.status).toBe("Running");
+    expect(store.markBackendRunning(
+      claimed.jobId,
+      backend,
+      "stale-lease",
+      claimed.runGeneration,
+      "turn-stale",
+    )).toBeNull();
+  });
+
+  test("terminal、outbox 与 active attempt 原子提交", () => {
+    const claimed = prepareRunningJob();
+    store.markBackendRunning(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-1",
+    );
+    const database = new Database(databasePath);
+    database.exec(`
+      CREATE TRIGGER fail_active_clear
+      BEFORE UPDATE OF active_job_id ON backend_sessions
+      WHEN OLD.active_job_id IS NOT NULL AND NEW.active_job_id IS NULL
+      BEGIN
+        SELECT RAISE(ABORT, 'injected active clear failure');
+      END;
+    `);
+    database.close();
+
+    expect(() => store.finishBackendSuccess(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-1",
+      '{"text":"done"}',
+    )).toThrow("injected active clear failure");
+    expect(store.require(claimed.jobId).status).toBe("Running");
+    expect(store.require(claimed.jobId).outbox).toBeNull();
+    expect(store.getBackendSession(backend, sessionKey)?.activeJobId).toBe(claimed.jobId);
+
+    const cleanup = new Database(databasePath);
+    cleanup.exec("DROP TRIGGER fail_active_clear;");
+    cleanup.close();
+    const finished = store.finishBackendSuccess(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-1",
+      '{"text":"done"}',
+    )!;
+    expect(finished.status).toBe("Succeeded");
+    expect(finished.outbox?.status).toBe("Pending");
+    const session = store.getBackendSession(backend, sessionKey)!;
+    expect(session.activeJobId).toBeNull();
+    expect(session.activeTurnId).toBeNull();
+    expect(session.recoveryRequired).toBeFalse();
+  });
+
+  test("重启保留 active evidence 并要求显式 release recovery", () => {
+    const claimed = prepareRunningJob();
+    store.markBackendRunning(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-1",
+    );
+    expect(store.releaseBackendSessionRecovery(backend, sessionKey)).toBeFalse();
+    store.close();
+    store = new JobStore(databasePath, "account:agent");
+
+    const recovery = store.recoverAfterRestart();
+    expect(recovery.interrupted).toBe(1);
+    expect(store.require(claimed.jobId).status).toBe("Interrupted");
+    const interrupted = store.getBackendSession(backend, sessionKey)!;
+    expect(interrupted.recoveryRequired).toBeTrue();
+    expect(interrupted.activeJobId).toBe(claimed.jobId);
+    expect(interrupted.activeTurnId).toBe("turn-1");
+    expect(store.listQuarantinedSessions().map((entry) => entry.sessionKey)).toContain(sessionKey);
+
+    expect(store.releaseSessionRecovery(sessionKey)).toBeTrue();
+    const released = store.getBackendSession(backend, sessionKey)!;
+    expect(released.threadId).toBe("thread-1");
+    expect(released.activeJobId).toBeNull();
+    expect(released.activeTurnId).toBeNull();
+    expect(released.recoveryRequired).toBeFalse();
+    expect(store.listQuarantinedSessions()).toHaveLength(0);
+    expect(store.releaseSessionRecovery(sessionKey)).toBeFalse();
+  });
+
+  test("ambiguous 与 cancel unknown 原子进入 recovery，且保留精确 attempt", () => {
+    const dispatching = prepareRunningJob("dispatch-unknown");
+    const interrupted = store.markBackendInterrupted(
+      dispatching.jobId,
+      backend,
+      "lease-1",
+      dispatching.runGeneration,
+      null,
+      "turn/start response 丢失",
+    )!;
+    expect(interrupted.status).toBe("Interrupted");
+    expect(store.getBackendSession(backend, sessionKey)?.recoveryRequired).toBeTrue();
+    expect(store.getBackendSession(backend, sessionKey)?.activeTurnId).toBeNull();
+    expect(store.listQuarantinedSessions().map((entry) => entry.sessionKey)).toContain(sessionKey);
+    expect(store.releaseBackendSessionRecovery(backend, sessionKey)).toBeTrue();
+
+    store.ingest(incomingJob("cancel-unknown"), sessionKey);
+    store.markAcked("cancel-unknown");
+    const cancelling = store.claimForBackendDispatch(
+      "cancel-unknown",
+      backend,
+      "codex:process-2",
+      "lease-2",
+    )!;
+    store.markBackendRunning(
+      cancelling.jobId,
+      backend,
+      "lease-2",
+      cancelling.runGeneration,
+      "turn-2",
+    );
+    expect(store.requestCancel(cancelling.jobId)?.status).toBe("Cancelling");
+    expect(store.markBackendCancelUnknown(
+      cancelling.jobId,
+      backend,
+      "lease-2",
+      cancelling.runGeneration,
+      null,
+      "stale turn",
+    )).toBeNull();
+    const unknown = store.markBackendCancelUnknown(
+      cancelling.jobId,
+      backend,
+      "lease-2",
+      cancelling.runGeneration,
+      "turn-2",
+      "interrupt 无法证明工具退出",
+    )!;
+    expect(unknown.status).toBe("CancelUnknown");
+    const session = store.getBackendSession(backend, sessionKey)!;
+    expect(session.recoveryRequired).toBeTrue();
+    expect(session.activeJobId).toBe(cancelling.jobId);
+    expect(session.activeTurnId).toBe("turn-2");
+  });
+
+  test("cancel 与 turn/start accept 竞态会持久化已知 turnId 后隔离", () => {
+    const claimed = prepareRunningJob("cancel-before-accept");
+    expect(store.requestCancel(claimed.jobId)?.status).toBe("Cancelling");
+    expect(store.markBackendRunning(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-after-cancel",
+    )).toBeNull();
+    expect(store.getBackendSession(backend, sessionKey)?.activeTurnId).toBeNull();
+
+    const unknown = store.markBackendCancelUnknown(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-after-cancel",
+      "interrupt 已提交但工具退出未知",
+    )!;
+    expect(unknown.status).toBe("CancelUnknown");
+    const session = store.getBackendSession(backend, sessionKey)!;
+    expect(session.activeTurnId).toBe("turn-after-cancel");
+    expect(session.recoveryRequired).toBeTrue();
+    expect(store.listQuarantinedSessions()).toHaveLength(1);
+  });
+
+  test("可证明 not_sent 的并发取消直接 Cancelled 并清除 reservation", () => {
+    const claimed = prepareRunningJob("cancel-before-unsent");
+    expect(store.requestCancel(claimed.jobId)?.status).toBe("Cancelling");
+    expect(store.finishUnsentBackendCancellation(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration + 1,
+    )).toBeNull();
+    const cancelled = store.finishUnsentBackendCancellation(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+    )!;
+    expect(cancelled.status).toBe("Cancelled");
+    expect(cancelled.outbox).toBeNull();
+    const session = store.getBackendSession(backend, sessionKey)!;
+    expect(session.activeJobId).toBeNull();
+    expect(session.activeTurnId).toBeNull();
+    expect(session.recoveryRequired).toBeFalse();
+    expect(store.listQuarantinedSessions()).toHaveLength(0);
+  });
+
+  test("backend disconnect 按 executionId 批量收口 active jobs", () => {
+    const executionId = "codex:shared-process";
+    const cases = [
+      {
+        sessionKey,
+        sessionHash,
+        threadId: "thread-1",
+        jobId: "running-on-exit",
+        leaseId: "lease-running",
+        turnId: "turn-running",
+      },
+      {
+        sessionKey: "livis:second-agent",
+        sessionHash: "b".repeat(64),
+        threadId: "thread-2",
+        jobId: "cancelling-on-exit",
+        leaseId: "lease-cancelling",
+        turnId: "turn-cancelling",
+      },
+    ];
+    for (const item of cases) {
+      store.ensureBackendSession({
+        backend,
+        sessionKey: item.sessionKey,
+        sessionHash: item.sessionHash,
+        cwd: join(directory.path, "sessions", item.sessionHash, "workspace"),
+        cliVersion: "0.1.0",
+      });
+      store.bindBackendThread(backend, item.sessionKey, item.threadId);
+      store.ingest(incomingJob(item.jobId), item.sessionKey);
+      store.markAcked(item.jobId);
+      const claimed = store.claimForBackendDispatch(
+        item.jobId,
+        backend,
+        executionId,
+        item.leaseId,
+      )!;
+      store.markBackendRunning(
+        item.jobId,
+        backend,
+        item.leaseId,
+        claimed.runGeneration,
+        item.turnId,
+      );
+    }
+    expect(store.requestCancel("cancelling-on-exit")?.status).toBe("Cancelling");
+
+    expect(store.markBackendDisconnected(backend, executionId, "app-server child exited"))
+      .toBe(2);
+    expect(store.require("running-on-exit").status).toBe("Interrupted");
+    expect(store.require("cancelling-on-exit").status).toBe("CancelUnknown");
+    for (const item of cases) {
+      const session = store.getBackendSession(backend, item.sessionKey)!;
+      expect(session.recoveryRequired).toBeTrue();
+      expect(session.activeJobId).toBe(item.jobId);
+      expect(session.activeTurnId).toBe(item.turnId);
+    }
+    expect(store.listQuarantinedSessions()).toHaveLength(2);
+    expect(store.markBackendDisconnected(backend, executionId, "duplicate close")).toBe(0);
+  });
+});
+
+describe("SQLite schema v4 migration", () => {
+  test("fresh 数据库直接创建 v4，重复打开保持完整", async () => {
+    const directory = await temporaryDirectory("livis-store-fresh-v4-");
     const databasePath = join(directory.path, "relay.db");
     try {
       const first = new JobStore(databasePath, "account:agent");
       first.close();
-      expectHealthyV3(databasePath);
+      expectHealthyV4(databasePath);
 
       const reopened = new JobStore(databasePath, "account:agent");
       reopened.close();
-      expectHealthyV3(databasePath);
+      expectHealthyV4(databasePath);
+    } finally {
+      await directory.cleanup();
+    }
+  });
+
+  test("schema v3 原地升级到 v4", async () => {
+    const directory = await temporaryDirectory("livis-store-v3-to-v4-");
+    const databasePath = join(directory.path, "relay.db");
+    try {
+      const seed = new JobStore(databasePath, "account:agent");
+      seed.close();
+      downgradeV4ToV3(databasePath);
+
+      const migrated = new JobStore(databasePath, "account:agent");
+      migrated.close();
+      expectHealthyV4(databasePath);
     } finally {
       await directory.cleanup();
     }
   });
 
   test("并发 opener 在取得 IMMEDIATE 写锁后才裁决版本", async () => {
-    const directory = await temporaryDirectory("livis-store-concurrent-v3-");
+    const directory = await temporaryDirectory("livis-store-concurrent-v4-");
     const databasePath = join(directory.path, "relay.db");
     const readyPath = join(directory.path, "child-ready");
     const proceedPath = join(directory.path, "child-proceed");
@@ -532,7 +939,7 @@ describe("SQLite schema v3 migration", () => {
     try {
       const seed = new JobStore(databasePath, "account:agent");
       seed.close();
-      downgradeV3ToV2(databasePath);
+      downgradeV4ToV2(databasePath);
 
       blocker = new Database(databasePath, { strict: true });
       blocker.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;");
@@ -555,7 +962,7 @@ describe("SQLite schema v3 migration", () => {
             },
           });
           store.close();
-          process.stdout.write("opened-v3");
+          process.stdout.write("opened-v4");
         `,
       ], {
         cwd: join(import.meta.dir, ".."),
@@ -592,9 +999,9 @@ describe("SQLite schema v3 migration", () => {
 
       const [exitCode, childStdout, childStderr] = await Promise.all([child.exited, stdout, stderr]);
       expect(exitCode).toBe(0);
-      expect(childStdout).toBe("opened-v3");
+      expect(childStdout).toBe("opened-v4");
       expect(childStderr).toBe("");
-      expectHealthyV3(databasePath);
+      expectHealthyV4(databasePath);
     } finally {
       if (blocker) {
         if (!committed) {
@@ -614,8 +1021,8 @@ describe("SQLite schema v3 migration", () => {
     }
   });
 
-  test("外键检查失败会回滚全部 v2→v3 DDL 与版本号", async () => {
-    const directory = await temporaryDirectory("livis-store-rollback-v3-");
+  test("外键检查失败会回滚全部 v2→v4 DDL 与版本号", async () => {
+    const directory = await temporaryDirectory("livis-store-rollback-v4-");
     const databasePath = join(directory.path, "relay.db");
     try {
       const seed = new JobStore(databasePath, "account:agent");
@@ -625,13 +1032,13 @@ describe("SQLite schema v3 migration", () => {
       seed.markRunning("orphaned-job", "connector", "lease-1");
       seed.finishSuccess("orphaned-job", "lease-1", '{"text":"done"}');
       seed.close();
-      downgradeV3ToV2(databasePath);
+      downgradeV4ToV2(databasePath);
 
       const corrupt = new Database(databasePath, { strict: true });
       corrupt.exec("PRAGMA foreign_keys=OFF; DELETE FROM jobs WHERE job_id='orphaned-job';");
       corrupt.close();
 
-      expect(() => new JobStore(databasePath, "account:agent")).toThrow("SQLite v3 迁移外键检查失败");
+      expect(() => new JobStore(databasePath, "account:agent")).toThrow("SQLite v4 迁移外键检查失败");
       const rolledBack = databaseHealth(databasePath);
       expect(rolledBack.version).toBe(2);
       expect(rolledBack.outboxColumns).not.toContain("next_attempt_at");

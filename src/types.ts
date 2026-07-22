@@ -71,6 +71,29 @@ export interface StoredOutbox {
   ackedAt: number | null;
 }
 
+/**
+ * daemon 直接管理的执行后端会话元数据。
+ *
+ * `sessionKey` 仍是 LiViS 会话所有权键；`threadId` 只是后端私有标识，
+ * 不得替代 session quarantine、job 或 lease 的裁决键。
+ */
+export interface StoredBackendSession {
+  scopeKey: string;
+  backend: string;
+  sessionKey: string;
+  sessionHash: string;
+  threadId: string | null;
+  cwd: string;
+  cliVersion: string;
+  activeJobId: string | null;
+  activeLeaseId: string | null;
+  activeRunGeneration: number | null;
+  activeTurnId: string | null;
+  recoveryRequired: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface ConnectorImplementation {
   name: string;
   version: string;

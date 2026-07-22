@@ -2,8 +2,21 @@
 
 import { readdir, realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { loadRelayConfig, initializeConfig, DEFAULT_CONFIG_PATH } from "./config.ts";
+import {
+  CODEX_MAXIMUM_EXCLUSIVE_VERSION,
+  CODEX_MINIMUM_VERSION,
+  loadRelayConfig,
+  initializeConfig,
+  DEFAULT_CONFIG_PATH,
+} from "./config.ts";
 import { RelayDaemon, DAEMON_VERSION } from "./daemon.ts";
+import { runCodexCommand } from "./backends/codex/codex-execution-backend.ts";
+import {
+  assertCodexRuntimeLayout,
+  buildCodexEnvironment,
+  ensureCodexRuntimeLayout,
+  resolveCodexCommand,
+} from "./backends/codex/runtime-layout.ts";
 import { IdaasClient } from "./auth/idaas.ts";
 import { IdentityStore } from "./identity.ts";
 import { Logger, errorMessage } from "./logger.ts";
@@ -244,7 +257,7 @@ async function commandServe(args: string[]): Promise<void> {
       secretValues: context.secretValues,
       upstreamProofExpiresAt: Date.parse(upstreamProof.expiresAt),
     });
-    daemon.start();
+    await daemon.start();
   } catch (primaryError) {
     return rethrowAfterProfileOperationCleanup(
       "serve 启动",
@@ -450,40 +463,89 @@ async function commandDoctor(args: string[]): Promise<void> {
     checks.push({ name: "config", ok: true, detail: context.path });
     checks.push({ name: "profile", ok: true, detail: context.profile.id });
     checks.push({
+      name: "execution_backend",
+      ok: true,
+      detail: context.config.execution.backend,
+    });
+    checks.push({
       name: "protocol_acknowledgement",
       ok: context.config.security.acknowledgeUnofficialProtocol,
       detail: String(context.config.security.acknowledgeUnofficialProtocol),
     });
+    if (context.config.execution.backend === "codex") {
+      checks.push({
+        name: "codex_remote_execution_acknowledgement",
+        ok: context.config.codex.acknowledgeRemoteExecution,
+        detail: String(context.config.codex.acknowledgeRemoteExecution),
+      });
+    }
   } catch (error) {
     checks.push({ name: "config", ok: false, detail: errorMessage(error) });
     process.stdout.write(`${JSON.stringify({ ok: false, checks }, null, 2)}\n`);
     process.exitCode = 1;
     return;
   }
-  const hermesProcess = Bun.spawn([context.config.hermes.command, "--version"], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const [hermesStdout, hermesStderr, hermesExit] = await Promise.all([
-    new Response(hermesProcess.stdout).text(),
-    new Response(hermesProcess.stderr).text(),
-    hermesProcess.exited,
-  ]);
-  const currentVersion = parseSemverTriplet(`${hermesStdout}\n${hermesStderr}`);
-  const minimumVersion = parseSemverTriplet(context.config.hermes.minimumVersion);
-  const maximumVersion = parseSemverTriplet(context.config.hermes.maximumExclusiveVersion);
-  const hermesOkay = hermesExit === 0 &&
-    currentVersion !== null &&
-    minimumVersion !== null &&
-    maximumVersion !== null &&
-    versionAtLeast(currentVersion, minimumVersion) &&
-    versionLessThan(currentVersion, maximumVersion);
-  checks.push({
-    name: "hermes_version",
-    ok: hermesOkay,
-    detail: `${hermesStdout}${hermesStderr}`.trim() +
-      `\n审核范围：[${context.config.hermes.minimumVersion}, ${context.config.hermes.maximumExclusiveVersion})`,
-  });
+  const backendKind = context.config.execution.backend;
+  const backendMinimumVersion = backendKind === "codex"
+    ? CODEX_MINIMUM_VERSION
+    : context.config.hermes.minimumVersion;
+  const backendMaximumVersion = backendKind === "codex"
+    ? CODEX_MAXIMUM_EXCLUSIVE_VERSION
+    : context.config.hermes.maximumExclusiveVersion;
+  try {
+    let backendStdout: string;
+    let backendStderr: string;
+    let backendExit: number;
+    if (backendKind === "codex") {
+      const layout = await ensureCodexRuntimeLayout({
+        stateDir: context.config.stateDir,
+        scopeKey: IdentityStore.scopeKey(context.identity),
+        sessionKey: `livis:${context.identity.agentId}`,
+        remoteNodeId: context.config.security.allowedNodeIds[0]!,
+      });
+      await assertCodexRuntimeLayout(layout);
+      const command = await resolveCodexCommand(layout, context.config.codex.command);
+      const result = await runCodexCommand([command, "--version"], {
+        cwd: layout.workspace,
+        env: await buildCodexEnvironment(layout),
+        timeoutMs: context.config.codex.requestTimeoutMs,
+      });
+      backendStdout = result.stdout;
+      backendStderr = result.stderr;
+      backendExit = result.exitCode;
+    } else {
+      const backendProcess = Bun.spawn([context.config.hermes.command, "--version"], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      [backendStdout, backendStderr, backendExit] = await Promise.all([
+        new Response(backendProcess.stdout).text(),
+        new Response(backendProcess.stderr).text(),
+        backendProcess.exited,
+      ]);
+    }
+    const currentVersion = parseSemverTriplet(`${backendStdout}\n${backendStderr}`);
+    const minimumVersion = parseSemverTriplet(backendMinimumVersion);
+    const maximumVersion = parseSemverTriplet(backendMaximumVersion);
+    const versionOkay = backendExit === 0 &&
+      currentVersion !== null &&
+      minimumVersion !== null &&
+      maximumVersion !== null &&
+      versionAtLeast(currentVersion, minimumVersion) &&
+      versionLessThan(currentVersion, maximumVersion);
+    checks.push({
+      name: `${backendKind}_version`,
+      ok: versionOkay,
+      detail: `${backendStdout}${backendStderr}`.trim() +
+        `\n审核范围：[${backendMinimumVersion}, ${backendMaximumVersion})`,
+    });
+  } catch (error) {
+    checks.push({
+      name: `${backendKind}_version`,
+      ok: false,
+      detail: `${errorMessage(error)}\n审核范围：[${backendMinimumVersion}, ${backendMaximumVersion})`,
+    });
+  }
   const store = new JobStore(join(context.config.stateDir, "relay.db"), IdentityStore.scopeKey(context.identity));
   const integrity = store.integrityCheck();
   checks.push({ name: "sqlite_integrity", ok: integrity === "ok", detail: integrity });
@@ -538,11 +600,13 @@ async function commandStatus(args: string[]): Promise<void> {
 async function commandReleaseSession(args: string[]): Promise<void> {
   const sessionKey = args.find((arg) => !arg.startsWith("--") && arg !== "session" && arg !== "release");
   if (!sessionKey) {
-    throw new Error("用法：session release <sessionKey>；执行前必须先重启专用 Hermes Gateway 并确认旧工具已退出");
+    throw new Error(
+      "用法：session release <sessionKey>；执行前必须停止 daemon，并确认所选后端的旧执行进程与工具副作用均已退出",
+    );
   }
   const context = await loadContext(optionValue(args, "--config"));
   const store = new JobStore(join(context.config.stateDir, "relay.db"), IdentityStore.scopeKey(context.identity));
-  const released = store.releaseSessionQuarantine(sessionKey);
+  const released = store.releaseSessionRecovery(sessionKey);
   store.close();
   process.stdout.write(`${JSON.stringify({ released, sessionKey })}\n`);
   if (!released) process.exitCode = 1;

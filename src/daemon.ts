@@ -1,4 +1,16 @@
 import { join } from "node:path";
+import type {
+  ExecutionAcceptedEvent,
+  ExecutionBackend,
+  ExecutionBackendHandlers,
+  ExecutionCancelledEvent,
+  ExecutionDisconnectedEvent,
+  ExecutionFailedEvent,
+  ExecutionReadyEvent,
+  ExecutionResultEvent,
+} from "./backends/execution-backend.ts";
+import { HermesExecutionBackend } from "./backends/hermes-backend.ts";
+import { CodexExecutionBackend } from "./backends/codex/codex-execution-backend.ts";
 import type { RelayConfig } from "./config.ts";
 import { ConnectorServer, type ConnectorServerHandlers } from "./connector/server.ts";
 import { IdaasClient } from "./auth/idaas.ts";
@@ -14,7 +26,7 @@ import {
   ProfileOperationGuard,
   ProfileOperationGuardBusyError,
 } from "./state/offline-guard.ts";
-import type { ConnectorHello, ConnectorInboundMessage, RelayEnvelope, StoredJob } from "./types.ts";
+import type { RelayEnvelope, StoredJob } from "./types.ts";
 import { UpstreamChecker } from "./upstream/checker.ts";
 import { saveSupportedProof } from "./upstream/proof.ts";
 
@@ -59,6 +71,7 @@ export class RelayDaemon {
     private readonly identity: RelayIdentity,
     private readonly store: JobStore,
     private readonly connector: ConnectorServer,
+    private readonly executionBackend: ExecutionBackend,
     private readonly relay: RelayClient,
     private readonly logger: Logger,
     private upstreamProofExpiresAt: number,
@@ -69,23 +82,72 @@ export class RelayDaemon {
   static create(dependencies: RelayDaemonDependencies): RelayDaemon {
     const logger = dependencies.logger ?? new Logger("livis-relayd");
     const scopeKey = IdentityStore.scopeKey(dependencies.identity);
+    if (
+      dependencies.config.execution.backend === "codex" &&
+      (dependencies.config.security.allowAllNodes ||
+        dependencies.config.security.allowedNodeIds.length !== 1)
+    ) {
+      throw new Error(
+        "Codex backend 只支持单设备：必须关闭 allowAllNodes 并配置唯一 allowedNodeId",
+      );
+    }
     const store = new JobStore(join(dependencies.config.stateDir, "relay.db"), scopeKey);
     const auth = new IdaasClient(dependencies.profile, dependencies.secrets);
     let daemon!: RelayDaemon;
 
+    const executionHandlers: ExecutionBackendHandlers = {
+      onReady: (event) => daemon.onExecutionReady(event),
+      onAccepted: (event) => daemon.onExecutionAccepted(event),
+      onResult: (event) => daemon.onExecutionResult(event),
+      onFailed: (event) => daemon.onExecutionFailed(event),
+      onCancelled: (event) => daemon.onExecutionCancelled(event),
+      onDisconnected: (event) => daemon.onExecutionDisconnected(event),
+    };
+
     const connectorHandlers: ConnectorServerHandlers = {
-      onReady: (hello) => daemon.onConnectorReady(hello),
-      onAccepted: (message, connectorId) => daemon.onConnectorAccepted(message, connectorId),
-      onResult: (message, connectorId) => daemon.onConnectorResult(message, connectorId),
-      onFailed: (message, connectorId) => daemon.onConnectorFailed(message, connectorId),
-      onCancelled: (message, connectorId) => daemon.onConnectorCancelled(message, connectorId),
-      onDisconnected: (connectorId) => daemon.onConnectorDisconnected(connectorId),
+      onReady: (hello) => executionHandlers.onReady({
+        kind: "hermes",
+        executionId: hello.connectorId,
+        implementation: { ...hello.implementation },
+      }),
+      onAccepted: (message, connectorId) => executionHandlers.onAccepted({
+        kind: "hermes",
+        executionId: connectorId,
+        jobId: message.jobId,
+        leaseId: message.leaseId,
+      }),
+      onResult: (message, connectorId) => executionHandlers.onResult({
+        kind: "hermes",
+        executionId: connectorId,
+        jobId: message.jobId,
+        leaseId: message.leaseId,
+        text: message.text,
+      }),
+      onFailed: (message, connectorId) => executionHandlers.onFailed({
+        kind: "hermes",
+        executionId: connectorId,
+        jobId: message.jobId,
+        leaseId: message.leaseId,
+        error: message.error,
+        retryable: message.retryable,
+      }),
+      onCancelled: (message, connectorId) => executionHandlers.onCancelled({
+        kind: "hermes",
+        executionId: connectorId,
+        jobId: message.jobId,
+        leaseId: message.leaseId,
+      }),
+      onDisconnected: (connectorId) => executionHandlers.onDisconnected({
+        kind: "hermes",
+        executionId: connectorId,
+      }),
       status: () => daemon.status(),
     };
     const connector = new ConnectorServer(
       {
         socketPath: dependencies.config.connector.socketPath,
         connectorToken: dependencies.secretValues.connectorToken,
+        acceptHermesConnector: dependencies.config.execution.backend === "hermes",
         helloTimeoutMs: dependencies.config.connector.helloTimeoutMs,
         resultStoreTimeoutMs: dependencies.config.connector.resultStoreTimeoutMs,
         maxFrameBytes: dependencies.config.connector.maxFrameBytes,
@@ -99,6 +161,24 @@ export class RelayDaemon {
       connectorHandlers,
       logger.child("connector"),
     );
+    const sessionKey = `livis:${dependencies.identity.agentId}`;
+    const executionBackend: ExecutionBackend = dependencies.config.execution.backend === "codex"
+      ? new CodexExecutionBackend({
+        stateDir: dependencies.config.stateDir,
+        scopeKey,
+        sessionKey,
+        remoteNodeId: dependencies.config.security.allowedNodeIds[0]!,
+        command: dependencies.config.codex.command,
+        model: dependencies.config.codex.model,
+        maxOutputChars: dependencies.config.security.maxOutputChars,
+        requestTimeoutMs: dependencies.config.codex.requestTimeoutMs,
+        shutdownTimeoutMs: dependencies.config.codex.shutdownTimeoutMs,
+      }, {
+        store,
+        handlers: executionHandlers,
+        logger: logger.child("codex"),
+      })
+      : new HermesExecutionBackend(connector);
 
     const relayHandlers: RelayClientHandlers = {
       onIncoming: (envelope) => daemon.onRelayIncoming(envelope),
@@ -121,6 +201,7 @@ export class RelayDaemon {
       dependencies.identity,
       store,
       connector,
+      executionBackend,
       relay,
       logger,
       dependencies.upstreamProofExpiresAt,
@@ -130,15 +211,24 @@ export class RelayDaemon {
     return daemon;
   }
 
-  start(): void {
+  async start(): Promise<void> {
     if (!this.config.security.acknowledgeUnofficialProtocol) {
       throw new Error(
         "尚未确认 LiViS 第三方兼容协议边界；请审阅文档后设置 security.acknowledgeUnofficialProtocol=true",
       );
     }
+    if (this.executionBackend.kind === "codex" && !this.config.codex.acknowledgeRemoteExecution) {
+      throw new Error(
+        "尚未确认通过 Codex 远程执行 LiViS 请求；请审阅安全边界后设置 codex.acknowledgeRemoteExecution=true",
+      );
+    }
     const recovery = this.store.recoverAfterRestart();
     this.logger.info("SQLite 恢复完成", recovery);
-    this.connector.start();
+    if (this.executionBackend.kind === "codex") {
+      // Codex 不接 Hermes WS，但仍用同一私有 UDS 提供 health/status 控制面。
+      this.connector.start();
+    }
+    await this.executionBackend.start();
     if (this.armUpstreamProofExpiry()) {
       this.relay.start();
     }
@@ -162,7 +252,10 @@ export class RelayDaemon {
     const upstreamBlockPromise = this.upstreamBlockPromise;
     this.stopPromise = (async () => {
       const results = await Promise.allSettled([
-        Promise.resolve().then(() => this.connector.stop()),
+        Promise.resolve().then(() => this.executionBackend.stop()),
+        ...(this.executionBackend.kind === "codex"
+          ? [Promise.resolve().then(() => this.connector.stop())]
+          : []),
         Promise.resolve().then(() => this.relay.stop()),
         upstreamCheckPromise ?? Promise.resolve(),
         upstreamBlockPromise ?? Promise.resolve(),
@@ -192,6 +285,7 @@ export class RelayDaemon {
         blocked: this.upstreamBlocked,
       },
       relay: this.relay.status(),
+      execution: this.executionBackend.status(),
       connector: {
         ready: this.connector.ready,
         connectorId: this.connector.connectorId,
@@ -210,7 +304,7 @@ export class RelayDaemon {
   }
 
   releaseSessionQuarantine(sessionKey: string): boolean {
-    return this.store.releaseSessionQuarantine(sessionKey);
+    return this.store.releaseSessionRecovery(sessionKey);
   }
 
   private async onRelayIncoming(envelope: RelayEnvelope): Promise<void> {
@@ -265,8 +359,29 @@ export class RelayDaemon {
       return;
     }
     if (job.status === "Cancelling" && job.leaseId) {
-      if (!this.connector.sendCancel(job)) {
-        this.store.markCancelUnknown(job.jobId, job.leaseId, "cancel could not be delivered to connector");
+      let submission: Awaited<ReturnType<ExecutionBackend["cancel"]>>;
+      try {
+        submission = await this.executionBackend.cancel(job);
+      } catch (error) {
+        this.markCancellationUnknown(job, `cancel 请求异常：${errorMessage(error)}`);
+        return;
+      }
+      if (submission === "not_sent") {
+        if (this.executionBackend.kind === "codex") {
+          const cancelled = this.store.finishUnsentBackendCancellation(
+            job.jobId,
+            this.executionBackend.kind,
+            job.leaseId,
+            job.runGeneration,
+          );
+          if (cancelled) return;
+        }
+        this.markCancellationUnknown(
+          job,
+          this.executionBackend.kind === "hermes"
+            ? "cancel could not be delivered to connector"
+            : "cancel could not be delivered to Codex app-server",
+        );
       }
     }
   }
@@ -278,89 +393,195 @@ export class RelayDaemon {
     await this.dispatchPending(false);
   }
 
-  private async onConnectorReady(_hello: ConnectorHello): Promise<void> {
+  private async onExecutionReady(event: ExecutionReadyEvent): Promise<void> {
+    this.assertConfiguredBackend(event.kind);
     await this.dispatchPending();
   }
 
-  private async onConnectorAccepted(
-    message: Extract<ConnectorInboundMessage, { type: "accepted" }>,
-    connectorId: string,
-  ): Promise<void> {
-    const job = this.store.markRunning(message.jobId, connectorId, message.leaseId);
-    if (job.status !== "Running" || job.leaseId !== message.leaseId) {
-      this.connector.rejectJobMessage(message.jobId, "stale_lease", "accepted 使用了失效 lease");
+  private async onExecutionAccepted(event: ExecutionAcceptedEvent): Promise<void> {
+    this.assertConfiguredBackend(event.kind);
+    if (event.kind === "codex") {
+      const { runGeneration, turnId } = this.requireCodexTurn(event);
+      const job = this.store.markBackendRunning(
+        event.jobId,
+        event.kind,
+        event.leaseId,
+        runGeneration,
+        turnId,
+      );
+      if (!job) {
+        const current = this.store.get(event.jobId);
+        if (
+          current?.status === "Cancelling" &&
+          current.leaseId === event.leaseId &&
+          current.runGeneration === runGeneration
+        ) {
+          const quarantined = this.store.markBackendCancelUnknown(
+            event.jobId,
+            event.kind,
+            event.leaseId,
+            runGeneration,
+            turnId,
+            "cancel 与 Codex turn/start 并发；interrupt 只能证明请求已接受",
+          );
+          if (quarantined) return;
+        }
+        throw new Error(`Codex accepted 使用了失效 attempt：${event.jobId}`);
+      }
+      return;
+    }
+    const job = this.store.markRunning(event.jobId, event.executionId, event.leaseId);
+    if (job.status !== "Running" || job.leaseId !== event.leaseId) {
+      this.rejectHermesEvent(event.jobId, "stale_lease", "accepted 使用了失效 lease");
     }
   }
 
-  private async onConnectorResult(
-    message: Extract<ConnectorInboundMessage, { type: "result" }>,
-    _connectorId: string,
-  ): Promise<void> {
-    if (message.text.length > this.config.security.maxOutputChars) {
-      this.connector.rejectJobMessage(message.jobId, "output_too_large", "Hermes 输出超过 daemon 上限");
+  private async onExecutionResult(event: ExecutionResultEvent): Promise<void> {
+    this.assertConfiguredBackend(event.kind);
+    if (event.text.length > this.config.security.maxOutputChars) {
+      if (event.kind === "hermes") {
+        this.rejectHermesEvent(event.jobId, "output_too_large", "Hermes 输出超过 daemon 上限");
+        return;
+      }
+      const { runGeneration, turnId } = this.requireCodexTurn(event);
+      const failed = this.store.finishBackendFailure(
+        event.jobId,
+        event.kind,
+        event.leaseId,
+        runGeneration,
+        turnId,
+        serializeResult("Codex 输出超过 daemon 上限，已拒绝返回。"),
+        "Codex output exceeded daemon maxOutputChars",
+      );
+      if (!failed) throw new Error(`Codex 超限结果未能按当前 attempt 结算：${event.jobId}`);
+      await this.relay.notifyOutboxPending();
+      this.deferDispatchPending();
       return;
     }
-    const resultJson = serializeResult(message.text);
-    const before = this.store.get(message.jobId);
-    if (!before || before.leaseId !== message.leaseId) {
-      this.connector.rejectJobMessage(message.jobId, "stale_lease", "result 使用了失效 lease");
-      return;
+    const resultJson = serializeResult(event.text);
+    const before = this.store.get(event.jobId);
+    if (!before || before.leaseId !== event.leaseId) {
+      if (event.kind === "hermes") {
+        this.rejectHermesEvent(event.jobId, "stale_lease", "result 使用了失效 lease");
+        return;
+      }
+      throw new Error(`Codex result 使用了失效 lease：${event.jobId}`);
     }
     if (before.cancelRequested) {
-      this.connector.rejectJobMessage(message.jobId, "cancel_superseded", "cancel 已获胜，final result 被丢弃");
+      if (event.kind === "hermes") {
+        this.rejectHermesEvent(event.jobId, "cancel_superseded", "cancel 已获胜，final result 被丢弃");
+        return;
+      }
+      throw new Error(`Codex result 到达时 cancel 已获胜：${event.jobId}`);
+    }
+    if (event.kind === "codex") {
+      const { runGeneration, turnId } = this.requireCodexTurn(event);
+      const job = this.store.finishBackendSuccess(
+        event.jobId,
+        event.kind,
+        event.leaseId,
+        runGeneration,
+        turnId,
+        resultJson,
+      );
+      if (!job) throw new Error(`Codex result 未能按当前 attempt 结算：${event.jobId}`);
+      await this.relay.notifyOutboxPending();
+      this.deferDispatchPending();
       return;
     }
-    const job = this.store.finishSuccess(message.jobId, message.leaseId, resultJson);
+    const job = this.store.finishSuccess(event.jobId, event.leaseId, resultJson);
     if (job.outbox?.resultJson !== resultJson) {
-      this.connector.rejectJobMessage(message.jobId, "result_conflict", "同一 job 收到不同 final result");
+      this.rejectHermesEvent(event.jobId, "result_conflict", "同一 job 收到不同 final result");
       return;
     }
-    this.connector.acknowledgeResult(message.jobId, message.leaseId);
+    this.acknowledgeHermesResult(event.jobId, event.leaseId);
     await this.relay.notifyOutboxPending();
     await this.dispatchPending();
   }
 
-  private async onConnectorFailed(
-    message: Extract<ConnectorInboundMessage, { type: "failed" }>,
-    _connectorId: string,
-  ): Promise<void> {
-    const before = this.store.get(message.jobId);
-    if (!before || before.leaseId !== message.leaseId) {
-      this.connector.rejectJobMessage(message.jobId, "stale_lease", "failed 使用了失效 lease");
-      return;
+  private async onExecutionFailed(event: ExecutionFailedEvent): Promise<void> {
+    this.assertConfiguredBackend(event.kind);
+    const before = this.store.get(event.jobId);
+    if (!before || before.leaseId !== event.leaseId) {
+      if (event.kind === "hermes") {
+        this.rejectHermesEvent(event.jobId, "stale_lease", "failed 使用了失效 lease");
+        return;
+      }
+      throw new Error(`Codex failed 使用了失效 lease：${event.jobId}`);
     }
     if (before.cancelRequested) {
-      this.connector.rejectJobMessage(message.jobId, "cancel_superseded", "cancel 已获胜，failed 上报被丢弃");
+      if (event.kind === "hermes") {
+        this.rejectHermesEvent(event.jobId, "cancel_superseded", "cancel 已获胜，failed 上报被丢弃");
+        return;
+      }
+      throw new Error(`Codex failed 到达时 cancel 已获胜：${event.jobId}`);
+    }
+    const userMessage = event.kind === "hermes"
+      ? "Hermes 暂时无法完成该请求，请稍后重试。"
+      : "Codex 暂时无法完成该请求，请稍后重试。";
+    if (event.kind === "codex") {
+      const { runGeneration, turnId } = this.requireCodexTurn(event);
+      const job = this.store.finishBackendFailure(
+        event.jobId,
+        event.kind,
+        event.leaseId,
+        runGeneration,
+        turnId,
+        serializeResult(userMessage),
+        event.error,
+      );
+      if (!job) throw new Error(`Codex failed 未能按当前 attempt 结算：${event.jobId}`);
+      await this.relay.notifyOutboxPending();
+      this.deferDispatchPending();
       return;
     }
-    const userMessage = "Hermes 暂时无法完成该请求，请稍后重试。";
-    const job = this.store.finishFailure(message.jobId, message.leaseId, serializeResult(userMessage), message.error);
+    const job = this.store.finishFailure(event.jobId, event.leaseId, serializeResult(userMessage), event.error);
     if (job.outbox) {
-      this.connector.acknowledgeResult(message.jobId, message.leaseId);
+      this.acknowledgeHermesResult(event.jobId, event.leaseId);
       await this.relay.notifyOutboxPending();
     }
     await this.dispatchPending();
   }
 
-  private async onConnectorCancelled(
-    message: Extract<ConnectorInboundMessage, { type: "cancelled" }>,
-    _connectorId: string,
-  ): Promise<void> {
-    const before = this.store.get(message.jobId);
-    if (!before || before.leaseId !== message.leaseId) {
+  private async onExecutionCancelled(event: ExecutionCancelledEvent): Promise<void> {
+    this.assertConfiguredBackend(event.kind);
+    const before = this.store.get(event.jobId);
+    if (!before || before.leaseId !== event.leaseId) {
       return;
     }
-    this.store.markCancelUnknown(
-      message.jobId,
-      message.leaseId,
-      "Hermes /stop 已发出，但一期无法证明所有工具线程已经退出",
-    );
+    if (event.kind === "codex") {
+      const runGeneration = this.requireCodexRunGeneration(event);
+      this.store.markBackendCancelUnknown(
+        event.jobId,
+        event.kind,
+        event.leaseId,
+        runGeneration,
+        event.turnId ?? null,
+        "Codex turn/interrupt 已接受，但无法证明工具副作用已经停止",
+      );
+      return;
+    }
+    this.store.markCancelUnknown(event.jobId, event.leaseId, "Hermes /stop 已发出，但一期无法证明所有工具线程已经退出");
   }
 
-  private async onConnectorDisconnected(connectorId: string): Promise<void> {
-    const affected = this.store.markConnectorDisconnected(connectorId);
+  private async onExecutionDisconnected(event: ExecutionDisconnectedEvent): Promise<void> {
+    this.assertConfiguredBackend(event.kind);
+    let affected = 0;
+    if (event.kind === "hermes") {
+      affected = this.store.markConnectorDisconnected(event.executionId);
+    } else {
+      affected = this.store.markBackendDisconnected(
+        event.kind,
+        event.executionId,
+        event.reason ?? "Codex app-server disconnected during active execution",
+      );
+    }
     if (affected > 0) {
-      this.logger.warn("connector 断开导致 session 隔离", { connectorId, affected });
+      this.logger.warn("execution backend 断开导致 session 隔离", {
+        kind: event.kind,
+        executionId: event.executionId,
+        affected,
+      });
     }
   }
 
@@ -374,25 +595,139 @@ export class RelayDaemon {
       await this.beginUpstreamBlock(this.upstreamBlocked, waitForRelayStop);
       return;
     }
-    if (!this.connector.ready) return;
+    if (!this.executionBackend.ready || !this.executionBackend.executionId) return;
     for (const candidate of this.store.listDispatchable()) {
       if (this.isUpstreamProofExpired()) {
         await this.beginUpstreamBlock(UPSTREAM_PROOF_EXPIRED_REASON, waitForRelayStop);
         return;
       }
+      if (!this.isNodeAuthorized(candidate.fromNodeId)) {
+        this.store.reject(
+          candidate.jobId,
+          serializeResult(this.config.security.unauthorizedMessage),
+          "node not authorized",
+        );
+        await this.relay.notifyOutboxPending();
+        continue;
+      }
       const leaseId = crypto.randomUUID();
-      const claimed = this.store.claimForDispatch(candidate.jobId, this.connector.connectorId!, leaseId);
+      const executionId = this.executionBackend.executionId;
+      if (!executionId) break;
+      const claimed = this.executionBackend.kind === "codex"
+        ? this.store.claimForBackendDispatch(candidate.jobId, this.executionBackend.kind, executionId, leaseId)
+        : this.store.claimForDispatch(candidate.jobId, executionId, leaseId);
       if (!claimed) continue;
       if (this.isUpstreamProofExpired()) {
-        this.store.resetUnsentDispatch(claimed.jobId, leaseId);
+        this.resetUnsentExecution(claimed);
         await this.beginUpstreamBlock(UPSTREAM_PROOF_EXPIRED_REASON, waitForRelayStop);
         return;
       }
-      if (!this.connector.sendJob(claimed)) {
-        this.store.resetUnsentDispatch(claimed.jobId, leaseId);
+      const submission = await this.executionBackend.dispatch(claimed);
+      if (submission === "not_sent") {
+        this.resetUnsentExecution(claimed);
         break;
       }
     }
+  }
+
+  private resetUnsentExecution(job: StoredJob): void {
+    if (!job.leaseId) throw new Error(`待 reset 的 execution 缺少 lease：${job.jobId}`);
+    if (this.executionBackend.kind === "codex") {
+      const current = this.store.get(job.jobId);
+      if (current?.status === "Cancelling") {
+        const cancelled = this.store.finishUnsentBackendCancellation(
+          job.jobId,
+          this.executionBackend.kind,
+          job.leaseId,
+          job.runGeneration,
+        );
+        if (!cancelled) throw new Error(`Codex 未发送 cancel attempt 无法安全结算：${job.jobId}`);
+        return;
+      }
+      if (current?.status !== "Dispatching") {
+        // 并发 cancel/disconnect 已经完成更严格的终态迁移，不得回退。
+        return;
+      }
+      const reset = this.store.resetUnsentBackendDispatch(
+        job.jobId,
+        this.executionBackend.kind,
+        job.leaseId,
+        job.runGeneration,
+      );
+      if (!reset) throw new Error(`Codex 未发送 attempt 无法安全 reset：${job.jobId}`);
+      return;
+    }
+    this.store.resetUnsentDispatch(job.jobId, job.leaseId);
+  }
+
+  private assertConfiguredBackend(kind: ExecutionBackend["kind"]): void {
+    if (kind !== this.executionBackend.kind) {
+      throw new Error(`收到非当前 execution backend 的事件：${kind}`);
+    }
+  }
+
+  private requireCodexRunGeneration(event: {
+    jobId: string;
+    runGeneration?: number;
+  }): number {
+    if (!Number.isSafeInteger(event.runGeneration) || (event.runGeneration ?? 0) < 1) {
+      throw new Error(`Codex 事件缺少有效 runGeneration：${event.jobId}`);
+    }
+    return event.runGeneration!;
+  }
+
+  private requireCodexTurn(event: {
+    jobId: string;
+    runGeneration?: number;
+    turnId?: string | null;
+  }): { runGeneration: number; turnId: string } {
+    const runGeneration = this.requireCodexRunGeneration(event);
+    if (typeof event.turnId !== "string" || event.turnId.length === 0) {
+      throw new Error(`Codex 事件缺少有效 turnId：${event.jobId}`);
+    }
+    return { runGeneration, turnId: event.turnId };
+  }
+
+  private acknowledgeHermesResult(jobId: string, leaseId: string): void {
+    if (!(this.executionBackend instanceof HermesExecutionBackend)) {
+      throw new Error("非 Hermes backend 不支持 connector result ACK");
+    }
+    this.executionBackend.acknowledgeResult(jobId, leaseId);
+  }
+
+  private rejectHermesEvent(jobId: string, code: string, message: string): void {
+    if (!(this.executionBackend instanceof HermesExecutionBackend)) {
+      throw new Error("非 Hermes backend 不支持 connector 结构化拒绝");
+    }
+    this.executionBackend.rejectJobMessage(jobId, code, message);
+  }
+
+  private markCancellationUnknown(job: StoredJob, reason: string): void {
+    if (!job.leaseId) return;
+    if (this.executionBackend.kind === "hermes") {
+      this.store.markCancelUnknown(job.jobId, job.leaseId, reason);
+      return;
+    }
+    const session = this.store.getBackendSession(this.executionBackend.kind, job.sessionKey);
+    this.store.markBackendCancelUnknown(
+      job.jobId,
+      this.executionBackend.kind,
+      job.leaseId,
+      job.runGeneration,
+      session?.activeTurnId ?? null,
+      reason,
+    );
+  }
+
+  private deferDispatchPending(): void {
+    const timer = setTimeout(() => {
+      void this.dispatchPending().catch((error) => {
+        if (!this.stopping) {
+          this.logger.error("terminal 结算后的延迟派发失败", { error: errorMessage(error) });
+        }
+      });
+    }, 0);
+    timer.unref?.();
   }
 
   private isNodeAuthorized(nodeId: string): boolean {
