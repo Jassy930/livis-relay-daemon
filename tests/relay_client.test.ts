@@ -583,6 +583,9 @@ describe("RelayClient fake LiViS end-to-end", () => {
     };
     createPendingResult(store, "late-after-failure");
     const relayClient = createClient(durableHandlers());
+    const internals = relayClient as unknown as {
+      stopOutboxRecoveryTimer: () => void;
+    };
     relayClient.start();
     const socket = await fakeRelay.handshake(relayClient);
 
@@ -593,9 +596,13 @@ describe("RelayClient fake LiViS end-to-end", () => {
       1_000,
       "outbox persistent backoff",
     );
-    const nextAttemptAt = store.require("late-after-failure").outbox?.nextAttemptAt;
+    // 本用例只验证 AckFailed 对迟到 ACK 的结算；在线退避恢复由下一用例覆盖。
+    // 先暂停 recovery timer，避免用 runner 此刻的墙钟时间定义持久化状态。
+    internals.stopOutboxRecoveryTimer();
+    const outbox = store.require("late-after-failure").outbox!;
+    const nextAttemptAt = outbox.nextAttemptAt;
     expect(nextAttemptAt).toBeNumber();
-    expect(nextAttemptAt!).toBeGreaterThan(Date.now());
+    expect(nextAttemptAt!).toBeGreaterThan(outbox.updatedAt);
 
     fakeRelay.send(socket, {
       type: "ack_send_result",
@@ -607,7 +614,7 @@ describe("RelayClient fake LiViS end-to-end", () => {
       1_000,
       "late ACK after retry exhaustion",
     );
-    await Bun.sleep(Math.max(0, nextAttemptAt! - Date.now() + 20));
+    await Bun.sleep(20);
     expect(fakeRelay.count("send_result")).toBe(2);
   });
 
