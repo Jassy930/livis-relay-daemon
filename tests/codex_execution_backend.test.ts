@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, realpath, writeFile } from "node:fs/promises";
+import { chmod, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import {
   CodexExecutionBackend,
   type CodexCommandRunner,
@@ -8,12 +9,14 @@ import type {
   ExecutionBackendHandlers,
   ExecutionJobEvent,
 } from "../src/backends/execution-backend.ts";
-import type {
-  CodexAppServerProcess,
-  CodexAppServerSpawn,
-  CodexAppServerSpawnOptions,
+import {
+  CODEX_DISABLED_FEATURES,
+  type CodexAppServerProcess,
+  type CodexAppServerSpawn,
+  type CodexAppServerSpawnOptions,
 } from "../src/backends/codex/app-server-client.ts";
 import { ensureCodexRuntimeLayout } from "../src/backends/codex/runtime-layout.ts";
+import { runCodexAppServerLocalSmoke } from "../src/backends/codex/local-smoke.ts";
 import { serializeResult } from "../src/protocol/livis.ts";
 import { JobStore } from "../src/state/store.ts";
 import type { StoredJob } from "../src/types.ts";
@@ -57,7 +60,11 @@ class FakeCodexAppServer {
   threadId = "019f-thread-1";
   account: Record<string, unknown> | null = { type: "chatgpt", email: null, planType: "plus" };
   permissionAllowed = true;
+  enabledHighRiskFeature: string | null = null;
   threadReadbackOverride: Record<string, unknown> = {};
+  materializationMode: "valid" | "missing" | "wrong-id" = "valid";
+  materializationReadMisses = 0;
+  rolloutPath: string | null = null;
   failWriteMethod: string | null = null;
   blockWriteResponseId: number | null = null;
   holdTurnStart = false;
@@ -119,11 +126,19 @@ class FakeCodexAppServer {
   async onMessage(message: Record<string, unknown>): Promise<void> {
     if (typeof message.id !== "number" || typeof message.method !== "string") return;
     if (message.method === "initialize") {
-      await this.respond(message.id, {});
+      await this.respond(message.id, {
+        userAgent: "livis-relay-daemon/0.145.0 (test; test) unknown (livis-relay-daemon; 0.1.0)",
+        codexHome: this.spawnOptions?.env?.CODEX_HOME,
+        platformFamily: "unix",
+        platformOs: "test",
+      });
       return;
     }
     if (message.method === "account/read") {
-      await this.respond(message.id, { account: this.account, requiresOpenaiAuth: true });
+      await this.respond(message.id, {
+        account: this.account,
+        requiresOpenaiAuth: this.account === null,
+      });
       return;
     }
     if (message.method === "permissionProfile/list") {
@@ -133,12 +148,53 @@ class FakeCodexAppServer {
       });
       return;
     }
+    if (message.method === "experimentalFeature/list") {
+      await this.respond(message.id, {
+        data: CODEX_DISABLED_FEATURES.map((name) => ({
+          name,
+          enabled: name === this.enabledHighRiskFeature,
+        })),
+        nextCursor: null,
+      });
+      return;
+    }
     if (message.method === "thread/start" || message.method === "thread/resume") {
-      const response = this.threadResponse();
+      const response = this.threadResponse(message);
       await this.respond(message.id, response);
       return;
     }
+    if (message.method === "thread/memoryMode/set") {
+      const params = isRecord(message.params) ? message.params : {};
+      if (params.threadId !== this.threadId || params.mode !== "disabled") {
+        throw new Error("fake app-server 收到错误的 thread memory mode");
+      }
+      if (this.materializationMode !== "missing") {
+        const codexHome = this.spawnOptions?.env?.CODEX_HOME;
+        if (!codexHome) throw new Error("fake app-server 缺少 CODEX_HOME");
+        await this.prepareRollout(
+          codexHome,
+          true,
+          this.materializationMode === "wrong-id" ? `${this.threadId}-other` : this.threadId,
+        );
+      }
+      await this.respond(message.id, {});
+      return;
+    }
+    if (message.method === "thread/read") {
+      const params = isRecord(message.params) ? message.params : {};
+      if (params.threadId !== this.threadId || params.includeTurns !== true) {
+        throw new Error("fake app-server 收到错误的 thread/read 参数");
+      }
+      const thread = this.threadRecord();
+      if (this.materializationReadMisses > 0) {
+        this.materializationReadMisses -= 1;
+        thread.path = null;
+      }
+      await this.respond(message.id, { thread });
+      return;
+    }
     if (message.method === "turn/start") {
+      this.requireLocalEnvironment(message);
       if (this.holdTurnStart) {
         void this.heldTurnStart.promise
           .then((response) => this.respond(message.id as number, response))
@@ -155,16 +211,51 @@ class FakeCodexAppServer {
     await this.respond(message.id, {});
   }
 
-  threadResponse(): Record<string, unknown> {
+  private requireLocalEnvironment(message: Record<string, unknown>): void {
+    const params = isRecord(message.params) ? message.params : {};
+    const environments = params.environments;
+    if (!Array.isArray(environments) || environments.length !== 1) {
+      throw new Error("fake app-server 要求唯一 local environment");
+    }
+    const environment = environments[0];
+    if (
+      !isRecord(environment) ||
+      environment.environmentId !== "local" ||
+      environment.cwd !== this.workspace ||
+      !Array.isArray(environment.runtimeWorkspaceRoots) ||
+      environment.runtimeWorkspaceRoots.length !== 1 ||
+      environment.runtimeWorkspaceRoots[0] !== this.workspace
+    ) {
+      throw new Error("fake app-server 收到错误的 local environment");
+    }
+  }
+
+  threadResponse(message: Record<string, unknown>): Record<string, unknown> {
+    const params = isRecord(message.params) ? message.params : {};
+    const environments = params.environments;
+    let runtimeWorkspaceRoots = Array.isArray(params.runtimeWorkspaceRoots)
+      ? params.runtimeWorkspaceRoots
+      : [];
+    if (Array.isArray(environments)) {
+      if (environments.length === 0) {
+        // 与真实 app-server 一致：空选择会清空本地 runtime roots。
+        runtimeWorkspaceRoots = [];
+      } else {
+        this.requireLocalEnvironment(message);
+        const environment = environments[0] as Record<string, unknown>;
+        runtimeWorkspaceRoots = environment.runtimeWorkspaceRoots as unknown[];
+      }
+    }
     return {
-      thread: { id: this.threadId, cwd: this.workspace },
+      thread: this.threadRecord(),
       cwd: this.workspace,
-      runtimeWorkspaceRoots: [this.workspace],
+      runtimeWorkspaceRoots,
+      instructionSources: [],
       approvalPolicy: "never",
       approvalsReviewer: "user",
       activePermissionProfile: { id: "livis-remote", extends: null },
       sandbox: {
-        type: "workspaceWrite",
+        type: runtimeWorkspaceRoots.length === 1 ? "workspaceWrite" : "readOnly",
         writableRoots: [],
         networkAccess: false,
         excludeTmpdirEnvVar: true,
@@ -172,6 +263,41 @@ class FakeCodexAppServer {
       },
       ...this.threadReadbackOverride,
     };
+  }
+
+  private threadRecord(): Record<string, unknown> {
+    return {
+      id: this.threadId,
+      sessionId: this.threadId,
+      cwd: this.workspace,
+      cliVersion: "0.145.0",
+      ephemeral: false,
+      status: { type: "idle" },
+      turns: [],
+      path: this.rolloutPath,
+    };
+  }
+
+  async prepareRollout(
+    codexHome: string,
+    write: boolean,
+    sessionMetaId = this.threadId,
+  ): Promise<string> {
+    const directory = join(codexHome, "sessions", "2026", "07", "22");
+    this.rolloutPath = join(directory, `rollout-test-${this.threadId}.jsonl`);
+    if (write) {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await writeFile(
+        this.rolloutPath,
+        `${JSON.stringify({
+          timestamp: "2026-07-22T00:00:00.000Z",
+          type: "session_meta",
+          payload: { id: sessionMetaId, session_id: sessionMetaId },
+        })}\n`,
+        { mode: 0o600 },
+      );
+    }
+    return this.rolloutPath;
   }
 
   async respond(id: number, result: unknown): Promise<void> {
@@ -195,6 +321,7 @@ interface Harness {
   store: JobStore;
   fake: FakeCodexAppServer;
   backend: CodexExecutionBackend;
+  handlers: ExecutionBackendHandlers;
   events: string[];
   results: string[];
   failures: string[];
@@ -222,6 +349,7 @@ async function createHarness(options: {
   configureFake?: (fake: FakeCodexAppServer) => void;
   commandRunner?: CodexCommandRunner;
   existingThreadId?: string;
+  existingRollout?: "valid" | "missing";
   maxOutputChars?: number;
   acceptedGate?: Promise<void>;
 } = {}): Promise<Harness> {
@@ -248,6 +376,10 @@ async function createHarness(options: {
     });
     store.bindBackendThread("codex", sessionKey, options.existingThreadId);
     fake.threadId = options.existingThreadId;
+    await fake.prepareRollout(
+      layout.codexHome,
+      options.existingRollout !== "missing",
+    );
   }
   const events: string[] = [];
   const results: string[] = [];
@@ -361,6 +493,7 @@ async function createHarness(options: {
     store,
     fake,
     backend,
+    handlers,
     events,
     results,
     failures,
@@ -386,6 +519,75 @@ function claimJob(harness: Harness, jobId: string, text = "请处理"): StoredJo
 }
 
 describe("CodexExecutionBackend", () => {
+  test("smoke 入口 fake 轨迹固定且绝不发送模型 turn", async () => {
+    const commandDirectory = await temporaryDirectory("livis-codex-smoke-command-");
+    const command = `${commandDirectory.path}/codex`;
+    await writeFile(command, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    const freshFake = new FakeCodexAppServer();
+    const resumedFake = new FakeCodexAppServer();
+    freshFake.account = null;
+    resumedFake.account = null;
+    let spawnCount = 0;
+    const smokeSpawn: CodexAppServerSpawn = (argv, options) => {
+      const fake = spawnCount++ === 0 ? freshFake : resumedFake;
+      if (fake === resumedFake) {
+        resumedFake.threadId = freshFake.threadId;
+        resumedFake.rolloutPath = freshFake.rolloutPath;
+      }
+      return fake.spawn(argv, options);
+    };
+    let smokeStateDir: string | null = null;
+    try {
+      const report = await runCodexAppServerLocalSmoke({
+        command,
+        requestTimeoutMs: 1_000,
+        shutdownTimeoutMs: 1_000,
+      }, {
+        appServerSpawn: smokeSpawn,
+        commandRunner: successfulVersion,
+      });
+      smokeStateDir = report.stateDir;
+      expect(report).toMatchObject({
+        ok: true,
+        sentModelTurn: false,
+        backendStartReady: false,
+        cliVersion: "0.145.0",
+        account: { authenticated: false, requiresOpenaiAuth: true, type: null },
+        permissionProfile: "livis-remote",
+        environmentId: "local",
+        safety: {
+          runtimeWorkspaceRootsMatch: true,
+          sandboxType: "workspaceWrite",
+          networkAccess: false,
+        },
+      });
+      const messages = [...freshFake.messages, ...resumedFake.messages];
+      expect(messages.map((message) => message.method).filter(Boolean)).toEqual([
+        "initialize",
+        "initialized",
+        "account/read",
+        "permissionProfile/list",
+        "experimentalFeature/list",
+        "thread/start",
+        "thread/memoryMode/set",
+        "thread/read",
+        "initialize",
+        "initialized",
+        "account/read",
+        "permissionProfile/list",
+        "experimentalFeature/list",
+        "thread/resume",
+      ]);
+      expect(messages.some((message) => message.method === "turn/start")).toBeFalse();
+    } finally {
+      await Promise.all([freshFake.stop(0), resumedFake.stop(0)]);
+      if (smokeStateDir !== null) {
+        await rm(smokeStateDir, { recursive: true, force: true });
+      }
+      await commandDirectory.cleanup();
+    }
+  });
+
   test("固定版本窗口、私有环境、认证/profile 与 thread 安全回读后才 ready", async () => {
     const versionProbes: Array<Parameters<CodexCommandRunner>[1]> = [];
     const harness = await createHarness({
@@ -408,6 +610,22 @@ describe("CodexExecutionBackend", () => {
         "remote_plugin",
         "--disable",
         "apps",
+        "--disable",
+        "shell_snapshot",
+        "--disable",
+        "hooks",
+        "--disable",
+        "image_generation",
+        "--disable",
+        "goals",
+        "--disable",
+        "memories",
+        "--disable",
+        "skill_mcp_dependency_install",
+        "--disable",
+        "multi_agent",
+        "--disable",
+        "multi_agent_v2",
       ]);
       const canonicalStateDir = await realpath(harness.directory.path);
       expect(harness.fake.spawnOptions?.env?.CODEX_HOME).toStartWith(canonicalStateDir);
@@ -430,13 +648,136 @@ describe("CodexExecutionBackend", () => {
         approvalPolicy: "never",
         approvalsReviewer: "user",
         permissions: "livis-remote",
-        environments: [],
+        environments: [{
+          environmentId: "local",
+          cwd: harness.fake.workspace,
+          runtimeWorkspaceRoots: [harness.fake.workspace],
+        }],
         ephemeral: false,
       });
       const stored = harness.store.getBackendSession("codex", "livis:agent-test");
       expect(stored?.threadId).toBe(harness.fake.threadId);
       expect(stored?.cwd).toBe(harness.fake.workspace);
       expect(stored?.cliVersion).toBe("0.145.0");
+      expect(harness.fake.messages.find(
+        (message) => message.method === "thread/memoryMode/set",
+      )?.params).toEqual({ threadId: harness.fake.threadId, mode: "disabled" });
+      expect(harness.fake.messages.find((message) => message.method === "thread/read")?.params)
+        .toEqual({ threadId: harness.fake.threadId, includeTurns: true });
+      expect(harness.fake.rolloutPath).not.toBeNull();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("新 thread 在首个 turn 前物化，daemon 无 turn 重启后可按原 id resume", async () => {
+    const harness = await createHarness();
+    let restarted: CodexExecutionBackend | null = null;
+    try {
+      const threadId = harness.fake.threadId;
+      const rolloutPath = harness.fake.rolloutPath;
+      if (!rolloutPath) throw new Error("test rollout 尚未物化");
+      expect(harness.fake.messages.some((message) => message.method === "turn/start")).toBeFalse();
+
+      await harness.backend.stop();
+      const resumedFake = new FakeCodexAppServer();
+      resumedFake.threadId = threadId;
+      resumedFake.rolloutPath = rolloutPath;
+      restarted = new CodexExecutionBackend({
+        stateDir: harness.directory.path,
+        scopeKey: "scope-test",
+        sessionKey: "livis:agent-test",
+        remoteNodeId: "node-1",
+        command: "/test/bin/codex",
+        model: null,
+        maxOutputChars: 1_048_576,
+        requestTimeoutMs: 100,
+        shutdownTimeoutMs: 100,
+      }, {
+        store: harness.store,
+        handlers: harness.handlers,
+        appServerSpawn: resumedFake.spawn,
+        commandRunner: successfulVersion,
+      });
+      await restarted.start();
+
+      expect(restarted.executionId).toBe(`codex:${threadId}`);
+      expect(resumedFake.messages.some((message) => message.method === "thread/start")).toBeFalse();
+      expect(resumedFake.messages.some(
+        (message) => message.method === "thread/memoryMode/set",
+      )).toBeFalse();
+      expect(resumedFake.messages.find((message) => message.method === "thread/resume")?.params)
+        .toMatchObject({ threadId });
+      expect(resumedFake.messages.find((message) => message.method === "thread/read")?.params)
+        .toEqual({ threadId, includeTurns: true });
+      expect(resumedFake.messages.some((message) => message.method === "turn/start")).toBeFalse();
+      expect(harness.events).toEqual(["ready", "ready"]);
+    } finally {
+      await restarted?.stop().catch(() => undefined);
+      await harness.cleanup();
+    }
+  });
+
+  test("新 thread 的 rollout path 延迟出现时仅在总时限内轮询 thread/read", async () => {
+    const harness = await createHarness({
+      configureFake: (fake) => {
+        fake.materializationReadMisses = 2;
+      },
+    });
+    try {
+      expect(harness.backend.ready).toBeTrue();
+      expect(harness.fake.messages.filter((message) => message.method === "thread/read"))
+        .toHaveLength(3);
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")?.threadId)
+        .toBe(harness.fake.threadId);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("新 thread 物化失败时不 bind 且不触发 ready", async () => {
+    const materializationTimeoutMs = 80;
+    const harness = await createHarness({
+      start: false,
+      requestTimeoutMs: materializationTimeoutMs,
+      configureFake: (fake) => {
+        fake.materializationMode = "missing";
+      },
+    });
+    try {
+      const startedAt = Date.now();
+      await expect(harness.backend.start()).rejects.toThrow(
+        `在 ${materializationTimeoutMs} ms 内未物化 rollout`,
+      );
+      expect(Date.now() - startedAt)
+        .toBeLessThan(materializationTimeoutMs + 500);
+      expect(harness.fake.messages.filter((message) => message.method === "thread/read").length)
+        .toBeGreaterThan(1);
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")?.threadId).toBeNull();
+      expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
+        .toContain("rollout 物化");
+      expect(harness.events).toEqual([]);
+      expect(harness.backend.ready).toBeFalse();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("rollout session_meta 不匹配属于永久错误且不会轮询重试", async () => {
+    const harness = await createHarness({
+      start: false,
+      configureFake: (fake) => {
+        fake.materializationMode = "wrong-id";
+      },
+    });
+    try {
+      await expect(harness.backend.start()).rejects.toThrow(
+        "session_meta id 与 threadId 不一致",
+      );
+      expect(harness.fake.messages.filter((message) => message.method === "thread/read"))
+        .toHaveLength(1);
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")?.threadId).toBeNull();
+      expect(harness.events).toEqual([]);
     } finally {
       await harness.cleanup();
     }
@@ -470,7 +811,36 @@ describe("CodexExecutionBackend", () => {
         permissions: "livis-remote",
       });
       expect((resume?.params as Record<string, unknown>).environments).toBeUndefined();
+      expect(harness.fake.messages.some(
+        (message) => message.method === "thread/memoryMode/set",
+      )).toBeFalse();
+      expect(harness.fake.messages.find((message) => message.method === "thread/read")?.params)
+        .toEqual({ threadId: "019f-existing-thread", includeTurns: true });
       expect(harness.backend.executionId).toBe("codex:019f-existing-thread");
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("已绑定 thread 的 rollout 缺失时 fail-closed 且不触发 ready", async () => {
+    const harness = await createHarness({
+      start: false,
+      existingThreadId: "019f-existing-missing-rollout",
+      existingRollout: "missing",
+    });
+    try {
+      await expect(harness.backend.start()).rejects.toThrow("rollout 尚未落盘");
+      expect(harness.fake.messages.some((message) => message.method === "thread/start")).toBeFalse();
+      expect(harness.fake.messages.some(
+        (message) => message.method === "thread/memoryMode/set",
+      )).toBeFalse();
+      expect(harness.fake.messages.some((message) => message.method === "thread/read")).toBeTrue();
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")?.threadId)
+        .toBe("019f-existing-missing-rollout");
+      expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
+        .toContain("rollout 物化");
+      expect(harness.events).toEqual([]);
+      expect(harness.backend.ready).toBeFalse();
     } finally {
       await harness.cleanup();
     }
@@ -488,6 +858,22 @@ describe("CodexExecutionBackend", () => {
         "Codex 私有 CODEX_HOME account 必须是对象",
       );
       expect(harness.fake.messages.some((message) => message.method === "thread/start")).toBeFalse();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("高风险 Codex feature 任一仍启用时 fail-closed，不创建 thread", async () => {
+    const harness = await createHarness({
+      start: false,
+      configureFake: (fake) => {
+        fake.enabledHighRiskFeature = "goals";
+      },
+    });
+    try {
+      await expect(harness.backend.start()).rejects.toThrow("高风险 feature 未禁用");
+      expect(harness.fake.messages.some((message) => message.method === "thread/start")).toBeFalse();
+      expect(harness.backend.ready).toBeFalse();
     } finally {
       await harness.cleanup();
     }
@@ -552,7 +938,11 @@ describe("CodexExecutionBackend", () => {
           approvalPolicy: "never",
           approvalsReviewer: "user",
           permissions: "livis-remote",
-          environments: [],
+          environments: [{
+            environmentId: "local",
+            cwd: harness.fake.workspace,
+            runtimeWorkspaceRoots: [harness.fake.workspace],
+          }],
         });
 
       await harness.fake.send({

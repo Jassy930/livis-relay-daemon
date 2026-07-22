@@ -145,7 +145,7 @@ IDaaS token 响应可能直接包含 token 字段，也可能在 audience 键下
 | daemon → Relay | WSS URL | query `protocol_version=1`，TLS profile 使用 `wss` | S4 高层握手；参数形状为 S3/S2，无原始 receipt | 参数必填性未知 |
 | daemon → Relay | `connect` | metadata：`msg_id/job_id/agent_id/timestamp`；payload：`device_id/node_name/node_desc/client/token/refresh_token` | S4 高层握手 + S3/S2 帧形；没有字段级 receipt | `refresh_token` 是否必填或可省略为 U；access-token-only 仍是候选契约 |
 | Relay → daemon | `connected` | 当前只要求 `type`；其余字段不参与握手 | S4 实际收到 | 服务端完整 schema 未知 |
-| Relay → daemon | `send_message` | metadata `job_id` 必需；payload `from_node_id`、`data.type=exec`、非空 `data.content` 必需；`data` 可为对象或 JSON 字符串 | S4 单设备纯文本；S2 负向校验 | `msg_id/timestamp/from_node_type` 的服务端保证与最大长度未知 |
+| Relay → daemon | `send_message` | metadata `job_id` 必需；payload `from_node_id`、`data.type=exec`、非空 `data.content` 必需；`data` 可为对象或 JSON 字符串 | S4 单设备纯文本；S2 负向校验 | `msg_id/timestamp/from_node_type` 的服务端保证与最大长度未知；没有稳定 conversation/session 标识的字段级证据 |
 | daemon → Relay | `ack_send_message` | metadata 含 job/agent/device/message/timestamp；payload 增加 `nodeType`，metadata 增加 `client` | S4 路径中实际发送；S2 | Relay 是否要求所有字段、如何去重未知 |
 | Relay → daemon | `cancel_chat` | 当前只读取 metadata `job_id` | S3/S2；无 S4 | 来源 node 缺失；字段、重放和鉴权语义未知 |
 | daemon → Relay | `ack_cancel_chat` | 与普通 ACK 相同的 identity 字段 | S3/S2；无 S4 | 服务端要求未知 |
@@ -237,6 +237,8 @@ wire 变化转 Ready 前必须同时满足：
 6. application heartbeat 与 WebSocket pong 的服务端要求；
 7. `from_node_id` 的稳定性、轮换、账号绑定和认证强度；
 8. 帧大小、速率限制、顺序保证、错误帧 schema 与服务端构建版本。
+9. App 新对话是否产生稳定 conversation/session 标识，以及该标识的生命周期、重放和
+   与 `from_node_id`/`job_id` 的关系。
 
 除 #23 专项门禁外，后续获授权隔离 canary backlog 包括：
 

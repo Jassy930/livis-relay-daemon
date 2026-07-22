@@ -34,6 +34,14 @@ describe("Codex daemon 托管目录", () => {
       expect(expectedConfig).toContain(`projects.${JSON.stringify(layout.workspace)}`);
       expect(expectedConfig).toContain('trust_level = "untrusted"');
       expect(expectedConfig).toContain('exclude = ["CODEX_HOME", "OPENAI_*", "LIVIS_*"]');
+      expect(expectedConfig).toContain("[agents]\nenabled = false");
+      expect(expectedConfig).toContain("[skills]\ninclude_instructions = false");
+      expect(expectedConfig).toContain("[skills.bundled]\nenabled = false");
+      expect(expectedConfig).toContain(`
+":root" = "deny"
+":minimal" = "read"
+":workspace_roots" = "write"
+`);
       await assertCodexRuntimeLayout(layout);
       const reopened = await ensureCodexRuntimeLayout({
         stateDir: directory.path,

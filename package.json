@@ -37,6 +37,7 @@
     "probe:protocol:update": "bun run scripts/probe-protocol-local.ts --write",
     "probe:protocol:check": "bun run scripts/probe-protocol-local.ts --check",
     "probe:protocol:test": "bun test tests/protocol_probe_artifact.test.ts tests/auth_contract_probe.test.ts tests/relay_wire_probe.test.ts",
+    "smoke:codex:app-server": "bun run src/index.ts codex smoke-app-server",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "test:hermes": "cd hermes-plugin && uv lock --check && PYTHONDONTWRITEBYTECODE=1 uv run pytest -p no:cacheprovider -q",

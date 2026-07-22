@@ -16,6 +16,14 @@
 这种边界允许以后评审新的执行后端，而不复制 LiViS 登录、协议和 durable outbox。
 Claude Code 当前尚未实现，不属于可选择 backend。
 
+当前抽象还不是完整的 provider-neutral managed-session 层：事件中的 `turnId`、SQLite
+中的 `thread_id/active_turn_id` 以及 daemon 多处 `kind === "codex"` 分支都带 Codex
+语义。引入 Claude Code 前，应先抽出 backend registry、托管目录/session 生命周期、
+attempt fencing、terminal/cancel 能力和 provider session/execution 标识；Codex 的
+JSON-RPC stdio 与 Claude 的 SDK/CLI stream-json 必须保留为两个独立 transport，不能
+为了复用代码把它们伪装成同一协议。一套 daemon 是否同时承载两个 provider 仍是产品
+决策，当前只支持配置时二选一。
+
 这里的“协议所有者”描述本地状态职责，不代表项目掌握服务端规范。服务端已经接受、仅由官方客户端观察、只在 fake Relay 验证或仍未知的行为，统一登记在[LiViS 服务端协议证据与支持边界](LIVIS-RELAY-PROTOCOL-BOUNDARY.md)。
 
 ## 一期设备与会话所有权
@@ -111,8 +119,9 @@ Codex 是 daemon 内部 backend，不使用 connector v1。daemon 为稳定
 `sessionKey=livis:<agentId>` 创建或恢复一个非 ephemeral thread，并固定：
 
 ```text
-initialize → account/read → permissionProfile/list
-           → thread/start | thread/resume
+initialize → account/read → permissionProfile/list → experimentalFeature/list
+           → thread/start → memoryMode/set → thread/read → SQLite bind
+           → 或 thread/resume → thread/read
 job claim  → turn/start → item/completed* → turn/completed
 cancel     → turn/interrupt
 ```
@@ -128,6 +137,10 @@ turn、app-server 断连或 daemon 重启时，均保留 attempt 并进入
 `Interrupted`/`CancelUnknown`、recovery 和 quarantine，绝不自动重发或创建替代
 thread。
 
+Codex 0.145.0 的新 thread 在首个 turn 前不会自动落盘。daemon 只在有界物化回读确认
+rollout 位于专用 `CODEX_HOME/sessions`、首条 `session_meta.id` 匹配后写入 SQLite；
+因此已绑定 thread 的恢复失败视为数据损坏，不会降级为创建替代 thread。
+
 `item/completed` 只在内存中收集 agent message。只有匹配当前 thread/turn 的 terminal
 `turn/completed` 才能把一个 final 写入 outbox；reasoning、工具输出、progress、错误
 重试通知和流式 commentary 均不会直接进入 LiViS。完整安全与恢复边界见
@@ -139,8 +152,8 @@ LiViS 与执行后端使用不同门禁：
 
 1. LiViS：版本化 protocol profile、artifact 哈希、wire marker、`wireContractRevision + credentialMode`、active profile SHA pin、runtime contract digest、24 小时 supported proof 与本地脱敏 S2 probe artifact。
 2. Hermes：外置公共 platform plugin、connector hello、bridge 版本区间、Hermes runtime 版本区间和真实包 smoke test。
-3. Codex：CLI `[0.145.0, 0.146.0)` 版本窗、专用登录、固定 app-server argv、
-   thread/sandbox 安全回读和真实恶意凭据负向 canary。
+3. Codex：CLI `[0.145.0, 0.146.0)` 版本窗、专用登录、固定 app-server argv/config、
+   高风险 feature 回读、thread/rollout/sandbox 安全回读和真实恶意凭据负向 canary。
 4. daemon：自身版本与上述 profile 分离；升级 daemon 不覆盖状态目录中的 active profile、
    backend session 或 workspace。
 

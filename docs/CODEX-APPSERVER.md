@@ -10,7 +10,9 @@ Codex 当前是显式选择的实验后端；默认执行后端仍是 Hermes。C
 
 - Codex CLI 只审核 `[0.145.0, 0.146.0)`；当前窗口实际只放行 `0.145.x`。
 - daemon 直接启动 `codex app-server --strict-config --stdio`，同时禁用 plugins、
-  remote plugin 和 apps；Codex 不经过 Hermes bridge。
+  remote plugin、apps、宿主 shell snapshot/hooks、image generation、goals、memories、
+  skill 依赖安装和 multi-agent；Codex 不经过 Hermes bridge。专用配置还关闭 agents、
+  bundled skills 与自动 skill instructions。
 - Codex 模式在代码级要求 `security.allowAllNodes=false` 且
   `security.allowedNodeIds` 恰好包含一个获准 `node_id`。所有该设备的消息固定映射到
   `sessionKey=livis:<agentId>`，再映射到一个持久 Codex thread。
@@ -74,6 +76,53 @@ directory 中原地换设备会产生 session hash 冲突并拒绝复用旧 thre
 创建并读回 `0700` 普通目录，拒绝 symlink、realpath 漂移、inode 替换或安全
 `config.toml` 内容漂移。
 
+## 无模型 turn 的本机 smoke
+
+协议 fake 不能代替真实 app-server。使用下面的手动入口可在系统临时目录创建一个带
+专用 marker 的可丢弃 state directory，并执行：
+
+```text
+initialize → account/read → permissionProfile/list → experimentalFeature/list
+→ thread/start → thread/memoryMode/set(disabled) → thread/read
+→ close → 新 app-server initialize → thread/resume → close
+```
+
+```bash
+bun run smoke:codex:app-server -- --command /opt/homebrew/bin/codex
+```
+
+入口不会读取 relay config、不会打开或迁移 `relay.db`、不会复用 `~/.codex`，也绝不
+发送 `turn/start`。它会先把空 thread 物化，再由第二个真实 app-server 恢复同一 ID；
+输出中的 `zeroTurnMaterialized=true` 与 `zeroTurnResumeVerified=true` 才表示该回归通过。
+全新 state 的预期账号结果是 `authenticated=false`、`requiresOpenaiAuth=true`、
+`backendStartReady=false`；若意外继承账号会失败关闭。
+
+系统临时目录位于 macOS `:minimal` 读取基线内，不能用于证明凭据隔离。要运行真实读取
+负向 canary，必须在可信终端使用一个尚不存在、位于非临时私有持久父目录下的路径：
+
+```bash
+bun run smoke:codex:app-server -- \
+  --command /opt/homebrew/bin/codex \
+  --create-state-dir /绝对/非临时/路径/livis-codex-canary \
+  --verify-read-isolation
+```
+
+该模式用 `command/exec` 操作本入口生成的无秘密 marker，验证 workspace 可读写、专用
+`CODEX_HOME` 不可读写，且 sandbox 子进程看不到 `CODEX_HOME`、`OPENAI_*`、`LIVIS_*`。
+它不需要账号或模型 turn。macOS 嵌套沙箱可能拒绝在另一个 sandbox 中执行
+`sandbox-exec`，此时应在本机可信终端直接运行，不能把 `Operation not permitted`
+误判为 profile 通过或失败。
+
+只有本入口创建、权限为 `0700` 且 marker 精确匹配的目录，才能通过 `--state-dir`
+复用；`--create-state-dir` 要求目标不存在且父目录为 canonical 普通目录。两者都不能
+指向生产 state directory、项目 checkout 或用户日常 `~/.codex`。输出目录会保留，
+用完后由操作者确认路径再删除。
+
+这个 smoke 只承诺“没有模型 turn”，不承诺完全离线。Codex 0.145.0 即使在空账号下，
+也可能在 `thread/start` 后尝试连接模型控制面并产生有界 stderr；因此该入口保持手动，
+不加入默认 `bun run check`。每次运行还会在可丢弃 state 中创建一个未使用的非
+ephemeral thread。
+
 首次使用时，在本机可信终端为专用目录登录；不要从 LiViS 消息触发登录，也不要把
 API key 写入 argv、配置文件或 shell history。以下示例使用默认 state directory：
 
@@ -108,9 +157,13 @@ daemon 为 app-server 固定以下边界，并在 `thread/start` 或 `thread/res
 - active permission profile 必须为 `livis-remote`；
 - sandbox 必须为 `workspaceWrite`，`runtimeWorkspaceRoots` 必须恰好是上述 workspace，
   且 `sandbox.writableRoots` 不得追加任何额外写根；
-- 新建 thread 与每次 turn 都显式发送 `environments=[]`，禁止选择账号默认环境或沿用
-  thread sticky environment；`thread/resume` 协议没有该字段，因此恢复后的每次 turn
-  仍必须重新发送空数组；
+- 自定义 filesystem profile 固定为 `:root=deny`、`:minimal=read`、
+  `:workspace_roots=write`。其中 `:minimal` 只为 shell、动态库和系统运行时保留平台
+  基线，不等于绝对的 workspace-only 读取；
+- 新建 thread 与每次 turn 都显式选择唯一的 `local` environment，并在该选择中再次
+  固定 `cwd` 与 `runtimeWorkspaceRoots`；`environments=[]` 会清空本地 runtime roots，
+  不能用于隔离。`thread/resume` 不发送 environments，因此恢复后的每次 turn 仍必须
+  重新固定 `local` environment，不能沿用 thread sticky environment；
 - 工具网络为关闭状态，`/tmp` 与继承的 `TMPDIR` 不额外放行；
 - shell 只继承最小环境，并排除 `CODEX_HOME`、`OPENAI_*` 和 `LIVIS_*`；
 - workspace 预先标为 `untrusted`，防止 Codex 在首次 thread 创建时把项目自动追加为
@@ -120,6 +173,14 @@ app-server 的 NDJSON 单行、stderr、notification backlog、agent message 数
 累计内容均设有硬上限。stdout 在进程退出前 EOF、无法关联有效请求 ID 的已知
 server request（包括审批、用户输入、elicitation、动态工具、凭据刷新、attestation 与
 时间读取）都会直接关闭 transport，不得降级为可忽略 notification。
+
+daemon 还会通过 `experimentalFeature/list` 回读上述高风险 feature 均为 disabled；
+缺项、分页不完整或任一项重新启用都在创建 thread 前失败关闭。`shell_snapshot` 与
+hooks 必须特别保持关闭：前者会启动宿主 login shell 并 source runtime HOME 下的 rc，
+后者的 command runner 也不经过 turn sandbox。关闭 bundled skills 后，真实无模型
+smoke 不再铺设 `.system` skills 或 `shell_snapshots`；但上游仍会在外层 `0700` home
+内创建部分 `0755` 子目录和 `0644` 文件，不能把 daemon 自管目录/文件的
+`0700/0600` 保证外推到所有上游产物。
 
 这里的“无网络”指 agent 工具执行沙箱不允许网络访问；Codex app-server 自身仍需通过
 其认证控制面请求模型。workspace 内容应始终视为远程输入可影响的不可信数据，不应
@@ -143,6 +204,23 @@ Codex thread 是会话连续性的载体，不是 job/outbox 真源。daemon 重
 attempt、没有 quarantine 且持久元数据完全一致时才恢复同一个 thread；不会因为恢复
 失败而静默创建替代 thread。CLI 版本、cwd、session hash 或 thread 绑定发生冲突时均
 失败关闭。
+
+Codex 0.145.0 的非 ephemeral thread 在首个 user turn 前采用 lazy materialization；
+仅 `thread/start` 后关闭 app-server 会留下不可恢复 ID。daemon 因此在 SQLite bind 前
+固定执行：
+
+```text
+thread/start 安全回读
+→ thread/memoryMode/set(mode=disabled)
+→ 有界轮询 thread/read(includeTurns=true)
+→ 校验 rollout 位于专用 CODEX_HOME/sessions、普通非 symlink 文件、首条 session_meta.id
+→ bindBackendThread → onReady
+```
+
+物化验证前崩溃时 SQLite 仍保持 `thread_id=null`，最多遗留一个没有 turn 的空 rollout；
+验证后保持不变量“`backend_sessions.thread_id` 非空即 rollout 已验证存在”。已绑定 thread
+的 rollout 缺失、路径漂移或内容不匹配一律按数据损坏失败关闭，不会静默创建替代
+thread。真实 Codex 0.145.0 已通过“零 turn 关闭后由新 app-server 恢复同一 ID”回归。
 
 ## 取消、崩溃与人工 release
 
@@ -170,19 +248,101 @@ attempt；只要可能写入，就按 ambiguous execution 进入 `Interrupted`/q
 
 ## 当前上线门禁
 
-当前实现和真实 `thread/start` 安全回读已经确认 approval、permission profile、
-workspace-only writable roots、无工具网络以及 `/tmp` 隔离均命中预期。由于本轮验证
-环境本身运行在外层 sandbox 中，无法可靠嵌套 macOS Seatbelt 来完成“诱导 agent 读取
-专用 `CODEX_HOME`、LiViS secret、环境变量和 workspace 外 canary 文件”的真实恶意
-凭据 canary。
+当前实现和真实 `thread/start` 安全回读已经确认：只有显式选择 `local` environment
+后，approval、permission profile、workspace-only writable roots、无工具网络以及
+`/tmp` 隔离才会同时命中预期；空 environment 数组会退化为 `readOnly`。
 
-因此 Codex 后端只能作为 Draft PR/受控开发功能，不能宣称生产上线。合并或发布前至少
-还需要在代表性 macOS/Linux 主机上完成上述负向 canary，保存脱敏回执，并同时验证：
+2026-07-22 的旧 profile 真实命令 canary 曾确认 agent 可读取专用 `CODEX_HOME`；只剥离
+环境变量不足以保护凭据。加入 `:root=deny`、`:minimal=read` 与 workspace write
+carveout 后，Codex 0.145.0 已在 macOS 非临时、可丢弃私有目录重新通过：workspace
+可读写，专用 `CODEX_HOME` 读写被拒绝，且 `CODEX_HOME`、`OPENAI_*`、
+`LIVIS_*` 未进入 sandbox 子进程环境。该回执只覆盖当前 macOS/CLI/config 组合，不可
+外推到 Linux 或未来 Codex 版本。
 
-- workspace 内允许读写，workspace 外读写和工具网络均被拒绝；
-- `CODEX_HOME`、`OPENAI_*`、`LIVIS_*` 不可由 agent shell 读取；
+macOS 的 `:minimal` 会为系统运行时开放一组平台路径，并包含 `/tmp`、`/private/tmp`、
+`/var/tmp`。所以协议 smoke 可以使用系统临时目录，但凭据/读取隔离 canary 和生产
+`CODEX_HOME` 绝不能放在这些目录；必须使用不在 minimal 基线中的私有持久目录。Linux
+也必须按目标版本重新核对平台基线，不能把 macOS 回执直接复用。
+
+因此 Codex 后端已经跨过“空账号协议接线、读取隔离、零 turn 恢复与高风险 feature
+冻结”这组本地门禁，但仍只能作为受控开发功能，不能宣称生产上线。继续集成至少还要：
+
+- 用本地 fake Responses endpoint 截获工具定义，确认只有已审核的 core/workspace 工具；
+- 把 `experimentalFeature/list` 从“已知高风险项黑名单”收紧为已审核 enabled feature
+  allowlist；未知但 enabled 的新 feature 必须失败关闭；
 - workspace 内创建指向 Codex command 的 hardlink 必须被 sandbox 拒绝，并核对后续
   启动前 command 内容没有漂移；
+- 增加真实工具网络负向 canary；当前读取隔离 canary 没有尝试联网；
 - cancel、app-server kill 和 daemon restart 都进入预期 quarantine，且 release 前不派发；
+- 为专用账号完成一个受控真实 turn，验证总体 deadline、输出与工具事件归属；
 - 唯一设备的纯文本 job 只在 terminal 后产生一个 final，并完成
   `Succeeded → Delivered → App 回显`。
+
+### 2026-07-22 本机验证回执
+
+当前本地 worktree 在更新 `origin` 引用后仍基于最新 `origin/main`，未执行 merge、rebase、
+push 或创建 PR。本轮在允许监听 loopback TCP 与 Unix socket 的本机环境执行：
+
+```bash
+bun run check
+bun run smoke:codex:app-server -- --command /opt/homebrew/bin/codex
+bun run smoke:codex:app-server -- \
+  --command /opt/homebrew/bin/codex \
+  --state-dir /绝对/非临时/私有/canary/path \
+  --verify-read-isolation
+```
+
+`bun run check` 通过 276 个 Bun 测试和 22 个 Hermes pytest。两次真实 Codex 0.145.0
+smoke 均得到 `sentModelTurn=false`、`zeroTurnMaterialized=true` 和
+`zeroTurnResumeVerified=true`；非临时 canary 还确认 workspace 可读写、专用
+`CODEX_HOME` 读写被拒绝、敏感环境变量不可见。
+
+这些回执只证明当前 macOS 上的无模型协议、持久化和读取隔离边界。smoke 使用未登录的
+可丢弃专用 `CODEX_HOME`，所以 `backendStartReady=false` 是预期结果；它没有验证专用真实
+账号、模型 turn、工具最终清单、资源收口或 LiViS App 回显。
+
+## 当前产品语义与后续缺口
+
+当前代码实际实现的是：一个 daemon、一个获准 `node_id`、一个固定隔离空 workspace、
+一个长期 Codex thread，所有纯文本 job 串行执行；一套配置只能选择一个 backend。
+这足以验证第一条 Codex 功能链，但以下语义尚未定型：
+
+- LiViS 每次新对话是否创建新 thread，还是一台设备永久复用一个 thread；
+- workspace 永远由 daemon 创建为空目录，还是允许操作者显式绑定已有项目；
+- Codex/Claude Code 是部署时二选一，还是同时在线并按远端会话路由。
+
+当前已验证的 LiViS `send_message` 输入只有 job、来源 node 和文本，没有稳定的
+conversation/session 标识。因此“App 新对话自动创建新 thread”目前没有可靠路由键；
+在服务端字段得到 probe 证据前，只能继续复用唯一 thread，或由本地显式 rotate 命令切换，
+不能从 job ID、时间间隔或文本内容猜测对话边界。
+
+不依赖上述产品决策、仍应在 Codex MVP 后续补齐的工程项包括：
+
+- idle app-server 崩溃后的有界自动恢复；
+- 覆盖完整 turn 的 deadline，以及 CPU、内存、磁盘配额和可靠后代进程收口；
+- 持久保留 job → provider session/thread → provider turn 的审计映射；
+- 持久化 thread tail/checkpoint 并独占专用 session；恢复时若发现未映射或仍在
+  `inProgress` 的外部 turn，必须 quarantine；
+- 分离宿主 app-server 与 agent tool 的 HOME/TMPDIR。当前宿主 `HOME`/`TMPDIR` 位于
+  agent 可写 workspace 内；虽然 shell snapshot/hooks 已关闭，仍不能把“尚未观察到宿主
+  读取攻击者预置文件”当成稳定安全承诺；
+- job 入库时持久绑定目标 provider，避免停机积压 job 在切换 backend 后由另一 provider
+  执行；
+- 把账号标识、解析后的 model 与 runtime/config 版本纳入 immutable session 元数据，避免
+  换账号或默认模型漂移后静默复用旧 thread；
+- backend 不可用时的 Relay admission 策略：当前 idle app-server 退出后不会自动恢复，
+  新 job 仍可能持久化并 ACK，但会一直等待 daemon 人工重启；
+- 输入速率、排队深度、token/费用和持久磁盘总量配额；
+- session new/list/rotate/archive 与 workspace 生命周期管理；
+- 固定空 workspace 中产物的查看、导出或销毁路径；一期 LiViS 只回纯文本 final，不会把
+  本地文件交付到 App；
+- Codex CLI 升级后旧 session 的兼容检查与迁移路径；
+- 专用账号初始化/状态运维，以及真实 LiViS App 回显闭环。
+
+Claude Code 不应复用 Codex JSON-RPC transport。下一阶段应只抽象 provider-neutral 的
+backend registry、托管目录、session 生命周期、attempt fencing、terminal/cancel 语义
+和持久化标识；Codex 保留 app-server NDJSON，Claude 保留其 SDK/CLI stream-json 与
+transcript 路径。当前 `ExecutionBackend` 事件和 `backend_sessions.thread_id/active_turn_id`
+仍带 Codex 语义，在引入 Claude 前需要完成这层重命名与 capability 拆分。当前单个
+`CODEX_HOME/config.toml` 还精确绑定唯一 workspace；多 session/workspace 不能只增加一张
+路由表，必须同时拆分配置与 runtime layout 的所有权。

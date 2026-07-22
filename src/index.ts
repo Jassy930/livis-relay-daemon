@@ -11,6 +11,7 @@ import {
 } from "./config.ts";
 import { RelayDaemon, DAEMON_VERSION } from "./daemon.ts";
 import { runCodexCommand } from "./backends/codex/codex-execution-backend.ts";
+import { runCodexAppServerLocalSmoke } from "./backends/codex/local-smoke.ts";
 import {
   assertCodexRuntimeLayout,
   buildCodexEnvironment,
@@ -612,6 +613,22 @@ async function commandReleaseSession(args: string[]): Promise<void> {
   if (!released) process.exitCode = 1;
 }
 
+async function commandCodexSmokeAppServer(args: string[]): Promise<void> {
+  const command = optionValue(args, "--command");
+  if (!command) {
+    throw new Error(
+      "用法：codex smoke-app-server --command /绝对路径/codex [--state-dir 已有可丢弃目录 | --create-state-dir 新目录] [--verify-read-isolation]",
+    );
+  }
+  const report = await runCodexAppServerLocalSmoke({
+    command,
+    stateDir: optionValue(args, "--state-dir"),
+    createStateDir: optionValue(args, "--create-state-dir"),
+    verifyReadIsolation: args.includes("--verify-read-isolation"),
+  });
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+}
+
 function printHelp(): void {
   process.stdout.write(`livis-relay-daemon ${DAEMON_VERSION}\n\n`);
   process.stdout.write("命令：\n");
@@ -629,6 +646,7 @@ function printHelp(): void {
   process.stdout.write("  profile rollback-migration --receipt PATH --apply --acknowledge-daemon-and-hermes-stopped [--config PATH]\n");
   process.stdout.write("  connector-token [--config PATH]\n");
   process.stdout.write("  session release <sessionKey> [--config PATH]\n");
+  process.stdout.write("  codex smoke-app-server --command PATH [--state-dir PATH | --create-state-dir PATH] [--verify-read-isolation]\n");
 }
 
 async function main(): Promise<void> {
@@ -670,6 +688,10 @@ async function main(): Promise<void> {
     case "session":
       if (subcommand !== "release") throw new Error("只支持 session release");
       await commandReleaseSession(args);
+      break;
+    case "codex":
+      if (subcommand !== "smoke-app-server") throw new Error("只支持 codex smoke-app-server");
+      await commandCodexSmokeAppServer(args);
       break;
     case "version":
     case "--version":

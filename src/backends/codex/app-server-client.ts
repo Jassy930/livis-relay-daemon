@@ -1,14 +1,23 @@
+export const CODEX_DISABLED_FEATURES = [
+  "plugins",
+  "remote_plugin",
+  "apps",
+  "shell_snapshot",
+  "hooks",
+  "image_generation",
+  "goals",
+  "memories",
+  "skill_mcp_dependency_install",
+  "multi_agent",
+  "multi_agent_v2",
+] as const;
+
 export const CODEX_APP_SERVER_COMMAND = [
   "codex",
   "app-server",
   "--strict-config",
   "--stdio",
-  "--disable",
-  "plugins",
-  "--disable",
-  "remote_plugin",
-  "--disable",
-  "apps",
+  ...CODEX_DISABLED_FEATURES.flatMap((feature) => ["--disable", feature]),
 ] as const;
 
 export const DEFAULT_CODEX_APP_SERVER_REQUEST_TIMEOUT_MS = 30_000;
@@ -88,12 +97,33 @@ export interface CodexAppServerInitializeCapabilities {
   optOutNotificationMethods?: string[] | null;
 }
 
+/**
+ * app-server 的 environment 不是普通环境变量集合，而是一次执行使用的 runtime
+ * workspace 选择。空数组会清空本地 runtime roots，因此本地 daemon 必须显式选择
+ * 稳定的 `local` environment。
+ */
+export interface CodexAppServerEnvironment {
+  environmentId: string;
+  cwd: string;
+  runtimeWorkspaceRoots: readonly string[];
+}
+
+export function codexLocalEnvironment(
+  workspace: string,
+): readonly [CodexAppServerEnvironment] {
+  return [{
+    environmentId: "local",
+    cwd: workspace,
+    runtimeWorkspaceRoots: [workspace],
+  }];
+}
+
 export interface CodexThreadStartParams {
   cwd?: string | null;
   model?: string | null;
   approvalPolicy?: unknown;
   sandbox?: unknown;
-  environments?: readonly unknown[] | null;
+  environments?: readonly CodexAppServerEnvironment[] | null;
   ephemeral?: boolean | null;
   [key: string]: unknown;
 }
@@ -104,11 +134,21 @@ export interface CodexThreadResumeParams {
   [key: string]: unknown;
 }
 
+export interface CodexThreadMemoryModeSetParams {
+  threadId: string;
+  mode: "enabled" | "disabled";
+}
+
+export interface CodexThreadReadParams {
+  threadId: string;
+  includeTurns?: boolean;
+}
+
 export interface CodexTurnStartParams {
   threadId: string;
   input: readonly unknown[];
   cwd?: string | null;
-  environments?: readonly unknown[] | null;
+  environments?: readonly CodexAppServerEnvironment[] | null;
   [key: string]: unknown;
 }
 
@@ -265,6 +305,7 @@ export class CodexAppServerClient {
   private nextRequestId = 1;
   private state: ClientState = "running";
   private terminalError: Error | null = null;
+  private _initializeResult: unknown = null;
   private stderrBytes = new Uint8Array(0);
   private stderrTotalBytes = 0;
   private _exitCode: number | null = null;
@@ -324,7 +365,7 @@ export class CodexAppServerClient {
     };
 
     try {
-      await client.request("initialize", { clientInfo, capabilities });
+      client._initializeResult = await client.request("initialize", { clientInfo, capabilities });
       await client.notify("initialized");
       return client;
     } catch (error) {
@@ -335,6 +376,11 @@ export class CodexAppServerClient {
 
   get exited(): Promise<number> {
     return this.child.exited;
+  }
+
+  /** initialize 的原始结果；调用方必须按自己的 runtime 安全边界完成回读校验。 */
+  get initializeResult(): unknown {
+    return this._initializeResult;
   }
 
   get exitCode(): number | null {
@@ -407,6 +453,16 @@ export class CodexAppServerClient {
 
   threadResume<T = unknown>(params: CodexThreadResumeParams): Promise<T> {
     return this.request<T>("thread/resume", params);
+  }
+
+  threadMemoryModeSet<T = unknown>(params: CodexThreadMemoryModeSetParams): Promise<T> {
+    return this.request<T>("thread/memoryMode/set", params);
+  }
+
+  threadRead<T = unknown>(params: CodexThreadReadParams, timeoutMs?: number): Promise<T> {
+    return timeoutMs === undefined
+      ? this.request<T>("thread/read", params)
+      : this.request<T>("thread/read", params, timeoutMs);
   }
 
   turnStart<T = unknown>(params: CodexTurnStartParams): Promise<T> {

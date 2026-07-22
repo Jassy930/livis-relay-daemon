@@ -24,6 +24,15 @@ approval_policy = "never"
 approvals_reviewer = "user"
 web_search = "disabled"
 
+[agents]
+enabled = false
+
+[skills]
+include_instructions = false
+
+[skills.bundled]
+enabled = false
+
 [shell_environment_policy]
 inherit = "core"
 exclude = ["CODEX_HOME", "OPENAI_*", "LIVIS_*"]
@@ -32,6 +41,8 @@ exclude = ["CODEX_HOME", "OPENAI_*", "LIVIS_*"]
 description = "LiViS 远程会话：仅访问 daemon 托管 workspace"
 
 [permissions.${CODEX_REMOTE_PERMISSION_PROFILE}.filesystem]
+":root" = "deny"
+":minimal" = "read"
 ":workspace_roots" = "write"
 
 [permissions.${CODEX_REMOTE_PERMISSION_PROFILE}.network]

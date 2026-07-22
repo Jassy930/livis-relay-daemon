@@ -1,4 +1,6 @@
-import { isAbsolute } from "node:path";
+import { constants as fsConstants } from "node:fs";
+import { lstat, open, realpath } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Logger } from "../../logger.ts";
 import { errorMessage } from "../../logger.ts";
 import {
@@ -19,7 +21,9 @@ import type {
 } from "../execution-backend.ts";
 import {
   CODEX_APP_SERVER_COMMAND,
+  CODEX_DISABLED_FEATURES,
   CodexAppServerClient,
+  codexLocalEnvironment,
   CodexAppServerRequestTransportError,
   CodexAppServerTimeoutError,
   type CodexAppServerNotification,
@@ -41,6 +45,16 @@ const CODEX_NOTIFICATION_BACKLOG_MAX_BYTES = 8 * 1024 * 1024;
 const CODEX_AGENT_MESSAGE_MAX_COUNT = 1_024;
 const CODEX_AGENT_MESSAGE_ID_MAX_CHARS = 256;
 const CODEX_AGENT_MESSAGE_HARD_MAX_CHARS = 4 * 1024 * 1024;
+const CODEX_ROLLOUT_SESSION_META_MAX_BYTES = 1024 * 1024;
+export const DEFAULT_CODEX_FRESH_THREAD_MATERIALIZATION_TIMEOUT_MS = 5_000;
+const CODEX_FRESH_THREAD_MATERIALIZATION_POLL_INTERVAL_MS = 25;
+
+class CodexThreadNotMaterializedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "CodexThreadNotMaterializedError";
+  }
+}
 
 export interface CodexExecutionBackendOptions {
   stateDir: string;
@@ -214,7 +228,7 @@ export const runCodexCommand: CodexCommandRunner = async (command, options) => {
   }
 };
 
-function parseSupportedVersion(result: CodexCommandResult): string {
+export function validateCodexVersion(result: CodexCommandResult): string {
   if (result.exitCode !== 0) {
     throw new Error(`Codex CLI 版本探针失败（exit ${result.exitCode}）`);
   }
@@ -229,20 +243,42 @@ function parseSupportedVersion(result: CodexCommandResult): string {
   return parsed.join(".");
 }
 
-function validateAccountResponse(value: unknown): string {
+export interface CodexAccountInspection {
+  requiresOpenaiAuth: boolean;
+  accountType: string | null;
+}
+
+export function inspectCodexAccountResponse(value: unknown): CodexAccountInspection {
   const response = requireRecord(value, "account/read response");
   if (typeof response.requiresOpenaiAuth !== "boolean") {
     throw new Error("account/read response.requiresOpenaiAuth 必须是布尔值");
+  }
+  if (response.account === null) {
+    if (response.requiresOpenaiAuth !== true) {
+      throw new Error("account/read 未登录状态必须要求 OpenAI 认证");
+    }
+    return { requiresOpenaiAuth: response.requiresOpenaiAuth, accountType: null };
   }
   const account = requireRecord(response.account, "Codex 私有 CODEX_HOME account");
   const accountType = nonEmptyString(account.type, "Codex account.type");
   if (!["apiKey", "chatgpt", "amazonBedrock"].includes(accountType)) {
     throw new Error(`Codex account.type 未经审核：${accountType}`);
   }
-  return accountType;
+  if (response.requiresOpenaiAuth !== false) {
+    throw new Error("account/read 已有账号时不应继续要求 OpenAI 认证");
+  }
+  return { requiresOpenaiAuth: response.requiresOpenaiAuth, accountType };
 }
 
-function validatePermissionProfiles(value: unknown): void {
+function validateAccountResponse(value: unknown): string {
+  const inspection = inspectCodexAccountResponse(value);
+  if (inspection.accountType === null) {
+    throw new Error("Codex 私有 CODEX_HOME account 必须是对象");
+  }
+  return inspection.accountType;
+}
+
+export function validatePermissionProfiles(value: unknown): void {
   const response = requireRecord(value, "permissionProfile/list response");
   if (!Array.isArray(response.data)) {
     throw new Error("permissionProfile/list response.data 必须是数组");
@@ -255,7 +291,57 @@ function validatePermissionProfiles(value: unknown): void {
   }
 }
 
-function validateThreadResponse(
+export function validateDisabledCodexFeatures(value: unknown): void {
+  const response = requireRecord(value, "experimentalFeature/list response");
+  if (!Array.isArray(response.data) || response.nextCursor !== null) {
+    throw new Error("Codex feature 列表必须在单页完整返回");
+  }
+  const features = new Map<string, boolean>();
+  for (const candidate of response.data) {
+    if (!isRecord(candidate) || typeof candidate.name !== "string" ||
+        typeof candidate.enabled !== "boolean") {
+      throw new Error("Codex feature 列表包含非法条目");
+    }
+    features.set(candidate.name, candidate.enabled);
+  }
+  for (const feature of CODEX_DISABLED_FEATURES) {
+    if (features.get(feature) !== false) {
+      throw new Error(`Codex 高风险 feature 未禁用或未回读：${feature}`);
+    }
+  }
+}
+
+export interface CodexInitializeInspection {
+  userAgent: string;
+  platformFamily: string;
+  platformOs: string;
+}
+
+export function validateCodexInitializeResponse(
+  value: unknown,
+  layout: CodexRuntimeLayout,
+  cliVersion: string,
+): CodexInitializeInspection {
+  const response = requireRecord(value, "initialize response");
+  if (response.codexHome !== layout.codexHome) {
+    throw new Error("Codex initialize.codexHome 未固定到 daemon 专用 CODEX_HOME");
+  }
+  const userAgent = nonEmptyString(response.userAgent, "Codex initialize.userAgent");
+  const userAgentProduct = userAgent.split(" ", 1)[0];
+  if (userAgentProduct !== `livis-relay-daemon/${cliVersion}`) {
+    throw new Error("Codex initialize.userAgent 的 CLI 版本与版本探针不一致");
+  }
+  return {
+    userAgent,
+    platformFamily: nonEmptyString(
+      response.platformFamily,
+      "Codex initialize.platformFamily",
+    ),
+    platformOs: nonEmptyString(response.platformOs, "Codex initialize.platformOs"),
+  };
+}
+
+export function validateThreadResponse(
   value: unknown,
   layout: CodexRuntimeLayout,
   expectedThreadId: string | null,
@@ -308,6 +394,175 @@ function validateThreadResponse(
     throw new Error("Codex sandbox 回读不应包含 runtime workspace 之外的额外 writable root");
   }
   return threadId;
+}
+
+function isWithinPath(parent: string, child: string): boolean {
+  const value = relative(parent, child);
+  return value === "" || (!value.startsWith(`..${sep}`) && value !== ".." && !isAbsolute(value));
+}
+
+function isMissingPathError(error: unknown): boolean {
+  return isRecord(error) && error.code === "ENOENT";
+}
+
+/**
+ * 校验 thread/read 返回的 rollout 是专用 CODEX_HOME 内、可恢复且属于同一 thread。
+ * 文件读取有硬上限，并用 O_NOFOLLOW 与 inode 回读避免把 symlink 或竞态替换当成证据。
+ */
+export async function validatePersistedCodexThread(
+  value: unknown,
+  layout: CodexRuntimeLayout,
+  expectedThreadId: string,
+): Promise<string> {
+  const response = requireRecord(value, "thread/read response");
+  const thread = requireRecord(response.thread, "thread/read response.thread");
+  const threadId = nonEmptyString(thread.id, "thread/read response.thread.id");
+  if (threadId !== expectedThreadId) {
+    throw new Error("Codex thread/read 返回了不同 threadId");
+  }
+  if (
+    thread.path === null ||
+    thread.path === undefined ||
+    (typeof thread.path === "string" && thread.path.trim() === "")
+  ) {
+    throw new CodexThreadNotMaterializedError("Codex thread/read 尚未返回 rollout path");
+  }
+  const reportedPath = nonEmptyString(thread.path, "thread/read response.thread.path");
+  if (!isAbsolute(reportedPath)) {
+    throw new Error("Codex rollout path 必须是绝对路径");
+  }
+  const rolloutPath = resolve(reportedPath);
+  const rolloutRoot = resolve(join(layout.codexHome, "sessions"));
+  if (rolloutPath === rolloutRoot || !isWithinPath(rolloutRoot, rolloutPath)) {
+    throw new Error("Codex rollout path 未位于专用 CODEX_HOME/sessions");
+  }
+
+  let pathInfo: Awaited<ReturnType<typeof lstat>>;
+  try {
+    pathInfo = await lstat(rolloutPath);
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      throw new CodexThreadNotMaterializedError(
+        `Codex rollout 尚未落盘：${rolloutPath}`,
+        { cause: error },
+      );
+    }
+    throw new Error(`Codex rollout path 不可读取：${rolloutPath}`, { cause: error });
+  }
+  if (pathInfo.isSymbolicLink() || !pathInfo.isFile()) {
+    throw new Error("Codex rollout 必须是普通非 symlink 文件");
+  }
+  let canonicalRolloutPath: string;
+  try {
+    canonicalRolloutPath = await realpath(rolloutPath);
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      throw new CodexThreadNotMaterializedError(
+        `Codex rollout 在 realpath 前尚未稳定落盘：${rolloutPath}`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+  if (canonicalRolloutPath !== rolloutPath) {
+    throw new Error("Codex rollout realpath 与专用 CODEX_HOME 内路径不一致");
+  }
+
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(rolloutPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      throw new CodexThreadNotMaterializedError(
+        `Codex rollout 在打开前尚未稳定落盘：${rolloutPath}`,
+        { cause: error },
+      );
+    }
+    throw new Error(`Codex rollout 无法以 no-follow 模式打开：${rolloutPath}`, { cause: error });
+  }
+  try {
+    const openedInfo = await handle.stat();
+    if (
+      !openedInfo.isFile() ||
+      openedInfo.dev !== pathInfo.dev ||
+      openedInfo.ino !== pathInfo.ino
+    ) {
+      throw new Error("Codex rollout 在校验期间被替换");
+    }
+    const buffer = new Uint8Array(CODEX_ROLLOUT_SESSION_META_MAX_BYTES + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, 0);
+    const newline = buffer.indexOf(0x0a, 0);
+    const firstLineBytes = newline >= 0 ? newline : bytesRead;
+    if (
+      firstLineBytes > CODEX_ROLLOUT_SESSION_META_MAX_BYTES ||
+      (newline < 0 && bytesRead > CODEX_ROLLOUT_SESSION_META_MAX_BYTES)
+    ) {
+      throw new Error("Codex rollout 首条 session_meta 超过读取上限");
+    }
+    const lineEnd = firstLineBytes > 0 && buffer[firstLineBytes - 1] === 0x0d
+      ? firstLineBytes - 1
+      : firstLineBytes;
+    if (lineEnd === 0) {
+      throw new CodexThreadNotMaterializedError("Codex rollout 已创建但 session_meta 尚未写入");
+    }
+    let firstRecord: unknown;
+    try {
+      firstRecord = JSON.parse(
+        new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, lineEnd)),
+      );
+    } catch (error) {
+      throw new Error("Codex rollout 首行不是有效 UTF-8 JSON", { cause: error });
+    }
+    const sessionMeta = requireRecord(firstRecord, "Codex rollout 首条记录");
+    const payload = requireRecord(sessionMeta.payload, "Codex rollout session_meta.payload");
+    if (sessionMeta.type !== "session_meta" || payload.id !== expectedThreadId) {
+      throw new Error("Codex rollout 首条 session_meta id 与 threadId 不一致");
+    }
+  } finally {
+    await handle.close();
+  }
+  return rolloutPath;
+}
+
+/** Codex 0.145.0 的新 thread 需显式关闭 memory mode 才会在首个 turn 前落盘。 */
+export async function materializeFreshCodexThread(
+  client: CodexAppServerClient,
+  layout: CodexRuntimeLayout,
+  threadId: string,
+  timeoutMs = DEFAULT_CODEX_FRESH_THREAD_MATERIALIZATION_TIMEOUT_MS,
+): Promise<string> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("Codex thread 物化 timeoutMs 必须是正整数");
+  }
+  await client.threadMemoryModeSet({ threadId, mode: "disabled" });
+  const deadline = Date.now() + timeoutMs;
+  let lastTransientError: CodexThreadNotMaterializedError | null = null;
+  while (true) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw new Error(
+        `Codex 新 thread 在 ${timeoutMs} ms 内未物化 rollout`,
+        { cause: lastTransientError },
+      );
+    }
+    const persisted = await client.threadRead(
+      { threadId, includeTurns: true },
+      remainingMs,
+    );
+    try {
+      return await validatePersistedCodexThread(persisted, layout, threadId);
+    } catch (error) {
+      if (!(error instanceof CodexThreadNotMaterializedError)) throw error;
+      lastTransientError = error;
+    }
+    const delayMs = Math.min(
+      CODEX_FRESH_THREAD_MATERIALIZATION_POLL_INTERVAL_MS,
+      deadline - Date.now(),
+    );
+    if (delayMs > 0) {
+      await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, delayMs));
+    }
+  }
 }
 
 function buildAppServerCommand(command: string): readonly string[] {
@@ -420,7 +675,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
         env: environment,
         timeoutMs: this.options.requestTimeoutMs,
       });
-      const cliVersion = parseSupportedVersion(versionResult);
+      const cliVersion = validateCodexVersion(versionResult);
       const storedSession = this.store.ensureBackendSession({
         backend: this.kind,
         sessionKey: this.options.sessionKey,
@@ -455,11 +710,16 @@ export class CodexExecutionBackend implements ExecutionBackend {
         (error: unknown) => this.onProcessExit(null, error),
       );
 
+      validateCodexInitializeResponse(client.initializeResult, layout, cliVersion);
+
       const accountType = validateAccountResponse(
         await client.request("account/read", { refreshToken: false }),
       );
       validatePermissionProfiles(
         await client.request("permissionProfile/list", { cwd: layout.workspace }),
+      );
+      validateDisabledCodexFeatures(
+        await client.request("experimentalFeature/list", { cursor: null, limit: 256 }),
       );
       await assertCodexRuntimeLayout(layout);
 
@@ -476,7 +736,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
         if (storedSession.threadId === null) {
           threadResponse = await client.threadStart({
             ...commonThreadParams,
-            environments: [],
+            environments: codexLocalEnvironment(layout.workspace),
             ephemeral: false,
           });
         } else {
@@ -505,11 +765,22 @@ export class CodexExecutionBackend implements ExecutionBackend {
           layout,
           storedSession.threadId,
         );
+        if (storedSession.threadId === null) {
+          await materializeFreshCodexThread(
+            client,
+            layout,
+            threadId,
+            this.options.requestTimeoutMs,
+          );
+        } else {
+          const persisted = await client.threadRead({ threadId, includeTurns: true });
+          await validatePersistedCodexThread(persisted, layout, threadId);
+        }
         this.store.bindBackendThread(this.kind, this.options.sessionKey, threadId);
       } catch (error) {
         this.store.quarantineSession(
           this.options.sessionKey,
-          `Codex thread 已返回但安全回读或 SQLite bind 失败：${errorMessage(error)}`,
+          `Codex thread 已返回但安全回读、rollout 物化或 SQLite bind 失败：${errorMessage(error)}`,
         );
         throw error;
       }
@@ -631,7 +902,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
       response = await this.client.turnStart({
         threadId: this.threadId,
         input: [{ type: "text", text: job.text, text_elements: [] }],
-        environments: [],
+        environments: codexLocalEnvironment(this.layout.workspace),
         cwd: this.layout.workspace,
         runtimeWorkspaceRoots: [this.layout.workspace],
         approvalPolicy: "never",

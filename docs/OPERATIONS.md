@@ -295,8 +295,38 @@ quarantine 边界后才可把 acknowledgement 设为 `true`。Codex 模式代码
 `doctor --online` 应显示 `execution_backend=codex`、remote execution acknowledgement
 为 true、Codex 版本命中窗口、SQLite integrity 正常且无 quarantine。它不检查专用
 账号是否真的可创建 thread；最终还要由 `serve` 的 `account/read`、permission profile
-和 thread sandbox 回读共同放行。恶意凭据读取负向 canary 尚未完成，因此本模式当前
-只用于 Draft PR/受控开发，不得宣称生产上线。
+高风险 feature、thread sandbox 与 rollout 持久化回读共同放行。macOS/Codex 0.145.0
+的非临时读取负向 canary 与零 turn 重启恢复已经通过；真实账号 turn、Linux、资源配额、
+后代进程收口和 LiViS App 回显仍未验收，因此本模式当前只用于受控开发，不得宣称
+生产上线。
+
+调试真实 app-server 协议时，不要让 `doctor` 或 `serve` 打开现有生产状态。下面的
+手动 smoke 自建带 marker 的临时 state，不打开 relay SQLite，也不发送模型 turn：
+
+```bash
+bun run smoke:codex:app-server -- --command /opt/homebrew/bin/codex
+```
+
+全新目录的 `backendStartReady=false` 表示专用账号尚未登录，不是协议 smoke 失败。
+入口可能产生 app-server 控制面网络尝试和 stderr，并会保留输出中的可丢弃 stateDir；
+复用时只能传回同一 marker 目录。输出中的 `zeroTurnMaterialized=true` 与
+`zeroTurnResumeVerified=true` 表示空 thread 已由第二个 app-server 恢复，但临时目录
+不能证明读取隔离。
+
+读取负向 canary 必须使用尚不存在的非临时可丢弃目录，并从可信本机终端执行：
+
+```bash
+bun run smoke:codex:app-server -- \
+  --command /opt/homebrew/bin/codex \
+  --create-state-dir /绝对/非临时/路径/livis-codex-canary \
+  --verify-read-isolation
+```
+
+只有同时读回 `workspaceRead=true`、`workspaceWrite=true`、
+`codexHomeReadDenied=true`、`codexHomeWriteDenied=true`、
+`sensitiveEnvironmentHidden=true`、`highRiskFeaturesDisabled=true` 和
+`bundledSkillsDisabled=true` 才表示本机安全 probe 通过。该命令不登录、不发送模型
+turn，也不等于真实 LiViS 功能闭环；用完后确认输出路径再删除。
 
 ## 7. 启动顺序
 
