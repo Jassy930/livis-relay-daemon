@@ -3,6 +3,7 @@ import {
   CODEX_APP_SERVER_COMMAND,
   CodexAppServerClient,
   CodexAppServerCloseUnconfirmedError,
+  CodexAppServerProcessError,
   CodexAppServerProcessOwnershipUnconfirmedError,
   CodexAppServerRequestTransportError,
   CodexAppServerRpcError,
@@ -131,6 +132,16 @@ class FakeAppServer {
     this.exit.resolve(exitCode);
   }
 
+  async exitBeforeClosingStdio(exitCode: number): Promise<void> {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.exit.resolve(exitCode);
+    // 让 client 的 exit observer 先结算进程错误，避免 stdout EOF 抢先成为
+    // transport cause；随后仍关闭两个 stream，保证测试完整收口。
+    await Promise.resolve();
+    await Promise.allSettled([this.stdoutWriter.close(), this.stderrWriter.close()]);
+  }
+
   async startClient(
     options: Partial<Parameters<typeof CodexAppServerClient.start>[0]> = {},
   ): Promise<CodexAppServerClient> {
@@ -228,7 +239,7 @@ describe("Codex app-server stdio client", () => {
     }
   });
 
-  test("可解析拆分的无 jsonrpc NDJSON 通知与 RPC error", async () => {
+  test("可解析拆分的无 jsonrpc NDJSON 通知，且 RPC error 不暴露自由文本", async () => {
     const fake = new FakeAppServer();
     const notifications: string[] = [];
     const client = await fake.startClient({
@@ -245,13 +256,24 @@ describe("Codex app-server stdio client", () => {
         if (message.method === "turn/start") {
           await fake.send({
             id: message.id,
-            error: { code: -32_000, message: "synthetic failure", data: { retryable: false } },
+            error: {
+              code: -32_000,
+              message: "RPC_MESSAGE_SENSITIVE_SENTINEL",
+              data: { detail: "RPC_DATA_SENSITIVE_SENTINEL" },
+            },
           });
         }
       };
       const failure = client.turnStart({ threadId: "thread-1", input: [] });
-      await expect(failure).rejects.toBeInstanceOf(CodexAppServerRpcError);
-      await expect(failure).rejects.toThrow("synthetic failure");
+      const rpcError = await failure.then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(rpcError).toBeInstanceOf(CodexAppServerRpcError);
+      expect((rpcError as Error).message)
+        .toBe("Codex app-server turn/start RPC 失败（code -32000）");
+      expect((rpcError as Error).message).not.toContain("RPC_MESSAGE_SENSITIVE_SENTINEL");
+      expect(JSON.stringify(rpcError)).not.toContain("RPC_DATA_SENSITIVE_SENTINEL");
       expect(client.pendingRequestCount).toBe(0);
     } finally {
       await client.close();
@@ -349,8 +371,7 @@ describe("Codex app-server stdio client", () => {
           if (invalidId !== undefined) request.id = invalidId;
           await fake.send(request);
           await expect(pending).rejects.toBeInstanceOf(CodexAppServerRequestTransportError);
-          await expect(pending).rejects.toThrow("server request 缺少有效 id");
-          await expect(pending).rejects.toThrow(method);
+          await expect(pending).rejects.toThrow("请求因传输终止");
           await client.exited;
           expect(notifications).toEqual([]);
         } finally {
@@ -371,7 +392,7 @@ describe("Codex app-server stdio client", () => {
       await fake.closeStdoutOnly();
 
       await expect(pending).rejects.toBeInstanceOf(CodexAppServerRequestTransportError);
-      await expect(pending).rejects.toThrow("stdout 在进程退出前意外关闭");
+      await expect(pending).rejects.toThrow("请求因传输终止");
       expect(client.pendingRequestCount).toBe(0);
       expect(() => client.request("synthetic/after-eof")).toThrow(
         "stdout 在进程退出前意外关闭",
@@ -469,12 +490,51 @@ describe("Codex app-server stdio client", () => {
     await fake.stop(17);
 
     await expect(pendingA).rejects.toBeInstanceOf(CodexAppServerRequestTransportError);
-    await expect(pendingB).rejects.toThrow("stdout 在进程退出前意外关闭");
+    await expect(pendingB).rejects.toThrow("请求因传输终止");
     await waitFor(() => client.exitCode === 17, "进程退出状态");
     expect(client.pendingRequestCount).toBe(0);
     expect(client.stderrText).toBe("89abcdef");
     expect(client.stderrTruncated).toBeTrue();
     expect(new TextEncoder().encode(client.stderrText).byteLength).toBeLessThanOrEqual(8);
+    await client.close();
+  });
+
+  test("进程退出与 pending transport message 不暴露 stderr", async () => {
+    const sensitiveStderr = "SENSITIVE_STDERR_SENTINEL_DO_NOT_EXPOSE";
+    const fake = new FakeAppServer();
+    const client = await fake.startClient();
+    fake.onMessage = () => undefined;
+    const pending = client.request("synthetic/sensitive-exit", {}, 1_000);
+    await waitFor(() => client.pendingRequestCount === 1, "敏感退出 pending 请求");
+    await fake.writeStderr(sensitiveStderr);
+    await fake.exitBeforeClosingStdio(23);
+
+    let transportError: unknown;
+    try {
+      await pending;
+    } catch (error) {
+      transportError = error;
+    }
+    expect(transportError).toBeInstanceOf(CodexAppServerRequestTransportError);
+    expect((transportError as Error).message).toBe(
+      "Codex app-server synthetic/sensitive-exit 请求因传输终止（exit 23）",
+    );
+    expect((transportError as Error).message).not.toContain(sensitiveStderr);
+    expect((transportError as CodexAppServerRequestTransportError).cause).toBeInstanceOf(
+      CodexAppServerProcessError,
+    );
+
+    let processError: unknown;
+    try {
+      client.request("synthetic/after-sensitive-exit");
+    } catch (error) {
+      processError = error;
+    }
+    expect(processError).toBeInstanceOf(CodexAppServerProcessError);
+    expect((processError as CodexAppServerProcessError).exitCode).toBe(23);
+    expect((processError as Error).message).toBe("Codex app-server 已退出（exit 23）");
+    expect((processError as Error).message).not.toContain(sensitiveStderr);
+    expect(client.stderrText).toBe(sensitiveStderr);
     await client.close();
   });
 

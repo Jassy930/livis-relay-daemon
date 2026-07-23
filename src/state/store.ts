@@ -1236,6 +1236,33 @@ export class JobStore {
       "Failed",
       resultJson,
       error,
+      null,
+    );
+  }
+
+  finishBackendCredentialFailure(
+    jobId: string,
+    backend: string,
+    leaseId: string,
+    runGeneration: number,
+    turnId: string,
+    resultJson: string,
+    error: string,
+    quarantineReason: string,
+  ): StoredJob | null {
+    if (!quarantineReason.trim()) {
+      throw new Error("backend credential failure quarantine 原因不能为空");
+    }
+    return this.finishBackendWithOutbox(
+      jobId,
+      backend,
+      leaseId,
+      runGeneration,
+      turnId,
+      "Failed",
+      resultJson,
+      error,
+      quarantineReason,
     );
   }
 
@@ -2301,6 +2328,7 @@ export class JobStore {
     status: "Succeeded" | "Failed",
     resultJson: string,
     error: string | null,
+    quarantineReason: string | null = null,
   ): StoredJob | null {
     const now = Date.now();
     const transaction = this.database.transaction(() => {
@@ -2346,6 +2374,43 @@ export class JobStore {
         createdAt: now,
       });
       this.upsertOutbox(jobId, resultJson, now);
+      if (quarantineReason !== null) {
+        this.database
+          .query(`INSERT OR IGNORE INTO session_quarantine(
+                    scope_key,session_key,reason,created_at
+                  )
+                  SELECT jobs.scope_key,jobs.session_key,?,? FROM jobs
+                  JOIN backend_sessions backend_session
+                    ON backend_session.scope_key=jobs.scope_key
+                   AND backend_session.backend=jobs.target_backend
+                   AND backend_session.session_key=jobs.session_key
+                   AND backend_session.active_job_id=jobs.job_id
+                   AND backend_session.active_lease_id=jobs.lease_id
+                   AND backend_session.active_run_generation=jobs.run_generation
+                   AND backend_session.active_turn_id=?
+                   AND backend_session.recovery_required=0
+                  WHERE jobs.scope_key=? AND jobs.job_id=?
+                    AND jobs.target_backend=? AND jobs.lease_id=?
+                    AND jobs.run_generation=?`)
+          .run(
+            quarantineReason,
+            now,
+            turnId,
+            this.scopeKey,
+            jobId,
+            backend,
+            leaseId,
+            runGeneration,
+          );
+        const quarantined = this.database
+          .query<{ present: number }, [string, string, string]>(
+            "SELECT 1 AS present FROM session_quarantine WHERE scope_key=? AND session_key=(SELECT session_key FROM jobs WHERE scope_key=? AND job_id=?)",
+          )
+          .get(this.scopeKey, this.scopeKey, jobId);
+        if (!quarantined) {
+          throw new Error("backend credential failure 未能原子 quarantine session");
+        }
+      }
       const cleared = this.database
         .query(`UPDATE backend_sessions
                 SET active_job_id=NULL, active_lease_id=NULL,

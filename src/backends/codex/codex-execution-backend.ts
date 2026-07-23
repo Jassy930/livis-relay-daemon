@@ -247,6 +247,74 @@ function requireRecord(value: unknown, label: string): Record<string, unknown> {
   return value;
 }
 
+const SAFE_CODEX_ERROR_LABELS = new Map<string, string>([
+  ["contextWindowExceeded", "上下文窗口超限"],
+  ["sessionBudgetExceeded", "会话预算已耗尽"],
+  ["usageLimitExceeded", "账号使用额度已耗尽"],
+  ["serverOverloaded", "provider 过载"],
+  ["cyberPolicy", "请求被安全策略拒绝"],
+  ["internalServerError", "provider 内部错误"],
+  ["unauthorized", "provider 认证失败"],
+  ["badRequest", "provider 拒绝了无效请求"],
+  ["threadRollbackFailed", "thread 回滚失败"],
+  ["sandboxError", "sandbox 执行失败"],
+  ["other", "provider 返回未分类错误"],
+]);
+
+/**
+ * provider message 可能包含 API key 的掩码片段或其他账号信息，不能直接进入
+ * JobStore、Relay 或共享日志。这里只保留经过白名单审核的错误分类。
+ */
+interface SafeCodexTurnFailure {
+  message: string;
+  credentialRejected: boolean;
+}
+
+function safeCodexTurnFailure(value: unknown): SafeCodexTurnFailure {
+  if (!isRecord(value)) {
+    return { message: "Codex turn 执行失败", credentialRejected: false };
+  }
+  const message = typeof value.message === "string" ? value.message : "";
+  if (/\binvalid_api_key\b/i.test(message) || /Incorrect API key provided/i.test(message)) {
+    return {
+      message: "Codex provider 认证失败（401 invalid_api_key）",
+      credentialRejected: true,
+    };
+  }
+
+  const errorInfo = value.codexErrorInfo;
+  if (typeof errorInfo === "string") {
+    const label = SAFE_CODEX_ERROR_LABELS.get(errorInfo);
+    return {
+      message: label ? `Codex ${label}` : "Codex turn 执行失败",
+      credentialRejected: errorInfo === "unauthorized",
+    };
+  }
+  if (isRecord(errorInfo)) {
+    for (const [kind, detail] of Object.entries(errorInfo)) {
+      if (![
+        "httpConnectionFailed",
+        "responseStreamConnectionFailed",
+        "responseStreamDisconnected",
+        "responseTooManyFailedAttempts",
+      ].includes(kind)) {
+        continue;
+      }
+      const status = isRecord(detail) && Number.isSafeInteger(detail.httpStatusCode) &&
+          Number(detail.httpStatusCode) >= 100 && Number(detail.httpStatusCode) <= 599
+        ? Number(detail.httpStatusCode)
+        : null;
+      return {
+        message: status === null
+          ? `Codex provider 连接失败（${kind}）`
+          : `Codex provider 连接失败（${kind} HTTP ${status}）`,
+        credentialRejected: status === 401,
+      };
+    }
+  }
+  return { message: "Codex turn 执行失败", credentialRejected: false };
+}
+
 function requestWasDefinitelyUnwritten(error: unknown): boolean {
   return (
     (error instanceof CodexAppServerTimeoutError ||
@@ -568,17 +636,34 @@ export function validateThreadResponse(
   return inspectThreadResponse(value, layout, expectedThreadId).threadId;
 }
 
-export interface CodexThreadTailInspection {
-  threadStatus: "idle";
+interface CodexThreadTailCheckpoint {
   turnId: string | null;
   turnStatus: "completed" | "failed" | "interrupted" | null;
   turnCount: number;
   turnsSha256: string;
 }
 
+export interface CodexThreadTailInspection extends CodexThreadTailCheckpoint {
+  threadStatus: "idle";
+}
+
+interface CodexCheckpointThreadTailInspection extends CodexThreadTailCheckpoint {
+  threadStatus: "idle" | "systemError";
+}
+
+interface CodexSystemErrorDispatchMarker {
+  threadStatus: "systemError";
+  threadId: string;
+  clientEpoch: number;
+  turnId: string;
+  turnStatus: "failed";
+  turnCount: number;
+  turnsSha256: string;
+}
+
 function assertStoredThreadCheckpoint(
   stored: StoredBackendSession,
-  actual: CodexThreadTailInspection,
+  actual: CodexThreadTailCheckpoint,
 ): void {
   if (
     stored.checkpointTurnCount === null || stored.checkpointTurnsSha256 === null ||
@@ -596,10 +681,10 @@ function assertStoredThreadCheckpoint(
   }
 }
 
-export function inspectCodexThreadTail(
+function parseCodexThreadTail(
   value: unknown,
   expectedThreadId: string,
-): CodexThreadTailInspection {
+): CodexCheckpointThreadTailInspection {
   const response = requireRecord(value, "thread/read response");
   const thread = requireRecord(response.thread, "thread/read response.thread");
   const threadId = nonEmptyString(thread.id, "thread/read response.thread.id");
@@ -608,9 +693,6 @@ export function inspectCodexThreadTail(
   }
   const status = requireRecord(thread.status, "thread/read response.thread.status");
   const statusType = nonEmptyString(status.type, "thread/read response.thread.status.type");
-  if (statusType !== "idle") {
-    throw new Error(`Codex thread 恢复时不是 idle：${statusType}`);
-  }
   if (!Array.isArray(thread.turns)) {
     throw new Error("Codex thread/read turns 必须是数组");
   }
@@ -633,13 +715,55 @@ export function inspectCodexThreadTail(
     };
   });
   const tail = turns.at(-1) ?? null;
+  if (statusType !== "idle" && statusType !== "systemError") {
+    throw new Error(`Codex thread 当前不是稳定终态：${statusType}`);
+  }
+  if (statusType === "systemError" && tail?.status !== "failed") {
+    throw new Error("Codex thread 的 systemError 没有对应 failed tail");
+  }
   return {
-    threadStatus: "idle",
+    threadStatus: statusType,
     turnId: tail?.id ?? null,
     turnStatus: tail?.status ?? null,
     turnCount: turns.length,
     turnsSha256: sha256(JSON.stringify(turns)),
   };
+}
+
+export function inspectCodexThreadTail(
+  value: unknown,
+  expectedThreadId: string,
+): CodexThreadTailInspection {
+  const tail = parseCodexThreadTail(value, expectedThreadId);
+  if (tail.threadStatus !== "idle") {
+    throw new Error(`Codex thread 当前不是 idle：${tail.threadStatus}`);
+  }
+  return { ...tail, threadStatus: "idle" };
+}
+
+function inspectCodexCheckpointThreadTail(
+  value: unknown,
+  expectedThreadId: string,
+): CodexCheckpointThreadTailInspection {
+  return parseCodexThreadTail(value, expectedThreadId);
+}
+
+function inspectTerminalCodexThreadTail(
+  value: unknown,
+  expectedThreadId: string,
+  expectedTurnId: string,
+  expectedStatus: "completed" | "failed" | "interrupted",
+): CodexCheckpointThreadTailInspection {
+  const tail = parseCodexThreadTail(value, expectedThreadId);
+  if (tail.turnId !== expectedTurnId || tail.turnStatus !== expectedStatus) {
+    throw new Error(
+      `Codex terminal checkpoint 与通知不一致：${tail.turnId ?? "<empty>"}/${tail.turnStatus ?? "<empty>"}`,
+    );
+  }
+  if (tail.threadStatus === "systemError" && expectedStatus !== "failed") {
+    throw new Error("Codex thread 的 systemError 只能对应 failed terminal");
+  }
+  return tail;
 }
 
 function isWithinPath(parent: string, child: string): boolean {
@@ -661,6 +785,24 @@ export async function validatePersistedCodexThread(
   expectedThreadId: string,
 ): Promise<string> {
   inspectCodexThreadTail(value, expectedThreadId);
+  return validatePersistedCodexRollout(value, layout, expectedThreadId);
+}
+
+async function inspectPersistedCodexCheckpointTail(
+  value: unknown,
+  layout: CodexRuntimeLayout,
+  expectedThreadId: string,
+): Promise<CodexCheckpointThreadTailInspection> {
+  const tail = inspectCodexCheckpointThreadTail(value, expectedThreadId);
+  await validatePersistedCodexRollout(value, layout, expectedThreadId);
+  return tail;
+}
+
+async function validatePersistedCodexRollout(
+  value: unknown,
+  layout: CodexRuntimeLayout,
+  expectedThreadId: string,
+): Promise<string> {
   const response = requireRecord(value, "thread/read response");
   const thread = requireRecord(response.thread, "thread/read response.thread");
   const threadId = nonEmptyString(thread.id, "thread/read response.thread.id");
@@ -870,6 +1012,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
   private stopPromise: Promise<void> | null = null;
   private startInProgress = false;
   private clientEpoch = 0;
+  private systemErrorDispatchMarker: CodexSystemErrorDispatchMarker | null = null;
   private recoveryAttempts = 0;
   private recoveryNextAttemptAt: number | null = null;
   private recoveryLastError: string | null = null;
@@ -984,6 +1127,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
         throw new Error(`Codex backend session 仍在 quarantine：${quarantine.reason}`);
       }
 
+      this.systemErrorDispatchMarker = null;
       const clientEpoch = ++this.clientEpoch;
       await this.commandPinAsserter(commandPin);
       client = await CodexAppServerClient.start({
@@ -1543,6 +1687,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
     this.requireRecoveryStoreFence();
     if (this.state !== "recovering") throw new Error("Codex recovery 已被停止");
 
+    this.systemErrorDispatchMarker = null;
     const clientEpoch = ++this.clientEpoch;
     let client: CodexAppServerClient;
     try {
@@ -2220,11 +2365,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
       return;
     }
     if (status === "failed") {
-      const turnError = isRecord(turn.error) ? turn.error : null;
-      const failure =
-        turnError && typeof turnError.message === "string" && turnError.message.trim()
-          ? turnError.message
-          : "Codex turn 执行失败";
+      const failure = safeCodexTurnFailure(turn.error);
       if (
         attempt.deadlineExpired ||
         (attempt.deadlineAt !== null && Date.now() >= attempt.deadlineAt)
@@ -2242,8 +2383,18 @@ export class CodexExecutionBackend implements ExecutionBackend {
       }
       this.clearTurnDeadline(attempt);
       attempt.terminal = true;
-      await this.handlers.onFailed({ ...this.jobEvent(attempt), error: failure, retryable: false });
+      await this.handlers.onFailed({
+        ...this.jobEvent(attempt),
+        error: failure.message,
+        retryable: false,
+        ...(failure.credentialRejected
+          ? { sessionDisposition: "credential_rejected" as const }
+          : {}),
+      });
       this.activeAttempt = null;
+      if (failure.credentialRejected) {
+        await this.disableAfterTerminal("Codex provider 拒绝凭据后");
+      }
       return;
     }
     if (status === "interrupted") {
@@ -2341,19 +2492,38 @@ export class CodexExecutionBackend implements ExecutionBackend {
       threadId: this.threadId,
       includeTurns: true,
     });
-    await validatePersistedCodexThread(persisted, this.layout, this.threadId);
-    const actual = inspectCodexThreadTail(persisted, this.threadId);
+    const actual = await inspectPersistedCodexCheckpointTail(
+      persisted,
+      this.layout,
+      this.threadId,
+    );
     const stored = this.store.getBackendSession(this.kind, this.options.sessionKey);
     if (!stored || stored.threadId !== this.threadId || stored.recoveryRequired) {
       throw new Error("Codex backend session checkpoint 当前不可用于 dispatch");
     }
     assertStoredThreadCheckpoint(stored, actual);
+    if (actual.threadStatus === "systemError") {
+      const marker = this.systemErrorDispatchMarker;
+      if (
+        !marker || marker.clientEpoch !== this.clientEpoch ||
+        marker.threadId !== this.threadId || marker.turnId !== actual.turnId ||
+        marker.turnStatus !== actual.turnStatus || marker.turnCount !== actual.turnCount ||
+        marker.turnsSha256 !== actual.turnsSha256
+      ) {
+        throw new Error(
+          "Codex thread 的 systemError 未绑定到当前 app-server 进程实际观察到的 failed terminal",
+        );
+      }
+    } else {
+      // 同进程中若状态已回到 idle，旧 systemError marker 不得在之后再次复活。
+      this.systemErrorDispatchMarker = null;
+    }
   }
 
   private async checkpointTerminalThread(
     attempt: ActiveAttempt,
     expectedStatus: "completed" | "failed" | "interrupted",
-  ): Promise<void> {
+  ): Promise<CodexCheckpointThreadTailInspection> {
     if (!this.client || !this.layout || !this.threadId || !attempt.turnId) {
       throw new Error("Codex terminal checkpoint 时 backend/turn 未完整绑定");
     }
@@ -2361,13 +2531,13 @@ export class CodexExecutionBackend implements ExecutionBackend {
       threadId: this.threadId,
       includeTurns: true,
     });
-    await validatePersistedCodexThread(persisted, this.layout, this.threadId);
-    const tail = inspectCodexThreadTail(persisted, this.threadId);
-    if (tail.turnId !== attempt.turnId || tail.turnStatus !== expectedStatus) {
-      throw new Error(
-        `Codex terminal checkpoint 与通知不一致：${tail.turnId ?? "<empty>"}/${tail.turnStatus ?? "<empty>"}`,
-      );
-    }
+    const tail = inspectTerminalCodexThreadTail(
+      persisted,
+      this.threadId,
+      attempt.turnId,
+      expectedStatus,
+    );
+    await validatePersistedCodexRollout(persisted, this.layout, this.threadId);
     const checkpointedSession = this.store.checkpointBackendThreadTail({
       backend: this.kind,
       sessionKey: this.options.sessionKey,
@@ -2386,6 +2556,22 @@ export class CodexExecutionBackend implements ExecutionBackend {
       },
     });
     this.recoveryAnchorSha256 = backendSessionRecoveryAnchor(checkpointedSession);
+    if (tail.threadStatus === "systemError") {
+      if (!tail.turnId || tail.turnStatus !== "failed") {
+        throw new Error("Codex systemError terminal marker 缺少 failed turn 绑定");
+      }
+      this.systemErrorDispatchMarker = {
+        ...tail,
+        threadStatus: "systemError",
+        threadId: this.threadId,
+        clientEpoch: this.clientEpoch,
+        turnId: tail.turnId,
+        turnStatus: "failed",
+      };
+    } else {
+      this.systemErrorDispatchMarker = null;
+    }
+    return tail;
   }
 
   private armTurnDeadline(attempt: ActiveAttempt): void {
@@ -2560,17 +2746,37 @@ export class CodexExecutionBackend implements ExecutionBackend {
 
   private async disableBeforeSubmission(reason: string): Promise<void> {
     this.logger?.error("Codex backend 在请求写入前失效", { reason });
-    this.state = "failed";
+    this.state = this.state === "stopping" ? "stopping" : "failed";
     const client = this.client;
     this.client = null;
-    if (client) await client.close();
+    if (client) await this.closeDetachedClient(client, "Codex 请求提交前");
   }
 
-  private async disableAfterTerminal(): Promise<void> {
-    this.state = "failed";
+  private async disableAfterTerminal(label = "Codex terminal 后"): Promise<void> {
+    this.state = this.state === "stopping" ? "stopping" : "failed";
     const client = this.client;
     this.client = null;
-    if (client) await client.close();
+    if (!client) return;
+    await this.closeDetachedClient(client, label);
+  }
+
+  private async closeDetachedClient(
+    client: CodexAppServerClient,
+    label: string,
+  ): Promise<void> {
+    try {
+      await client.close();
+    } catch (error) {
+      const cleanupError = new Error(`${label}无法确认 app-server 进程组收口`, {
+        cause: error,
+      });
+      this.terminalCleanupError ??= cleanupError;
+      this.store.quarantineSession(
+        this.options.sessionKey,
+        `${label}无法确认 app-server 进程组收口；必须人工核对并 release session`,
+      );
+      throw cleanupError;
+    }
   }
 
   private onProcessExit(

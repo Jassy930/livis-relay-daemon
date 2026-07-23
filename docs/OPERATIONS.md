@@ -316,6 +316,19 @@ quarantine 边界后才可把 acknowledgement 设为 `true`。Codex 模式代码
 逃逸进程组后代和 LiViS App 回显仍未验收，因此本模式当前只用于受控开发，不得宣称
 生产上线。
 
+2026-07-23 的一次获授权真实 canary 已确认 `turn/start` 能提交并取得 provider turn ID。
+本次是明确获授权的例外：日常 `~/.codex/auth.json` 被复制为隔离 `CODEX_HOME` 中权限
+`0600`、单链接的临时普通文件；它不符合上面的专用登录 runbook，不能作为生产做法。
+Responses API 以 `401 invalid_api_key` 拒绝该临时副本；没有 assistant 输出，本地 token
+计数为 0。这只能证明调用链到达 provider 和该副本已失效，不能证明专用登录凭据状态，
+也不能算真实模型 turn 成功或授权自动重试。遇到同类错误时，job `Failed`、failed
+execution ledger、通用失败 outbox、active clear 和 session quarantine 必须在同一事务
+提交，随后关闭 backend；原始 provider message、JSON-RPC error message/data 与
+app-server stderr 不应出现在 `relay.db` 或共享日志。停止 daemon 后配置真正的专用
+`CODEX_HOME` 登录，再人工执行
+`session release`；新的真实调用必须重新取得明确授权。`account/read` 只证明账号对象存在，
+不能证明 API key 当前有效，今后不得用复制日常凭据代替专用登录。
+
 调试真实 app-server 协议时，不要让 `doctor` 或 `serve` 打开现有生产状态。下面的
 手动 smoke 自建带 marker 的临时 state，不打开 relay SQLite，也不发送模型 turn：
 

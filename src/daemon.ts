@@ -33,6 +33,8 @@ import { saveSupportedProof } from "./upstream/proof.ts";
 export const DAEMON_VERSION = "0.1.0";
 const UPSTREAM_RECHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const UPSTREAM_PROOF_EXPIRED_REASON = "supported proof 已过期；必须在线复核通过后才能继续派发";
+const CODEX_CREDENTIAL_REJECTED_QUARANTINE_REASON =
+  "Codex provider 拒绝当前隔离凭据；禁止继续发送 turn，需修复专用凭据并人工 release session";
 
 export interface RelayDaemonDependencies {
   config: RelayConfig;
@@ -547,18 +549,31 @@ export class RelayDaemon {
       : "Codex 暂时无法完成该请求，请稍后重试。";
     if (event.kind === "codex") {
       const { runGeneration, turnId } = this.requireCodexTurn(event);
-      const job = this.store.finishBackendFailure(
-        event.jobId,
-        event.kind,
-        event.leaseId,
-        runGeneration,
-        turnId,
-        serializeResult(userMessage),
-        event.error,
-      );
+      const job = event.sessionDisposition === "credential_rejected"
+        ? this.store.finishBackendCredentialFailure(
+            event.jobId,
+            event.kind,
+            event.leaseId,
+            runGeneration,
+            turnId,
+            serializeResult(userMessage),
+            event.error,
+            CODEX_CREDENTIAL_REJECTED_QUARANTINE_REASON,
+          )
+        : this.store.finishBackendFailure(
+            event.jobId,
+            event.kind,
+            event.leaseId,
+            runGeneration,
+            turnId,
+            serializeResult(userMessage),
+            event.error,
+          );
       if (!job) throw new Error(`Codex failed 未能按当前 attempt 结算：${event.jobId}`);
       await this.relay.notifyOutboxPending();
-      this.deferDispatchPending();
+      if (event.sessionDisposition !== "credential_rejected") {
+        this.deferDispatchPending();
+      }
       return;
     }
     const job = this.store.finishFailure(event.jobId, event.leaseId, serializeResult(userMessage), event.error);

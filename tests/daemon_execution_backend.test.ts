@@ -4,6 +4,7 @@ import type {
   ExecutionAcceptedEvent,
   ExecutionBackend,
   ExecutionDisconnectedEvent,
+  ExecutionFailedEvent,
   ExecutionReadyEvent,
   ExecutionResultEvent,
   ExecutionSubmission,
@@ -52,6 +53,7 @@ interface DaemonInternals {
   onExecutionReady(event: ExecutionReadyEvent): Promise<void>;
   onExecutionAccepted(event: ExecutionAcceptedEvent): Promise<void>;
   onExecutionResult(event: ExecutionResultEvent): Promise<void>;
+  onExecutionFailed(event: ExecutionFailedEvent): Promise<void>;
   onExecutionDisconnected(event: ExecutionDisconnectedEvent): Promise<void>;
 }
 
@@ -312,6 +314,61 @@ describe("RelayDaemon execution backend 接线", () => {
           },
         }],
       });
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  test("Codex 凭据拒绝由 daemon 原子结算 Failed 并 quarantine session", async () => {
+    const fixture = await daemonFixture("livis-daemon-codex-credential-failure-");
+    try {
+      enqueue(fixture.internals, fixture.sessionKey, "job-credential-failure");
+      let outboxNotifications = 0;
+      fixture.internals.relay.notifyOutboxPending = async () => {
+        outboxNotifications += 1;
+      };
+
+      await fixture.internals.dispatchPending();
+      const claimed = fixture.backend.dispatched[0]!;
+      await fixture.internals.onExecutionAccepted({
+        kind: "codex",
+        executionId: "codex:thread-test",
+        jobId: claimed.jobId,
+        leaseId: claimed.leaseId!,
+        runGeneration: claimed.runGeneration,
+        turnId: "turn-credential-failure",
+      });
+      await fixture.internals.onExecutionFailed({
+        kind: "codex",
+        executionId: "codex:thread-test",
+        jobId: claimed.jobId,
+        leaseId: claimed.leaseId!,
+        runGeneration: claimed.runGeneration,
+        turnId: "turn-credential-failure",
+        error: "Codex provider 认证失败（401 invalid_api_key）",
+        retryable: false,
+        sessionDisposition: "credential_rejected",
+      });
+
+      expect(fixture.internals.store.require(claimed.jobId)).toMatchObject({
+        status: "Failed",
+        error: "Codex provider 认证失败（401 invalid_api_key）",
+        outbox: { status: "Pending" },
+      });
+      expect(fixture.internals.store.getBackendSession("codex", fixture.sessionKey)).toMatchObject({
+        activeJobId: null,
+        activeLeaseId: null,
+        activeRunGeneration: null,
+        activeTurnId: null,
+        recoveryRequired: false,
+      });
+      expect(fixture.internals.store.getSessionQuarantine(fixture.sessionKey)?.reason)
+        .toBe(
+          "Codex provider 拒绝当前隔离凭据；禁止继续发送 turn，需修复专用凭据并人工 release session",
+        );
+      expect(fixture.internals.store.listExecutionAttemptEvents(claimed.jobId)
+        .map((event) => event.eventType)).toEqual(["reserved", "accepted", "failed"]);
+      expect(outboxNotifications).toBe(1);
     } finally {
       await fixture.cleanup();
     }

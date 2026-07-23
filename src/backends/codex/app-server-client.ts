@@ -240,10 +240,11 @@ export class CodexAppServerRpcError extends Error {
     readonly method: string,
     readonly requestId: CodexAppServerRequestId,
     readonly code: number | undefined,
-    message: string,
-    readonly data?: unknown,
   ) {
-    super(`Codex app-server ${method} 失败：${message}`);
+    const codeSuffix = code === undefined ? "" : `（code ${code}）`;
+    // JSON-RPC message/data 是 app-server/provider 自由文本，不得进入公开
+    // Error.message 或可枚举字段；调用链只保留内部 method 与数值 code。
+    super(`Codex app-server ${method} RPC 失败${codeSuffix}`);
     this.name = "CodexAppServerRpcError";
   }
 }
@@ -289,7 +290,12 @@ export class CodexAppServerRequestTransportError extends Error {
     readonly written: boolean,
     override readonly cause: Error,
   ) {
-    super(`Codex app-server ${method} 请求因传输终止：${cause.message}`);
+    const processExit = cause instanceof CodexAppServerProcessError
+      ? `（exit ${cause.exitCode}）`
+      : "";
+    // cause 可能来自 app-server 进程或底层 stdio，不能把未经净化的
+    // cause.message 复制到会进入 JobStore/Relay 的公开 transport message。
+    super(`Codex app-server ${method} 请求因传输终止${processExit}`);
     this.name = "CodexAppServerRequestTransportError";
   }
 }
@@ -297,10 +303,9 @@ export class CodexAppServerRequestTransportError extends Error {
 export class CodexAppServerProcessError extends Error {
   constructor(
     readonly exitCode: number,
-    stderrText: string,
   ) {
-    const suffix = stderrText.trim() ? `：${stderrText.trim()}` : "";
-    super(`Codex app-server 已退出（exit ${exitCode}）${suffix}`);
+    // stderr 仅允许留在 client 的有界诊断缓冲，不能进入公开 Error.message。
+    super(`Codex app-server 已退出（exit ${exitCode}）`);
     this.name = "CodexAppServerProcessError";
   }
 }
@@ -384,13 +389,9 @@ function isKnownServerRequestMethod(method: string): boolean {
   return KNOWN_SERVER_REQUEST_METHODS.has(method) || isApprovalRequestMethod(method);
 }
 
-function rpcErrorDetails(value: unknown): { code?: number; message: string; data?: unknown } {
-  if (!isRecord(value)) return { message: String(value) };
-  return {
-    code: typeof value.code === "number" ? value.code : undefined,
-    message: typeof value.message === "string" ? value.message : JSON.stringify(value),
-    data: value.data,
-  };
+function rpcErrorCode(value: unknown): number | undefined {
+  if (!isRecord(value) || !Number.isSafeInteger(value.code)) return undefined;
+  return Number(value.code);
 }
 
 export class CodexAppServerClient {
@@ -798,14 +799,11 @@ export class CodexAppServerClient {
     this.pending.delete(id);
     clearTimeout(pending.timer);
     if (hasOwn(message, "error") && message.error !== null && message.error !== undefined) {
-      const details = rpcErrorDetails(message.error);
       pending.reject(
         new CodexAppServerRpcError(
           pending.method,
           id,
-          details.code,
-          details.message,
-          details.data,
+          rpcErrorCode(message.error),
         ),
       );
       return;
@@ -921,7 +919,7 @@ export class CodexAppServerClient {
   private handleExit(exitCode: number): void {
     this._exitCode = exitCode;
     if (this.state === "running") {
-      const error = new CodexAppServerProcessError(exitCode, this.stderrText);
+      const error = new CodexAppServerProcessError(exitCode);
       this.terminalError = error;
       this.rejectAllForTransport(error);
     }

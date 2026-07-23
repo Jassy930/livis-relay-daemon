@@ -1150,6 +1150,122 @@ describe("backend session durability", () => {
     });
   });
 
+  test("凭据拒绝的 Failed、outbox、active clear 与 quarantine 原子提交", () => {
+    const claimed = prepareRunningJob("credential-failure-atomic");
+    store.markBackendRunning(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-credential",
+    );
+    const quarantineReason = "provider credential rejected";
+    for (const stale of [
+      { leaseId: "stale-lease", runGeneration: claimed.runGeneration, turnId: "turn-credential" },
+      { leaseId: "lease-1", runGeneration: claimed.runGeneration + 1, turnId: "turn-credential" },
+      { leaseId: "lease-1", runGeneration: claimed.runGeneration, turnId: "stale-turn" },
+    ]) {
+      expect(store.finishBackendCredentialFailure(
+        claimed.jobId,
+        backend,
+        stale.leaseId,
+        stale.runGeneration,
+        stale.turnId,
+        '{"text":"failed"}',
+        "Codex provider 认证失败",
+        quarantineReason,
+      )).toBeNull();
+      expect(store.getSessionQuarantine(sessionKey)).toBeNull();
+    }
+    const database = new Database(databasePath);
+    database.exec(`
+      CREATE TRIGGER fail_credential_quarantine
+      BEFORE INSERT ON session_quarantine
+      WHEN NEW.reason='provider credential rejected'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected credential quarantine failure');
+      END;
+    `);
+    database.close();
+
+    expect(() => store.finishBackendCredentialFailure(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-credential",
+      '{"text":"failed"}',
+      "Codex provider 认证失败",
+      quarantineReason,
+    )).toThrow("injected credential quarantine failure");
+    expect(store.require(claimed.jobId)).toMatchObject({ status: "Running", outbox: null });
+    expect(store.getBackendSession(backend, sessionKey)).toMatchObject({
+      activeJobId: claimed.jobId,
+      activeLeaseId: "lease-1",
+      activeRunGeneration: claimed.runGeneration,
+      activeTurnId: "turn-credential",
+      recoveryRequired: false,
+    });
+    expect(store.getSessionQuarantine(sessionKey)).toBeNull();
+    expect(store.listExecutionAttemptEvents(claimed.jobId).map((event) => event.eventType))
+      .toEqual(["reserved", "accepted"]);
+
+    const cleanup = new Database(databasePath);
+    cleanup.exec(`
+      DROP TRIGGER fail_credential_quarantine;
+      CREATE TRIGGER fail_credential_active_clear
+      BEFORE UPDATE OF active_job_id ON backend_sessions
+      WHEN OLD.active_job_id IS NOT NULL AND NEW.active_job_id IS NULL
+      BEGIN
+        SELECT RAISE(ABORT, 'injected credential active clear failure');
+      END;
+    `);
+    cleanup.close();
+    expect(() => store.finishBackendCredentialFailure(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-credential",
+      '{"text":"failed"}',
+      "Codex provider 认证失败",
+      quarantineReason,
+    )).toThrow("injected credential active clear failure");
+    expect(store.require(claimed.jobId)).toMatchObject({ status: "Running", outbox: null });
+    expect(store.getSessionQuarantine(sessionKey)).toBeNull();
+    expect(store.listExecutionAttemptEvents(claimed.jobId).map((event) => event.eventType))
+      .toEqual(["reserved", "accepted"]);
+
+    const removeActiveClearFailure = new Database(databasePath);
+    removeActiveClearFailure.exec("DROP TRIGGER fail_credential_active_clear;");
+    removeActiveClearFailure.close();
+    const finished = store.finishBackendCredentialFailure(
+      claimed.jobId,
+      backend,
+      "lease-1",
+      claimed.runGeneration,
+      "turn-credential",
+      '{"text":"failed"}',
+      "Codex provider 认证失败",
+      quarantineReason,
+    )!;
+    expect(finished).toMatchObject({
+      status: "Failed",
+      error: "Codex provider 认证失败",
+      outbox: { status: "Pending", resultJson: '{"text":"failed"}' },
+    });
+    expect(store.getBackendSession(backend, sessionKey)).toMatchObject({
+      activeJobId: null,
+      activeLeaseId: null,
+      activeRunGeneration: null,
+      activeTurnId: null,
+      recoveryRequired: false,
+    });
+    expect(store.getSessionQuarantine(sessionKey)?.reason).toBe(quarantineReason);
+    expect(store.listExecutionAttemptEvents(claimed.jobId).map((event) => event.eventType))
+      .toEqual(["reserved", "accepted", "failed"]);
+  });
+
   test("重启保留 active evidence 并要求显式 release recovery", () => {
     const claimed = prepareRunningJob();
     store.markBackendRunning(

@@ -6,6 +6,7 @@
 
 ### 修复
 
+- Codex failed turn 现在识别 0.145.0 的合法 `thread.status=systemError`：只有同一 failed terminal，或当前 app-server client epoch 实际观察并与 SQLite checkpoint 完全一致的下一次 dispatch 可以继续，其他入口仍严格要求 idle；provider 原始错误、JSON-RPC message/data 与 app-server stderr 不再写入 JobStore/Relay/共享日志，失效凭据会以脱敏分类在同一事务中完成失败结算与 quarantine，关闭失败继续向上报告。
 - Codex `account/read.requiresOpenaiAuth` 现在按 provider 属性解析，不再把 API key/ChatGPT 账号正常返回的 `true` 误判为未登录；账号存在性仍由受支持的 `account` 对象失败关闭。
 - Codex 固定安全配置现在强制把 CLI 认证凭据保存在 daemon 专用 `CODEX_HOME/auth.json`，登录 runbook 同步禁止复用系统 credential store、默认 `~/.codex` 凭据及可能泄露掩码片段的共享 `login status` 日志。
 - Codex app-server 现在以独立 POSIX 进程组运行；关闭按 `SIGTERM`、有界等待、`SIGKILL`、再次等待和进程组/stdio 收口回执执行，无法确认时向上抛错，不再把直接子进程退出等同于全部后代已结束。

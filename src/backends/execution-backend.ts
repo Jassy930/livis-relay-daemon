@@ -46,6 +46,11 @@ export interface ExecutionFailedEvent extends ExecutionJobEvent {
   turnId?: string;
   error: string;
   retryable?: boolean;
+  /**
+   * provider 已明确拒绝当前 session 的凭据。daemon 必须把 Failed/outbox、
+   * attempt clear 与 session quarantine 放在同一事务中提交。
+   */
+  sessionDisposition?: "credential_rejected";
 }
 
 export interface ExecutionCancelledEvent extends ExecutionJobEvent {

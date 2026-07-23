@@ -29,6 +29,7 @@ import {
   type PinnedCodexCommand,
 } from "../src/backends/codex/runtime-layout.ts";
 import { runCodexAppServerLocalSmoke } from "../src/backends/codex/local-smoke.ts";
+import { Logger, type LogLevel } from "../src/logger.ts";
 import { serializeResult } from "../src/protocol/livis.ts";
 import { JobStore } from "../src/state/store.ts";
 import type { StoredJob } from "../src/types.ts";
@@ -61,6 +62,34 @@ async function waitFor(predicate: () => boolean, label: string, timeoutMs = 1_00
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+class CapturingLogger extends Logger {
+  readonly entries: string[] = [];
+
+  constructor() {
+    super("test.codex-backend-capture", "debug");
+  }
+
+  override debug(message: string, fields: Record<string, unknown> = {}): void {
+    this.capture("debug", message, fields);
+  }
+
+  override info(message: string, fields: Record<string, unknown> = {}): void {
+    this.capture("info", message, fields);
+  }
+
+  override warn(message: string, fields: Record<string, unknown> = {}): void {
+    this.capture("warn", message, fields);
+  }
+
+  override error(message: string, fields: Record<string, unknown> = {}): void {
+    this.capture("error", message, fields);
+  }
+
+  private capture(level: LogLevel, message: string, fields: Record<string, unknown>): void {
+    this.entries.push(JSON.stringify({ level, message, fields }));
+  }
 }
 
 interface FakeCodexFeature {
@@ -99,7 +128,10 @@ class FakeCodexAppServer {
   spawnOptions: CodexAppServerSpawnOptions | null = null;
   workspace = "";
   threadId = "019f-thread-1";
-  threadStatus: "idle" | "active" = "idle";
+  threadStatus: "idle" | "active" | "systemError" = "idle";
+  failedTerminalThreadStatus: "idle" | "systemError" = "idle";
+  completedTerminalThreadStatus: "idle" | "systemError" = "idle";
+  nextTurnId = "019f-turn-1";
   turns: Array<Record<string, unknown>> = [];
   account: Record<string, unknown> | null = { type: "chatgpt", email: null, planType: "plus" };
   requiresOpenaiAuth = true;
@@ -120,6 +152,8 @@ class FakeCodexAppServer {
   materializationReadMisses = 0;
   rolloutPath: string | null = null;
   failWriteMethod: string | null = null;
+  rpcErrorMethod: string | null = null;
+  rpcError: Record<string, unknown> = { code: -32_000, message: "synthetic RPC failure" };
   blockWriteResponseId: number | null = null;
   holdTurnStart = false;
   holdTurnInterrupt = false;
@@ -189,6 +223,10 @@ class FakeCodexAppServer {
       void this.heldMethod.promise
         .then((response) => this.respond(message.id as number, response))
         .catch(() => undefined);
+      return;
+    }
+    if (message.method === this.rpcErrorMethod) {
+      await this.send({ id: message.id, error: this.rpcError });
       return;
     }
     if (message.method === "initialize") {
@@ -277,8 +315,10 @@ class FakeCodexAppServer {
         return;
       }
       this.threadStatus = "active";
-      this.turns.push({ id: "019f-turn-1", status: "inProgress" });
-      await this.respond(message.id, { turn: { id: "019f-turn-1", status: "inProgress" } });
+      this.turns.push({ id: this.nextTurnId, status: "inProgress" });
+      await this.respond(message.id, {
+        turn: { id: this.nextTurnId, status: "inProgress" },
+      });
       return;
     }
     if (message.method === "turn/interrupt" && this.holdTurnInterrupt) {
@@ -408,7 +448,9 @@ class FakeCodexAppServer {
     if (message.method === "turn/completed" && isRecord(message.params)) {
       const turn = isRecord(message.params.turn) ? message.params.turn : null;
       if (turn && typeof turn.id === "string" && typeof turn.status === "string") {
-        this.threadStatus = "idle";
+        this.threadStatus = turn.status === "failed"
+          ? this.failedTerminalThreadStatus
+          : this.completedTerminalThreadStatus;
         const existing = this.turns.findIndex((candidate) => candidate.id === turn.id);
         const snapshot = { id: turn.id, status: turn.status };
         if (existing >= 0) this.turns[existing] = snapshot;
@@ -416,6 +458,10 @@ class FakeCodexAppServer {
       }
     }
     await this.stdoutWriter.write(new TextEncoder().encode(`${JSON.stringify(message)}\n`));
+  }
+
+  async writeStderr(text: string): Promise<void> {
+    await this.stderrWriter.write(new TextEncoder().encode(text));
   }
 
   async stop(exitCode: number): Promise<void> {
@@ -480,6 +526,7 @@ interface Harness {
   results: string[];
   failures: string[];
   disconnects: string[];
+  logs: string[];
   cleanup(): Promise<void>;
 }
 
@@ -587,6 +634,7 @@ async function createHarness(options: {
   const results: string[] = [];
   const failures: string[] = [];
   const disconnects: string[] = [];
+  const logger = new CapturingLogger();
 
   const handlers: ExecutionBackendHandlers = {
     onReady: async () => {
@@ -644,15 +692,26 @@ async function createHarness(options: {
       events.push(`failed:${event.jobId}`);
       failures.push(event.error);
       const { runGeneration, turnId } = requireCodexAttempt(event);
-      const finished = store.finishBackendFailure(
-        event.jobId,
-        "codex",
-        event.leaseId,
-        runGeneration,
-        turnId,
-        serializeResult("Codex failed"),
-        event.error,
-      );
+      const finished = event.sessionDisposition === "credential_rejected"
+        ? store.finishBackendCredentialFailure(
+            event.jobId,
+            "codex",
+            event.leaseId,
+            runGeneration,
+            turnId,
+            serializeResult("Codex failed"),
+            event.error,
+            "Codex provider 拒绝当前隔离凭据；禁止继续发送 turn，需修复专用凭据并人工 release session",
+          )
+        : store.finishBackendFailure(
+            event.jobId,
+            "codex",
+            event.leaseId,
+            runGeneration,
+            turnId,
+            serializeResult("Codex failed"),
+            event.error,
+          );
       if (!finished) throw new Error("test failure fencing failed");
     },
     onCancelled: async (event) => {
@@ -688,6 +747,7 @@ async function createHarness(options: {
   }, {
     store,
     handlers,
+    logger,
     appServerSpawn: options.appServerSpawn ?? fake.spawn,
     commandRunner: options.commandRunner ?? successfulVersion,
     commandPinResolver: options.commandPinResolver ?? fakeCommandPinResolver,
@@ -712,6 +772,7 @@ async function createHarness(options: {
     results,
     failures,
     disconnects,
+    logs: logger.entries,
     cleanup: async () => {
       if (cleaned) return;
       cleaned = true;
@@ -1647,12 +1708,17 @@ describe("CodexExecutionBackend", () => {
       {
         status: "active" as const,
         turns: [{ id: "external-active", status: "inProgress" }],
-        expected: "不是 idle",
+        expected: "未归属的活动 turn",
       },
       {
         status: "idle" as const,
         turns: [{ id: "external-completed", status: "completed" }],
         expected: "持久 checkpoint 不一致",
+      },
+      {
+        status: "systemError" as const,
+        turns: [{ id: "external-failed", status: "failed" }],
+        expected: "不是 idle",
       },
     ]) {
       const harness = await createHarness({
@@ -1944,6 +2010,44 @@ describe("CodexExecutionBackend", () => {
         checkpointTurnStatus: "completed",
         checkpointTurnCount: 1,
       });
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("completed terminal 不得以 systemError thread 状态交付结果", async () => {
+    const harness = await createHarness({
+      configureFake: (fake) => {
+        fake.completedTerminalThreadStatus = "systemError";
+      },
+    });
+    try {
+      const job = claimJob(harness, "job-completed-system-error");
+      await harness.backend.dispatch(job);
+      await harness.fake.send({
+        method: "turn/completed",
+        params: {
+          threadId: harness.fake.threadId,
+          turn: {
+            id: "019f-turn-1",
+            status: "completed",
+            items: [
+              {
+                type: "agentMessage",
+                id: "m-invalid-system-error",
+                text: "不得交付",
+                phase: "final_answer",
+              },
+            ],
+          },
+        },
+      });
+      await waitFor(() => harness.disconnects.length === 1, "completed systemError disconnect");
+      expect(harness.results).toEqual([]);
+      expect(harness.store.require(job.jobId).status).toBe("Interrupted");
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")?.recoveryRequired)
+        .toBeTrue();
+      expect(harness.store.getSessionQuarantine("livis:agent-test")).not.toBeNull();
     } finally {
       await harness.cleanup();
     }
@@ -2285,6 +2389,52 @@ describe("CodexExecutionBackend", () => {
     }
   });
 
+  test("cancel 与 failed systemError 竞态保持 CancelUnknown 且不生成失败结果", async () => {
+    const harness = await createHarness({
+      configureFake: (fake) => {
+        fake.autoInterruptTerminal = false;
+        fake.failedTerminalThreadStatus = "systemError";
+      },
+    });
+    try {
+      const job = claimJob(harness, "job-cancel-failed-system-error");
+      await harness.backend.dispatch(job);
+      const cancelling = harness.store.requestCancel(job.jobId);
+      if (!cancelling) throw new Error("test cancel job missing");
+      expect(await harness.backend.cancel(cancelling)).toBe("submitted");
+
+      await harness.fake.send({
+        method: "turn/completed",
+        params: {
+          threadId: harness.fake.threadId,
+          turn: {
+            id: "019f-turn-1",
+            status: "failed",
+            error: { message: "provider failed", codexErrorInfo: "other" },
+            items: [],
+          },
+        },
+      });
+      await waitFor(
+        () => harness.events.includes("cancelled:job-cancel-failed-system-error"),
+        "cancel failed systemError terminal",
+      );
+
+      expect(harness.store.require(job.jobId).status).toBe("CancelUnknown");
+      expect(harness.failures).toEqual([]);
+      expect(harness.store.require(job.jobId).outbox).toBeNull();
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")).toMatchObject({
+        checkpointTurnId: "019f-turn-1",
+        checkpointTurnStatus: "failed",
+        checkpointTurnCount: 1,
+        recoveryRequired: true,
+      });
+      expect(harness.backend.ready).toBeFalse();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
   test("原 turn 已提交后即使 interrupt 可证明未写入也必须 CancelUnknown", async () => {
     const harness = await createHarness({ requestTimeoutMs: 20 });
     try {
@@ -2350,6 +2500,108 @@ describe("CodexExecutionBackend", () => {
     }
   });
 
+  test("terminal checkpoint transport 退出不会把 app-server stderr 写入 Store 或日志", async () => {
+    const fake = new FakeCodexAppServer();
+    const harness = await createHarness({ fake });
+    const sensitiveStderr = "PROVIDER_STDERR_SECRET_SENTINEL";
+    try {
+      const job = claimJob(harness, "job-terminal-transport-sensitive");
+      await harness.backend.dispatch(job);
+      const threadReadsBefore = fake.messages
+        .filter((message) => message.method === "thread/read").length;
+      fake.holdMethod = "thread/read";
+      await fake.send({
+        method: "turn/completed",
+        params: {
+          threadId: fake.threadId,
+          turn: {
+            id: "019f-turn-1",
+            status: "failed",
+            error: { message: "provider failed", codexErrorInfo: "other" },
+            items: [],
+          },
+        },
+      });
+      await waitFor(
+        () => fake.messages.filter((message) => message.method === "thread/read").length >
+          threadReadsBefore,
+        "terminal checkpoint thread/read",
+      );
+      await fake.writeStderr(sensitiveStderr);
+      fake.exitWithoutClosingStreams(47);
+
+      await waitFor(() => harness.disconnects.length === 1, "sensitive transport disconnect");
+      expect(harness.store.require(job.jobId).status).toBe("Interrupted");
+      expect(harness.store.require(job.jobId).error).not.toContain(sensitiveStderr);
+      expect(harness.disconnects.join("\n")).not.toContain(sensitiveStderr);
+      expect(harness.logs.join("\n")).not.toContain(sensitiveStderr);
+      expect(harness.store.listExecutionAttemptEvents(job.jobId)
+        .some((event) => event.reason?.includes(sensitiveStderr))).toBeFalse();
+      expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
+        .not.toContain(sensitiveStderr);
+      for (const name of (await readdir(harness.directory.path))
+        .filter((entry) => entry.startsWith("relay.db"))) {
+        expect((await readFile(join(harness.directory.path, name))).includes(sensitiveStderr))
+          .toBeFalse();
+      }
+    } finally {
+      fake.heldMethod.resolve({ thread: fake.threadResponse({}).thread });
+      await fake.stop(0);
+      await harness.cleanup();
+    }
+  });
+
+  test("terminal checkpoint RPC error 不会把 message/data 写入 Store 或日志", async () => {
+    const fake = new FakeCodexAppServer();
+    const harness = await createHarness({ fake });
+    const messageSensitive = "RPC_MESSAGE_STORE_SENSITIVE_SENTINEL";
+    const dataSensitive = "RPC_DATA_STORE_SENSITIVE_SENTINEL";
+    try {
+      const job = claimJob(harness, "job-terminal-rpc-sensitive");
+      await harness.backend.dispatch(job);
+      fake.rpcErrorMethod = "thread/read";
+      fake.rpcError = {
+        code: -32_001,
+        message: messageSensitive,
+        data: { detail: dataSensitive },
+      };
+      await fake.send({
+        method: "turn/completed",
+        params: {
+          threadId: fake.threadId,
+          turn: {
+            id: "019f-turn-1",
+            status: "failed",
+            error: { message: "provider failed", codexErrorInfo: "other" },
+            items: [],
+          },
+        },
+      });
+
+      await waitFor(() => harness.disconnects.length === 1, "sensitive RPC disconnect");
+      expect(harness.store.require(job.jobId).status).toBe("Interrupted");
+      expect(harness.store.require(job.jobId).error).not.toContain(messageSensitive);
+      expect(harness.disconnects.join("\n")).not.toContain(messageSensitive);
+      expect(harness.disconnects.join("\n")).not.toContain(dataSensitive);
+      expect(harness.logs.join("\n")).not.toContain(messageSensitive);
+      expect(harness.logs.join("\n")).not.toContain(dataSensitive);
+      expect(harness.store.listExecutionAttemptEvents(job.jobId)
+        .some((event) =>
+          event.reason?.includes(messageSensitive) || event.reason?.includes(dataSensitive)
+        )).toBeFalse();
+      expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
+        .not.toContain(messageSensitive);
+      for (const name of (await readdir(harness.directory.path))
+        .filter((entry) => entry.startsWith("relay.db"))) {
+        const bytes = await readFile(join(harness.directory.path, name));
+        expect(bytes.includes(messageSensitive)).toBeFalse();
+        expect(bytes.includes(dataSensitive)).toBeFalse();
+      }
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
   test("terminal failed 只通过 failed handler 结算，不把中间消息当结果", async () => {
     const harness = await createHarness();
     try {
@@ -2376,8 +2628,396 @@ describe("CodexExecutionBackend", () => {
         },
       });
       await waitFor(() => harness.store.require(job.jobId).status === "Failed", "failed terminal");
-      expect(harness.failures).toEqual(["synthetic model failure"]);
+      expect(harness.failures).toEqual(["Codex turn 执行失败"]);
       expect(harness.results).toEqual([]);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("failed + systemError 脱敏结算并阻断已被拒绝的隔离凭据副本", async () => {
+    const harness = await createHarness({
+      configureFake: (fake) => {
+        fake.failedTerminalThreadStatus = "systemError";
+      },
+    });
+    try {
+      const failedJob = claimJob(harness, "job-system-error", "触发 provider 失败");
+      await harness.backend.dispatch(failedJob);
+      const messageSensitive = "sk-message-sensitive-sentinel";
+      const detailsSensitive = "account-details-sensitive-sentinel";
+      await harness.fake.send({
+        method: "turn/completed",
+        params: {
+          threadId: harness.fake.threadId,
+          turn: {
+            id: "019f-turn-1",
+            status: "failed",
+            error: {
+              message: `unexpected status 401 Unauthorized: Incorrect API key provided: ${messageSensitive}; invalid_api_key`,
+              codexErrorInfo: "other",
+              additionalDetails: detailsSensitive,
+            },
+            items: [],
+          },
+        },
+      });
+
+      await waitFor(
+        () => harness.store.require(failedJob.jobId).status === "Failed",
+        "systemError failed terminal",
+      );
+      expect(harness.failures).toEqual([
+        "Codex provider 认证失败（401 invalid_api_key）",
+      ]);
+      expect(harness.store.require(failedJob.jobId)).toMatchObject({
+        status: "Failed",
+        error: "Codex provider 认证失败（401 invalid_api_key）",
+        outbox: { status: "Pending", resultJson: serializeResult("Codex failed") },
+      });
+      const attemptEvents = harness.store.listExecutionAttemptEvents(failedJob.jobId);
+      expect(attemptEvents.map((event) => event.eventType))
+        .toEqual(["reserved", "accepted", "failed"]);
+      expect(attemptEvents.at(-1)?.reason).toBe("Codex provider 认证失败（401 invalid_api_key）");
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")).toMatchObject({
+        activeJobId: null,
+        recoveryRequired: false,
+        checkpointTurnId: "019f-turn-1",
+        checkpointTurnStatus: "failed",
+        checkpointTurnCount: 1,
+      });
+      expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
+        .toBe(
+          "Codex provider 拒绝当前隔离凭据；禁止继续发送 turn，需修复专用凭据并人工 release session",
+        );
+      expect(harness.disconnects).toEqual([]);
+      expect(harness.backend.ready).toBeFalse();
+      expect(harness.logs.join("\n")).not.toContain(messageSensitive);
+      expect(harness.logs.join("\n")).not.toContain(detailsSensitive);
+
+      for (const name of (await readdir(harness.directory.path))
+        .filter((entry) => entry.startsWith("relay.db"))) {
+        const bytes = await readFile(join(harness.directory.path, name));
+        expect(bytes.includes(messageSensitive)).toBeFalse();
+        expect(bytes.includes(detailsSensitive)).toBeFalse();
+      }
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("凭据拒绝后的进程组收口失败会持久隔离并由 stop 传播", async () => {
+    const fake = new FakeCodexAppServer();
+    fake.failedTerminalThreadStatus = "systemError";
+    const harness = await createHarness({ fake, shutdownTimeoutMs: 20 });
+    try {
+      fake.ignoreKill = true;
+      const job = claimJob(harness, "job-credential-close-unconfirmed");
+      await harness.backend.dispatch(job);
+      await fake.send({
+        method: "turn/completed",
+        params: {
+          threadId: fake.threadId,
+          turn: {
+            id: "019f-turn-1",
+            status: "failed",
+            error: { message: "invalid_api_key", codexErrorInfo: "unauthorized" },
+            items: [],
+          },
+        },
+      });
+      await waitFor(
+        () => harness.store.require(job.jobId).status === "Failed",
+        "credential close failure terminal",
+      );
+
+      let stopError: unknown;
+      try {
+        await harness.backend.stop();
+      } catch (error) {
+        stopError = error;
+      }
+      expect(stopError).toBeInstanceOf(AggregateError);
+      expect((stopError as Error).message).toContain("未确认的进程组收口");
+      expect((stopError as AggregateError).errors.some((error) =>
+        error instanceof Error && /凭据后无法确认.*进程组收口/.test(error.message)
+      )).toBeTrue();
+      expect(harness.store.getSessionQuarantine("livis:agent-test")).not.toBeNull();
+      expect(harness.backend.ready).toBeFalse();
+    } finally {
+      fake.ignoreKill = false;
+      await fake.stop(0);
+      await harness.cleanup();
+    }
+  });
+
+  for (const scenario of [
+    {
+      name: "structured unauthorized",
+      error: { message: "provider rejected", codexErrorInfo: "unauthorized" },
+      expected: "Codex provider 认证失败",
+      credentialRejected: true,
+    },
+    {
+      name: "HTTP 401 tagged object",
+      error: {
+        message: "provider rejected",
+        codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 401 } },
+      },
+      expected: "Codex provider 连接失败（httpConnectionFailed HTTP 401）",
+      credentialRejected: true,
+    },
+    {
+      name: "HTTP 503 tagged object",
+      error: {
+        message: "provider unavailable",
+        codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 503 } },
+      },
+      expected: "Codex provider 连接失败（httpConnectionFailed HTTP 503）",
+      credentialRejected: false,
+    },
+    {
+      name: "unknown structured error",
+      error: { message: "provider details", codexErrorInfo: { futureKind: { code: 7 } } },
+      expected: "Codex turn 执行失败",
+      credentialRejected: false,
+    },
+  ] as const) {
+    test(`failed 错误分类闭集：${scenario.name}`, async () => {
+      const harness = await createHarness({
+        configureFake: (fake) => {
+          fake.failedTerminalThreadStatus = "systemError";
+        },
+      });
+      try {
+        const job = claimJob(harness, `job-classification-${scenario.name.replaceAll(" ", "-")}`);
+        await harness.backend.dispatch(job);
+        await harness.fake.send({
+          method: "turn/completed",
+          params: {
+            threadId: harness.fake.threadId,
+            turn: {
+              id: "019f-turn-1",
+              status: "failed",
+              error: scenario.error,
+              items: [],
+            },
+          },
+        });
+        await waitFor(
+          () => harness.store.require(job.jobId).status === "Failed",
+          `failed classification ${scenario.name}`,
+        );
+        expect(harness.failures).toEqual([scenario.expected]);
+        expect(harness.store.require(job.jobId).error).toBe(scenario.expected);
+        expect(harness.store.getSessionQuarantine("livis:agent-test") !== null)
+          .toBe(scenario.credentialRejected);
+        expect(harness.backend.ready).toBe(!scenario.credentialRejected);
+      } finally {
+        await harness.cleanup();
+      }
+    });
+  }
+
+  test("非认证 failed + systemError 仅在 checkpoint 精确一致时允许下一 turn", async () => {
+    const harness = await createHarness({
+      configureFake: (fake) => {
+        fake.failedTerminalThreadStatus = "systemError";
+      },
+    });
+    try {
+      const failedJob = claimJob(harness, "job-retryable-system-error");
+      await harness.backend.dispatch(failedJob);
+      await harness.fake.send({
+        method: "turn/completed",
+        params: {
+          threadId: harness.fake.threadId,
+          turn: {
+            id: "019f-turn-1",
+            status: "failed",
+            error: { message: "synthetic provider failure", codexErrorInfo: "other" },
+            items: [],
+          },
+        },
+      });
+      await waitFor(
+        () => harness.store.require(failedJob.jobId).status === "Failed",
+        "retryable systemError failed terminal",
+      );
+      expect(harness.failures).toEqual(["Codex provider 返回未分类错误"]);
+      expect(harness.store.getSessionQuarantine("livis:agent-test")).toBeNull();
+      expect(harness.backend.ready).toBeTrue();
+
+      harness.fake.nextTurnId = "019f-turn-2";
+      const recoveredJob = claimJob(harness, "job-after-system-error", "继续执行");
+      expect(await harness.backend.dispatch(recoveredJob)).toBe("submitted");
+      await harness.fake.send({
+        method: "turn/completed",
+        params: {
+          threadId: harness.fake.threadId,
+          turn: {
+            id: "019f-turn-2",
+            status: "completed",
+            items: [
+              {
+                type: "agentMessage",
+                id: "m-after-system-error",
+                text: "恢复成功",
+                phase: "final_answer",
+              },
+            ],
+          },
+        },
+      });
+      await waitFor(
+        () => harness.store.require(recoveredJob.jobId).status === "Succeeded",
+        "systemError 后下一 turn",
+      );
+      expect(harness.results).toEqual(["恢复成功"]);
+      expect(harness.fake.messages.filter((message) => message.method === "turn/start"))
+        .toHaveLength(2);
+      expect(harness.fake.threadStatus).toBe("idle");
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("failed terminal 实际为 idle 时拒绝后来无关的同 tail systemError", async () => {
+    const harness = await createHarness();
+    try {
+      const failedJob = claimJob(harness, "job-idle-failed-tail");
+      await harness.backend.dispatch(failedJob);
+      await harness.fake.send({
+        method: "turn/completed",
+        params: {
+          threadId: harness.fake.threadId,
+          turn: {
+            id: "019f-turn-1",
+            status: "failed",
+            error: { message: "synthetic failure", codexErrorInfo: "other" },
+            items: [],
+          },
+        },
+      });
+      await waitFor(
+        () => harness.store.require(failedJob.jobId).status === "Failed",
+        "idle failed terminal",
+      );
+      expect(harness.fake.threadStatus).toBe("idle");
+      expect(harness.backend.ready).toBeTrue();
+
+      // 不追加 turn，只把 thread 状态外部改成 systemError；持久 tail 仍完全相同。
+      harness.fake.threadStatus = "systemError";
+      harness.fake.nextTurnId = "019f-turn-2";
+      const nextJob = claimJob(harness, "job-unrelated-system-error");
+      const turnStartsBefore = harness.fake.messages
+        .filter((message) => message.method === "turn/start").length;
+      expect(await harness.backend.dispatch(nextJob)).toBe("not_sent");
+      expect(harness.fake.messages.filter((message) => message.method === "turn/start"))
+        .toHaveLength(turnStartsBefore);
+      expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
+        .toContain("systemError 未绑定");
+      expect(harness.backend.ready).toBeFalse();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("idle recovery 更换 client epoch 后不会复用旧 systemError marker", async () => {
+    const initial = new FakeCodexAppServer();
+    initial.failedTerminalThreadStatus = "systemError";
+    const recovering = new FakeCodexAppServer();
+    const sequence = new FakeCodexAppServerSequence(
+      [initial, recovering],
+      (index) => {
+        if (index === 1) {
+          recovering.turns = initial.turns.map((turn) => ({ ...turn }));
+          recovering.threadStatus = "idle";
+        }
+      },
+    );
+    const harness = await createHarness({
+      fake: initial,
+      appServerSpawn: sequence.spawn,
+      recoveryDelaysMs: [0, 0, 0],
+    });
+    try {
+      const failedJob = claimJob(harness, "job-system-error-old-epoch");
+      await harness.backend.dispatch(failedJob);
+      await initial.send({
+        method: "turn/completed",
+        params: {
+          threadId: initial.threadId,
+          turn: {
+            id: "019f-turn-1",
+            status: "failed",
+            error: { message: "synthetic failure", codexErrorInfo: "other" },
+            items: [],
+          },
+        },
+      });
+      await waitFor(
+        () => harness.store.require(failedJob.jobId).status === "Failed",
+        "old epoch systemError terminal",
+      );
+      await initial.stop(44);
+      await waitFor(
+        () => sequence.spawnCount === 2 && harness.backend.ready,
+        "new epoch idle recovery",
+      );
+
+      recovering.threadStatus = "systemError";
+      recovering.nextTurnId = "019f-turn-2";
+      const nextJob = claimJob(harness, "job-system-error-new-epoch");
+      const turnStartsBefore = recovering.messages
+        .filter((message) => message.method === "turn/start").length;
+      expect(await harness.backend.dispatch(nextJob)).toBe("not_sent");
+      expect(recovering.messages.filter((message) => message.method === "turn/start"))
+        .toHaveLength(turnStartsBefore);
+      expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
+        .toContain("systemError 未绑定");
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("systemError tail 与持久 failed checkpoint 漂移时拒绝下一 turn", async () => {
+    const harness = await createHarness({
+      configureFake: (fake) => {
+        fake.failedTerminalThreadStatus = "systemError";
+      },
+    });
+    try {
+      const failedJob = claimJob(harness, "job-system-error-drift");
+      await harness.backend.dispatch(failedJob);
+      await harness.fake.send({
+        method: "turn/completed",
+        params: {
+          threadId: harness.fake.threadId,
+          turn: {
+            id: "019f-turn-1",
+            status: "failed",
+            error: { message: "synthetic failure", codexErrorInfo: "other" },
+            items: [],
+          },
+        },
+      });
+      await waitFor(
+        () => harness.store.require(failedJob.jobId).status === "Failed",
+        "systemError drift baseline",
+      );
+
+      harness.fake.turns.push({ id: "external-failed", status: "failed" });
+      harness.fake.nextTurnId = "019f-turn-2";
+      const nextJob = claimJob(harness, "job-system-error-drift-next");
+      const turnStartsBefore = harness.fake.messages
+        .filter((message) => message.method === "turn/start").length;
+      expect(await harness.backend.dispatch(nextJob)).toBe("not_sent");
+      expect(harness.fake.messages.filter((message) => message.method === "turn/start"))
+        .toHaveLength(turnStartsBefore);
+      expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
+        .toContain("thread checkpoint");
+      expect(harness.backend.ready).toBeFalse();
     } finally {
       await harness.cleanup();
     }
