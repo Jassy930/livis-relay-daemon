@@ -342,9 +342,6 @@ export function inspectCodexAccountResponse(value: unknown): CodexAccountInspect
     throw new Error("account/read response.requiresOpenaiAuth 必须是布尔值");
   }
   if (response.account === null) {
-    if (response.requiresOpenaiAuth !== true) {
-      throw new Error("account/read 未登录状态必须要求 OpenAI 认证");
-    }
     return {
       requiresOpenaiAuth: response.requiresOpenaiAuth,
       accountType: null,
@@ -357,9 +354,9 @@ export function inspectCodexAccountResponse(value: unknown): CodexAccountInspect
   if (!["apiKey", "chatgpt", "amazonBedrock"].includes(accountType)) {
     throw new Error(`Codex account.type 未经审核：${accountType}`);
   }
-  if (response.requiresOpenaiAuth !== false) {
-    throw new Error("account/read 已有账号时不应继续要求 OpenAI 认证");
-  }
+  // requiresOpenaiAuth 描述当前 provider 是否依赖 OpenAI 认证，不描述登录是否缺失。
+  // 官方协议明确允许 apiKey/chatgpt account 与 true，以及 null 与 false 的组合；
+  // 生产启动是否已配置账号只由 account 是否为对象裁决。
   const normalizedEmail = accountType === "chatgpt" && typeof account.email === "string"
     ? account.email.trim().toLowerCase()
     : "";

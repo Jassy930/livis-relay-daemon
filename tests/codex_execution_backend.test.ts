@@ -8,6 +8,7 @@ import {
   type CodexCommandPinResolver,
   type CodexCommandRunner,
   type CodexExecutionBackendDependencies,
+  inspectCodexAccountResponse,
   validateDisabledCodexFeatures,
 } from "../src/backends/codex/codex-execution-backend.ts";
 import type {
@@ -101,6 +102,7 @@ class FakeCodexAppServer {
   threadStatus: "idle" | "active" = "idle";
   turns: Array<Record<string, unknown>> = [];
   account: Record<string, unknown> | null = { type: "chatgpt", email: null, planType: "plus" };
+  requiresOpenaiAuth = true;
   permissionAllowed = true;
   enabledHighRiskFeature: string | null = null;
   featureListTransform: (
@@ -201,7 +203,7 @@ class FakeCodexAppServer {
     if (message.method === "account/read") {
       await this.respond(message.id, {
         account: this.account,
-        requiresOpenaiAuth: this.account === null,
+        requiresOpenaiAuth: this.requiresOpenaiAuth,
       });
       return;
     }
@@ -942,6 +944,53 @@ async function listHardlinkCanaryFiles(stateDir: string): Promise<string[]> {
 }
 
 describe("CodexExecutionBackend", () => {
+  test("account/read 将 requiresOpenaiAuth 作为 provider 属性而不是登录状态", () => {
+    expect(inspectCodexAccountResponse({
+      account: { type: "apiKey" },
+      requiresOpenaiAuth: true,
+    })).toEqual({
+      requiresOpenaiAuth: true,
+      accountType: "apiKey",
+      accountSubjectSha256: null,
+      identityStrength: "type-only",
+    });
+    expect(inspectCodexAccountResponse({
+      account: { type: "chatgpt", email: " User@Example.COM " },
+      requiresOpenaiAuth: true,
+    })).toEqual({
+      requiresOpenaiAuth: true,
+      accountType: "chatgpt",
+      accountSubjectSha256: sha256(JSON.stringify(["chatgpt", "user@example.com"])),
+      identityStrength: "subject",
+    });
+    expect(inspectCodexAccountResponse({
+      account: { type: "amazonBedrock", credentialSource: "awsManaged" },
+      requiresOpenaiAuth: false,
+    })).toEqual({
+      requiresOpenaiAuth: false,
+      accountType: "amazonBedrock",
+      accountSubjectSha256: null,
+      identityStrength: "type-only",
+    });
+    expect(inspectCodexAccountResponse({
+      account: null,
+      requiresOpenaiAuth: false,
+    })).toEqual({
+      requiresOpenaiAuth: false,
+      accountType: null,
+      accountSubjectSha256: null,
+      identityStrength: null,
+    });
+    expect(() => inspectCodexAccountResponse({
+      account: { type: "unknown" },
+      requiresOpenaiAuth: true,
+    })).toThrow("account.type 未经审核");
+    expect(() => inspectCodexAccountResponse({
+      account: null,
+      requiresOpenaiAuth: null,
+    })).toThrow("requiresOpenaiAuth 必须是布尔值");
+  });
+
   test("smoke 入口 fake 轨迹固定且绝不发送模型 turn", async () => {
     const commandDirectory = await temporaryDirectory("livis-codex-smoke-command-");
     const command = `${commandDirectory.path}/codex`;
@@ -1637,6 +1686,43 @@ describe("CodexExecutionBackend", () => {
         "Codex 私有 CODEX_HOME account 必须是对象",
       );
       expect(harness.fake.messages.some((message) => message.method === "thread/start")).toBeFalse();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("生产 backend 接受 API key account 与 requiresOpenaiAuth=true", async () => {
+    const harness = await createHarness({
+      configureFake: (fake) => {
+        fake.account = { type: "apiKey" };
+        fake.requiresOpenaiAuth = true;
+      },
+    });
+    try {
+      expect(harness.backend.ready).toBeTrue();
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")).toMatchObject({
+        accountType: "apiKey",
+        accountIdentityStrength: "type-only",
+      });
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("account=null 即使 requiresOpenaiAuth=false 仍拒绝生产启动", async () => {
+    const harness = await createHarness({
+      start: false,
+      configureFake: (fake) => {
+        fake.account = null;
+        fake.requiresOpenaiAuth = false;
+      },
+    });
+    try {
+      await expect(harness.backend.start()).rejects.toThrow(
+        "Codex 私有 CODEX_HOME account 必须是对象",
+      );
+      expect(harness.fake.messages.some((message) => message.method === "thread/start")).toBeFalse();
+      expect(harness.backend.ready).toBeFalse();
     } finally {
       await harness.cleanup();
     }
