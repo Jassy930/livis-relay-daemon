@@ -50,6 +50,19 @@
   0.145.0 上通过无秘密 strict-config、隔离 API-key 登录和一次成功 custom Responses turn；
   回执只证明单一 daemon operation 与本轮零工具，不证明 endpoint 内部 HTTP 次数、请求层
   工具 schema 已移除或 LiViS App 投递闭环。
+- Codex 人在环 E2E 验证状态：精确提交 `896091b` 在全新隔离 state、schema v2 profile、
+  fresh LiViS Device Flow、标准输入登录的隔离 `CODEX_HOME`、Codex 0.145.0、固定
+  `gpt-5.6-sol` 与显式 custom Responses provider 组合下取得 `E2E_FUNCTIONAL_GO`。获授权
+  用户本人从唯一允许设备只发送一次 canonical nonce；唯一 job 为 `Succeeded/Delivered`、
+  `run_generation=1`、ledger `reserved → accepted → succeeded`、checkpoint
+  `completed/1`，只观察到一个 provider operation，active/recovery/quarantine 全清，App
+  视觉确认只有一个精确匹配的回复气泡。用户随后主动追加的两条扩展消息令同一会话累计三
+  turn、三 assistant，仍无 tool、approval、user input 或 unknown item；优雅停机零句柄，
+  原 Hermes/Relay 恢复健康并排空。一次观察到的单投递不构成 exactly-once 保证，也不证明
+  endpoint 内部 HTTP 请求恰好一次或请求 payload 不含工具 schema。Codex 本地 auth 已
+  logout；LiViS revoke 返回 HTTP 404，远端撤销未确认，refresh token 与整个隔离 state 按
+  fail-closed 保留，清理状态为 `CREDENTIAL_CLEANUP_BLOCKED`。复验与证据保留流程见
+  [Codex LiViS 人在环 E2E canary](docs/CODEX-E2E-CANARY.md)。
 - 执行后端配置固定为 Hermes/Codex/Claude 三选一；Claude 尚未实现时 `doctor` 与 `serve` 明确失败关闭。JobStore v5 让 job 首次入库绑定目标 backend，含待派发 job 的 v4 数据库必须显式声明原始 backend；v6 继续绑定 Codex 账号身份摘要/强度、请求与实际模型、模型 provider、安全配置 SHA、feature 快照 SHA 和单调 thread-tail checkpoint，旧 v5 session 只有在没有 active/recovery 证据时才允许首次安全补绑。
 - JobStore schema 升级为 v7：SQLite trigger 强制 `jobs.target_backend` 不可变，并新增拒绝 UPDATE/DELETE 的 `execution_attempt_events` 账本，永久保留 job/backend/session/lease/execution、Codex thread/turn 与 runtime/model/account/安全摘要。v6 active attempt 以 `legacy_active_imported` 导入，不猜测更早历史。
 - backend 切换新增失败关闭门禁：`serve` 在启动 execution backend 或 Relay 前拒绝异 backend 非终态积压；`doctor.execution_backend_backlog`、`status.backendBacklog` 与 `recentJobs[].latestAttempt` 提供观测。终态 job 不阻止切换，outbox 仍独立投递。

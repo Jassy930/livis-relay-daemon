@@ -2,7 +2,7 @@
 
 本文是本项目对 LiViS IDaaS / Relay 服务端协议断言的唯一证据入口。它不是厂商官方规范，也不把客户端实现、fake Relay 或工程推断升级为服务端事实。
 
-最后核对日期：2026-07-21。
+最后核对日期：2026-07-23。
 
 ## 1. 真源与裁决规则
 
@@ -69,7 +69,30 @@ daemon commit
 
 公开账本只保留 commit、版本、时间、脱敏结果与不透明 receipt ID。profile/artifact 哈希、环境标识和脱敏字段集应保存在获授权的私有审计位置；token 值、生产端点、账号、Agent/node ID、业务正文和未脱敏原始帧不得进入 PR、Issue 或 Git。若无法留下可定位 receipt，该 canary 只能作为历史人工摘要，不能作为未来字段级兼容证明。
 
-当前最高等级历史证据来自 [PR #14](https://github.com/Jassy930/livis-relay-daemon/pull/14)，它是高层端到端 S4 人工摘要，不是满足上述新标准的字段级 receipt：
+2026-07-23 新增的当前最高等级证据来自
+[Codex 完整 LiViS 人在环 canary](CODEX-E2E-CANARY.md)。它绑定精确测试提交
+`896091b`、macOS、Codex 0.145.0、隔离 API-key/custom Responses 配置与未知 Relay
+服务端构建；公开记录不包含敏感标识、生产地址、凭据、原始正文或 profile SHA。它是
+可定位的高层端到端 S4，不是字段级原始帧 receipt：
+
+- 真实 Device Flow 与 Relay 握手完成；发送前 backend ready，队列、active、recovery 与
+  quarantine 门禁通过；
+- 主 canary 只形成一个规范 job，状态为 `Succeeded`、`run_generation=1`，attempt ledger
+  为 `reserved → accepted → succeeded`，outbox 为 `Delivered` 且只有一次 delivery
+  attempt；
+- 操作者确认 App 只显示一个正文完全一致的回复气泡；随后由操作者自己发送的两条测试消息
+  也分别形成独立的 `Succeeded/Delivered` job；
+- 同一 rollout 共三轮，实际工具、审批、用户输入请求和 unknown item 都为 0；
+- canary daemon 与 app-server 收口，旧 Relay/Hermes 服务恢复并排空队列；
+- LiViS IDaaS revoke 在收口阶段返回 HTTP 404，本地 refresh token 与隔离 state 按失败关闭
+  规则保留。因此功能闭环通过，但远端撤销与 cleanup 阻塞。
+
+单个回复气泡、一个 provider operation 和一次 delivery attempt 只说明本次观察没有重复，
+不能把 provider、Relay 或 App 的端到端语义升级为 exactly-once。三轮零工具只证明 rollout
+没有实际 tool item，不证明发给 provider 的请求 payload 不含工具 schema，也不证明 provider
+内部只收到一次 HTTP 请求。
+
+此前最高等级历史证据来自 [PR #14](https://github.com/Jassy930/livis-relay-daemon/pull/14)，它同样是高层端到端 S4 人工摘要，不是满足上述新标准的字段级 receipt：
 
 - 日期：2026-07-18；
 - daemon：0.1.0；PR head `d2c4df1`，合入基线 `708b857`；
@@ -79,12 +102,14 @@ daemon commit
 - Relay 服务端构建标识：未记录，视为 `unknown`；
 - receipt：没有记录可定位的不透明 receipt、原始字段集或私有保管位置，公开 provenance 不完整。
 
-当前 `main` 已晚于该基线；仓库没有记录基于当前最终 head 的新 S4 canary。
+当前 `main` 已晚于 #14 基线；2026-07-23 的 Codex canary 只绑定其精确测试提交，后续
+实现、配置或依赖变化不能自动继承该结论。
 
-截至 2026-07-21 的历史证据矩阵：
+截至 2026-07-23 的历史证据矩阵：
 
 | 记录 | 最高等级 | 实际证明 | 明确不证明 | 当前状态 |
 |---|---|---|---|---|
+| Codex E2E | 高层 S4 | 精确测试提交上的 Device Flow、Relay/Codex 执行、durable outbox Delivered 与 App 人工回显 | 字段必填性、exactly-once、请求 payload 无工具 schema、provider 内部请求次数、成功 revoke | 功能闭环通过；revoke/cleanup 阻塞 |
 | #14 | 高层 S4 人工摘要 | 旧版本 Device Flow、握手、单设备纯文本、Hermes final 与 outbox Delivered | 原始字段必填性、在线刷新、取消、重连、常驻运行 | 已合并；旧基线 |
 | #17 | 局部 S4 | macOS LaunchAgent、online doctor、Relay handshake、connector ready | 同一常驻 job 的消息与结果闭环 | Draft / DIRTY；旧 head CI |
 | #23 | S3 + S2 | 官方客户端静态字段与 access-token-only fake Relay | 真实 Relay 省略 refresh token | Draft / DIRTY；旧 head CI |
@@ -125,6 +150,22 @@ sequenceDiagram
 
 这次 canary 没有验证 launchd/systemd 常驻、取消、重复或迟到投递、断网重连、在线 token refresh、多设备、未来版本或长期稳定性。
 
+2026-07-23 的 Codex 人在环 S4 又在精确测试提交上确认：
+
+- 真实 Device Flow、Relay 握手与单一获准来源的纯文本路径完成；
+- App 请求经 daemon 进入 Codex app-server/custom Responses；主 job 为 `Succeeded`、
+  `run_generation=1`，durable outbox 进入 `Delivered`；
+- 操作者确认主 canary 在 App 中只有一个正文完全一致的回复气泡；另外两条由操作者自己发送
+  的测试消息也分别完成 `Succeeded/Delivered`；
+- 三轮 rollout 实际零工具，canary 服务安全停止，旧 Relay/Hermes 服务恢复且队列排空；
+- revoke 返回 HTTP 404，daemon 保留本地 refresh token 和隔离 state，远端撤销与 cleanup
+  没有完成。
+
+这组事实把 Codex 功能闭环提升为该精确组合的高层 S4，但单气泡不能证明 exactly-once，
+三轮零工具不能证明 provider 请求 payload 没有工具 schema。没有字段级 Relay trace、provider
+侧脱敏请求计数或成功 revoke 回执的部分继续保持未知。完整回执与处置规则见
+[Codex 完整 LiViS 人在环 canary](CODEX-E2E-CANARY.md)。
+
 ## 5. IDaaS 协议账本
 
 | 操作 | daemon 发送 / 接收 | 当前证据 | 服务端边界 |
@@ -132,7 +173,7 @@ sequenceDiagram
 | Device code | `POST /aux`：`client_id`、`scope + offline_access`、`audience`、`offline_access=true`；接收 `device_code`、`verification_uri_complete`、`expires_in`、`interval` | S4 完成真实 Device Flow；S2 probe 固定精确请求字段，并记录当前响应类型/范围/URI 校验缺口 | 当前缺口是 daemon 风险，不表示服务端允许这些形状；私有路径和必填性没有 S5 schema |
 | Device token polling | `POST /token`：device-code grant、`device_code`、`client_id` | S4 观察到 `authorization_pending` + HTTP 428 并最终成功；S2 覆盖标准 HTTP 400 和 `slow_down` | HTTP 400/429 分支不是实网证据；以 OAuth `error` 而非状态码裁决 |
 | Access-token refresh | `POST /token`：refresh-token grant、`refresh_token`、`client_id`；接收 access token，可选轮换 refresh token | S2 覆盖成功、轮换、`invalid_grant` 等分支；当前代码路径暗示历史握手前可能经过该步骤，只能记为 S1 推断 | 没有独立真实 HTTP receipt；响应字段、轮换细节、所有错误状态和在线长期行为未知 |
-| Revoke | `POST /revoke`：token、`token_type_hint=refresh_token`、`client_id` | S2 代码与测试 | 当前没有真实 2xx、网络失败或拒绝 canary |
+| Revoke | `POST /revoke`：token、`token_type_hint=refresh_token`、`client_id` | 2026-07-23 S4 负向证据：真实收口请求返回 HTTP 404；S2 代码与测试 | 只证明该精确组合在该次测试中未成功撤销；路由/字段原因和成功 2xx 形状未知。本地 refresh token 与隔离 state 已保留，cleanup 阻塞 |
 
 IDaaS token 响应可能直接包含 token 字段，也可能在 audience 键下嵌套；这是 S3/S2 兼容行为，不代表服务端公开承诺两种形状。
 

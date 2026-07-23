@@ -79,6 +79,11 @@ bun run src/index.ts logout
 
 只有看到“已撤销并清除本地 refresh token”才表示远端确认成功。网络失败或远端非 2xx 时命令以失败退出，并故意保留本地 token，便于恢复网络后重试；不要为消除错误而手工删除凭据。
 
+2026-07-23 的获授权隔离 canary 对当前 profile 执行相同 `POST /revoke` 时真实收到
+HTTP 404；这是非 2xx 负向证据，不表示端点永久不存在，也不允许清除本地 token。该轮
+refresh token 与完整 state 已按失败关闭保留，远端撤销和清理仍未完成。详见
+[Codex 完整 LiViS 人在环 canary](CODEX-E2E-CANARY.md)。
+
 一期尚未把 OAuth 账号 subject 与 `identity.json`、SQLite job/outbox 做持久化绑定，因此不支持在同一个 state directory 中直接切换账号。需要使用另一账号时，应使用独立配置和独立 state directory；不得用 `login --force` 覆盖原账号 token 后继续复用旧 outbox。
 
 ## 6. 准备执行后端
@@ -355,8 +360,10 @@ quarantine 边界后才可把 acknowledgement 设为 `true`。Codex 模式代码
 系统 `nc -O` 精确 `EPERM` 与零 turn 重启恢复；该结果只覆盖当前 macOS/CLI/config 组合。
 完整 turn deadline 与同一 POSIX 进程组的 TERM/KILL
 收口已有代码和 fake 回归；隔离 API-key 的成功 custom 模型 turn 也已完成，但
-Linux/cgroup、资源配额、逃逸进程组后代、请求层工具定义和 LiViS App 回显仍未验收，
-因此本模式当前只用于受控开发，不得宣称生产上线。
+Linux/cgroup、资源配额、逃逸进程组后代和请求层工具定义仍未验收。精确提交 `896091b`
+随后已完成一次唯一设备的 `Succeeded → Delivered → App` 人在环功能闭环，但它只覆盖固定
+macOS/CLI/provider/model/profile 组合，且凭据 revoke 收口仍阻塞；因此本模式当前只用于
+受控开发，不得宣称生产上线。
 
 2026-07-23 的一次获授权真实 canary 已确认 `turn/start` 能提交并取得 provider turn ID。
 本次是明确获授权的例外：日常 `~/.codex/auth.json` 被复制为隔离 `CODEX_HOME` 中权限
@@ -419,6 +426,25 @@ exit 1、stdout/stderr 均为空，按检查器语义为零句柄。没有为修
 symlink 未跟随；脱敏复核后整个可丢弃 r4 state 已清理。该回执只证明 daemon 侧一次
 dispatch、一个 provider operation 和本轮实际零工具，不证明 endpoint 内部 HTTP 请求精确
 一次，也不证明请求中没有工具 schema，更不替代 `Delivered → App 回显`。
+
+精确提交 `896091b` 随后按[Codex 完整 LiViS 人在环 canary](CODEX-E2E-CANARY.md)建立
+全新隔离 state：只保留同一 Agent identity 与唯一 node allowlist，fresh 生成 LiViS/Codex
+凭据，在隔离目录迁移 profile v1→v2 并通过 online doctor。经操作者确认后，专用 Hermes
+Gateway 与旧 Relay 按顺序停服，默认 Hermes 保持运行；Codex daemon 完成 Relay handshake
+和 API-key/custom provider/model 读回后，获授权用户本人只发送一次随机 nonce。
+
+规范 job 达到 `Succeeded/Delivered`、`run_generation=1`、
+`reserved → accepted → succeeded`、单 provider operation、单 delivery attempt、checkpoint
+`completed/1` 与 active/recovery/quarantine 全清；用户确认 App 只有一个正文精确匹配的回复
+气泡。随后两条是用户主动扩展测试，最终三条 job 均各自成功投递，rollout 三轮、三条
+assistant，实际 tool/approval/user-input/unknown 均为 0。canary 优雅停止且零句柄，原 Relay
+与专用 Hermes 已恢复健康并排空。
+
+这只把功能结论升级为 `E2E_FUNCTIONAL_GO`，不把至少一次结果投递升级为 exactly-once，
+也不证明 endpoint 内部 HTTP 次数或请求层没有工具 schema。收口必须独立裁决：本轮 Codex
+本地 logout 成功，但 LiViS revoke 返回 HTTP 404，故结论为
+`CREDENTIAL_CLEANUP_BLOCKED`，refresh token 与整个隔离 state 保留，禁止 release、手工删
+token、复用或清理。私有脱敏回执 ID 为 `codex-e2e-20260723-93b4d1e292d6881e`。
 
 后续任何新的真实调用都必须先停止旧 daemon，换全新目录和真正专用的 `CODEX_HOME`，再以
 API key 登录并重新取得明确授权。

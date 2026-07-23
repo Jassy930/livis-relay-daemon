@@ -532,8 +532,8 @@ macOS 的 `:minimal` 会为系统运行时开放一组平台路径，并包含 `
   单一 provider operation 和单次 dispatch 不能证明 provider 内部只收到一个 HTTP 请求；
 - 在请求层移除或 allowlist 工具 schema；当前只证明该成功 turn 实际产生零工具/审批事件，
   不能把提示词、workspace 不变和沙箱约束表述为硬 `tool_choice=none`；
-- 唯一设备的纯文本 job 只在 terminal 后产生一个 final，并完成
-  `Succeeded → Delivered → App 回显`。
+- 在最终发布 head 重跑[完整 LiViS 人在环 canary](CODEX-E2E-CANARY.md)，并补齐异常恢复、
+  长期运行与 IDaaS revoke 2xx 的凭据收口证据。
 
 ### 2026-07-22 至 2026-07-23 本机验证回执
 
@@ -628,9 +628,46 @@ token。固定 custom provider/model 的生产 backend 只 dispatch 一个固定
 请求精确一次；它也只证明本轮实际零工具，不证明请求层未携带工具 schema，更没有经过
 LiViS Relay 的 `Delivered → App 回显`。
 
+#### 2026-07-23 LiViS 完整人在环 canary
+
+随后在精确提交 `896091b` 上使用全新隔离 state 完成了 App → Relay → daemon → Codex
+app-server/custom Responses → durable outbox → App 的完整人在环测试。隔离 state 只复制经
+profile 前缀校验的 identity、在内存继承唯一 node allowlist，并生成 fresh secrets；没有复制
+生产 refresh token、数据库、proof 或日常 Codex `auth.json`。旧 schema v1 profile 只在隔离
+state 中迁移到 v2，fresh Device Flow 与 stdin API-key 登录分别建立两套独立凭据。
+
+获授权用户本人从唯一允许设备只发送一次随机 nonce 作为规范 canary：
+
+- 发送前 Relay handshake、`accountType=apiKey`、custom provider、固定模型、checkpoint 0、
+  active/recovery/quarantine 全部通过；
+- 唯一 nonce job 为 `Succeeded/Delivered`、`run_generation=1`，ledger 精确为
+  `reserved → accepted → succeeded`，只有一个 provider operation 和一次 outbox delivery
+  attempt，checkpoint 为 `completed/1`；
+- App 人工确认只出现一个正文精确匹配的回复气泡；`Delivered` 与视觉确认分别留证，未互相
+  替代；
+- 用户随后主动追加两条扩展消息；最终一个 rollout 含三轮和三条 assistant message，三条
+  job 各自 `Succeeded/Delivered`，实际 tool、approval、user-input request 与 unknown item
+  均为 0；这些消息不是 Relay 重复投递，也不扩写成三次规范 canary；
+- daemon 优雅停止后 connector socket 消失、state 零打开句柄；原 Relay 与专用 Hermes
+  Gateway 已恢复并排空队列，零 quarantine、零未投递结果。
+
+功能结论为 `E2E_FUNCTIONAL_GO`。私有脱敏回执 ID 是
+`codex-e2e-20260723-93b4d1e292d6881e`，公开记录不含 endpoint、token、Agent/node ID、
+profile SHA 或消息正文。收口结论独立为 `CREDENTIAL_CLEANUP_BLOCKED`：隔离 Codex 已本地
+logout 且临时 `auth.json` 已删除，但 LiViS IDaaS 对当前 profile 的 `POST /revoke` 返回
+HTTP 404，daemon 按失败关闭规则保留 refresh token。因此该 canary state 不得 release、
+手工删 token、复用或清理。完整步骤和失败边界见
+[Codex 完整 LiViS 人在环 canary](CODEX-E2E-CANARY.md)。
+
+该回执仍只观察到单一 daemon provider operation，不证明 endpoint 内部 HTTP 请求恰好一次；
+三轮零工具 item 也不证明请求 payload 没有工具 schema。它只覆盖本次
+macOS/Codex 0.145.0/model/provider/profile 与未知 Relay build，不能外推到 Linux、未来版本、
+资源配额、取消、重连或长期运行。
+
 前述零模型 smoke 回执只证明当前 macOS/Codex 0.145.0 组合上的无模型协议、持久化和安全边界。smoke 使用未登录的
 可丢弃专用 `CODEX_HOME`，所以 `backendStartReady=false` 是预期结果；它没有验证专用真实
-账号、模型 turn、工具最终清单、资源收口或 LiViS App 回显。
+账号、模型 turn、工具最终清单、资源收口或 LiViS App 回显；上述完整 E2E 回执是独立证据，
+不能由 smoke 结果反推。
 
 ## 当前产品语义与后续缺口
 
@@ -666,7 +703,8 @@ conversation/session 标识。因此“App 新对话自动创建新 thread”目
 - 固定空 workspace 中产物的查看、导出或销毁路径；一期 LiViS 只回纯文本 final，不会把
   本地文件交付到 App；
 - Codex CLI 升级后旧 session 的兼容检查与迁移路径；
-- 专用账号初始化/状态运维，以及真实 LiViS App 回显闭环。
+- 专用账号初始化/状态运维、完整 E2E 的可重复准备工具，以及 revoke、异常恢复与长期运行
+  收口。
 
 Claude Code 不应复用 Codex JSON-RPC transport。下一阶段应只抽象 provider-neutral 的
 backend registry、托管目录、session 生命周期、attempt fencing、terminal/cancel 语义
