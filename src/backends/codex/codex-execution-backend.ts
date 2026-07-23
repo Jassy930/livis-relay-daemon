@@ -649,6 +649,7 @@ export interface CodexThreadTailInspection extends CodexThreadTailCheckpoint {
 
 interface CodexCheckpointThreadTailInspection extends CodexThreadTailCheckpoint {
   threadStatus: "idle" | "systemError";
+  legacyFailedTailProjectionObserved: boolean;
 }
 
 interface CodexSystemErrorDispatchMarker {
@@ -659,6 +660,11 @@ interface CodexSystemErrorDispatchMarker {
   turnStatus: "failed";
   turnCount: number;
   turnsSha256: string;
+  legacyFailedTailProjectionObserved: boolean;
+}
+
+function hasCodex0145LegacyFailedTailProjection(cliVersion: string): boolean {
+  return cliVersion === "0.145.0";
 }
 
 function assertStoredThreadCheckpoint(
@@ -684,6 +690,7 @@ function assertStoredThreadCheckpoint(
 function parseCodexThreadTail(
   value: unknown,
   expectedThreadId: string,
+  normalizeLegacyFailedTail = false,
 ): CodexCheckpointThreadTailInspection {
   const response = requireRecord(value, "thread/read response");
   const thread = requireRecord(response.thread, "thread/read response.thread");
@@ -714,19 +721,30 @@ function parseCodexThreadTail(
       status: turnStatus as "completed" | "failed" | "interrupted",
     };
   });
-  const tail = turns.at(-1) ?? null;
+  const rawTail = turns.at(-1) ?? null;
+  // Codex 0.145.0 的 legacy history 会在权威 failed terminal 后把同一 tail
+  // 投影为 completed，同时把 thread 标成 systemError。只允许调用方在已经绑定
+  // 当前 failed 通知或同 client epoch marker 时开启该归一化；fresh/recovery 读取
+  // 仍保持严格，不能仅凭磁盘上的 systemError 猜测历史执行结果。raw turns hash
+  // 始终按未改写的 readback 计算，避免 completed/failed 状态漂移被语义归一化掩盖。
+  const legacyFailedTailProjectionObserved = Boolean(
+    normalizeLegacyFailedTail && statusType === "systemError" &&
+      rawTail?.status === "completed",
+  );
+  const semanticTailStatus = legacyFailedTailProjectionObserved ? "failed" : rawTail?.status ?? null;
   if (statusType !== "idle" && statusType !== "systemError") {
     throw new Error(`Codex thread 当前不是稳定终态：${statusType}`);
   }
-  if (statusType === "systemError" && tail?.status !== "failed") {
+  if (statusType === "systemError" && semanticTailStatus !== "failed") {
     throw new Error("Codex thread 的 systemError 没有对应 failed tail");
   }
   return {
     threadStatus: statusType,
-    turnId: tail?.id ?? null,
-    turnStatus: tail?.status ?? null,
+    turnId: rawTail?.id ?? null,
+    turnStatus: semanticTailStatus,
     turnCount: turns.length,
     turnsSha256: sha256(JSON.stringify(turns)),
+    legacyFailedTailProjectionObserved,
   };
 }
 
@@ -744,8 +762,9 @@ export function inspectCodexThreadTail(
 function inspectCodexCheckpointThreadTail(
   value: unknown,
   expectedThreadId: string,
+  normalizeLegacyFailedTail = false,
 ): CodexCheckpointThreadTailInspection {
-  return parseCodexThreadTail(value, expectedThreadId);
+  return parseCodexThreadTail(value, expectedThreadId, normalizeLegacyFailedTail);
 }
 
 function inspectTerminalCodexThreadTail(
@@ -753,8 +772,13 @@ function inspectTerminalCodexThreadTail(
   expectedThreadId: string,
   expectedTurnId: string,
   expectedStatus: "completed" | "failed" | "interrupted",
+  cliVersion: string,
 ): CodexCheckpointThreadTailInspection {
-  const tail = parseCodexThreadTail(value, expectedThreadId);
+  const tail = parseCodexThreadTail(
+    value,
+    expectedThreadId,
+    expectedStatus === "failed" && hasCodex0145LegacyFailedTailProjection(cliVersion),
+  );
   if (tail.turnId !== expectedTurnId || tail.turnStatus !== expectedStatus) {
     throw new Error(
       `Codex terminal checkpoint 与通知不一致：${tail.turnId ?? "<empty>"}/${tail.turnStatus ?? "<empty>"}`,
@@ -792,8 +816,13 @@ async function inspectPersistedCodexCheckpointTail(
   value: unknown,
   layout: CodexRuntimeLayout,
   expectedThreadId: string,
+  normalizeLegacyFailedTail = false,
 ): Promise<CodexCheckpointThreadTailInspection> {
-  const tail = inspectCodexCheckpointThreadTail(value, expectedThreadId);
+  const tail = inspectCodexCheckpointThreadTail(
+    value,
+    expectedThreadId,
+    normalizeLegacyFailedTail,
+  );
   await validatePersistedCodexRollout(value, layout, expectedThreadId);
   return tail;
 }
@@ -2485,7 +2514,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
   }
 
   private async assertStoredThreadTailBeforeDispatch(): Promise<void> {
-    if (!this.client || !this.layout || !this.threadId) {
+    if (!this.client || !this.layout || !this.threadId || !this.cliVersion) {
       throw new Error("Codex thread checkpoint 回读时 backend 未完整就绪");
     }
     const persisted = await this.client.threadRead({
@@ -2496,6 +2525,8 @@ export class CodexExecutionBackend implements ExecutionBackend {
       persisted,
       this.layout,
       this.threadId,
+      this.systemErrorDispatchMarker?.legacyFailedTailProjectionObserved === true &&
+        hasCodex0145LegacyFailedTailProjection(this.cliVersion),
     );
     const stored = this.store.getBackendSession(this.kind, this.options.sessionKey);
     if (!stored || stored.threadId !== this.threadId || stored.recoveryRequired) {
@@ -2508,7 +2539,9 @@ export class CodexExecutionBackend implements ExecutionBackend {
         !marker || marker.clientEpoch !== this.clientEpoch ||
         marker.threadId !== this.threadId || marker.turnId !== actual.turnId ||
         marker.turnStatus !== actual.turnStatus || marker.turnCount !== actual.turnCount ||
-        marker.turnsSha256 !== actual.turnsSha256
+        marker.turnsSha256 !== actual.turnsSha256 ||
+        marker.legacyFailedTailProjectionObserved !==
+          actual.legacyFailedTailProjectionObserved
       ) {
         throw new Error(
           "Codex thread 的 systemError 未绑定到当前 app-server 进程实际观察到的 failed terminal",
@@ -2524,7 +2557,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
     attempt: ActiveAttempt,
     expectedStatus: "completed" | "failed" | "interrupted",
   ): Promise<CodexCheckpointThreadTailInspection> {
-    if (!this.client || !this.layout || !this.threadId || !attempt.turnId) {
+    if (!this.client || !this.layout || !this.threadId || !this.cliVersion || !attempt.turnId) {
       throw new Error("Codex terminal checkpoint 时 backend/turn 未完整绑定");
     }
     const persisted = await this.client.threadRead({
@@ -2536,6 +2569,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
       this.threadId,
       attempt.turnId,
       expectedStatus,
+      this.cliVersion,
     );
     await validatePersistedCodexRollout(persisted, this.layout, this.threadId);
     const checkpointedSession = this.store.checkpointBackendThreadTail({

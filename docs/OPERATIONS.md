@@ -319,13 +319,25 @@ quarantine 边界后才可把 acknowledgement 设为 `true`。Codex 模式代码
 2026-07-23 的一次获授权真实 canary 已确认 `turn/start` 能提交并取得 provider turn ID。
 本次是明确获授权的例外：日常 `~/.codex/auth.json` 被复制为隔离 `CODEX_HOME` 中权限
 `0600`、单链接的临时普通文件；它不符合上面的专用登录 runbook，不能作为生产做法。
-Responses API 以 `401 invalid_api_key` 拒绝该临时副本；没有 assistant 输出，本地 token
-计数为 0。这只能证明调用链到达 provider 和该副本已失效，不能证明专用登录凭据状态，
-也不能算真实模型 turn 成功或授权自动重试。遇到同类错误时，job `Failed`、failed
-execution ledger、通用失败 outbox、active clear 和 session quarantine 必须在同一事务
-提交，随后关闭 backend；原始 provider message、JSON-RPC error message/data 与
-app-server stderr 不应出现在 `relay.db` 或共享日志。停止 daemon 后配置真正的专用
-`CODEX_HOME` 登录，再人工执行
+Responses API 以 `401 invalid_api_key` 拒绝该临时副本；没有 assistant 输出，也没有
+token-count 记录。这只能证明调用链到达 provider 和该副本已失效，不能证明专用登录凭据状态，
+也不能算真实模型 turn 成功。harness/daemon 没有再次 dispatch；provider 内部 HTTP retry
+未在该回执中评估。
+
+提交 `e71363f` 上随后进行的一次性复核没有重发旧 job，而是在全新固定证据目录中只提交
+一个 turn；provider 再次返回 401，但 Codex 0.145.0 legacy `thread/read` 把权威 failed tail
+投影成 completed，backend 因通知/readback 不一致按 fail-closed 保留为 `Interrupted`、
+`recovery_required=true`、零 outbox 和单条 quarantine。该证据目录不得复用、手工改库、
+release 或清理；当前同一进程组已消失，事后 `lsof` 为零，但报告生成瞬间的 lsof 结果
+无结论，不能倒推为当时已经证明零句柄。
+
+本地修复的例外版本 allowlist 只含精确 0.145.0；仅在权威 failed 通知与同一 turn 的
+`systemError + legacy completed tail` 完全匹配时归一化业务语义，并继续以 raw turns hash
+检测漂移；其他入口仍失败关闭。预期同类凭据拒绝应在同一事务提交 job
+`Failed`、failed execution ledger、通用失败 outbox、active clear 和 session quarantine，
+随后关闭 backend；原始 provider message、JSON-RPC error message/data 与 app-server stderr
+不得进入 `relay.db` 或共享日志。该事务目前只有 fake 回归，没有新的真实 turn 证明。
+后续应停止 daemon，配置真正的专用 `CODEX_HOME` 登录，再经人工核对决定是否对旧证据执行
 `session release`；新的真实调用必须重新取得明确授权。`account/read` 只证明账号对象存在，
 不能证明 API key 当前有效，今后不得用复制日常凭据代替专用登录。
 

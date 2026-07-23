@@ -131,6 +131,8 @@ class FakeCodexAppServer {
   threadStatus: "idle" | "active" | "systemError" = "idle";
   failedTerminalThreadStatus: "idle" | "systemError" = "idle";
   completedTerminalThreadStatus: "idle" | "systemError" = "idle";
+  legacyFailedTurnReadbackAsCompleted = false;
+  cliVersion = "0.145.0";
   nextTurnId = "019f-turn-1";
   turns: Array<Record<string, unknown>> = [];
   account: Record<string, unknown> | null = { type: "chatgpt", email: null, planType: "plus" };
@@ -231,7 +233,7 @@ class FakeCodexAppServer {
     }
     if (message.method === "initialize") {
       await this.respond(message.id, {
-        userAgent: "livis-relay-daemon/0.145.0 (test; test) unknown (livis-relay-daemon; 0.1.0)",
+        userAgent: `livis-relay-daemon/${this.cliVersion} (test; test) unknown (livis-relay-daemon; 0.1.0)`,
         codexHome: this.spawnOptions?.env?.CODEX_HOME,
         platformFamily: "unix",
         platformOs: "test",
@@ -410,7 +412,7 @@ class FakeCodexAppServer {
       id: this.threadId,
       sessionId: this.threadId,
       cwd: this.workspace,
-      cliVersion: "0.145.0",
+      cliVersion: this.cliVersion,
       ephemeral: false,
       status: { type: this.threadStatus },
       turns: this.turns.map((turn) => ({ ...turn })),
@@ -452,7 +454,12 @@ class FakeCodexAppServer {
           ? this.failedTerminalThreadStatus
           : this.completedTerminalThreadStatus;
         const existing = this.turns.findIndex((candidate) => candidate.id === turn.id);
-        const snapshot = { id: turn.id, status: turn.status };
+        const snapshot = {
+          id: turn.id,
+          status: turn.status === "failed" && this.legacyFailedTurnReadbackAsCompleted
+            ? "completed"
+            : turn.status,
+        };
         if (existing >= 0) this.turns[existing] = snapshot;
         else this.turns.push(snapshot);
       }
@@ -2639,6 +2646,7 @@ describe("CodexExecutionBackend", () => {
     const harness = await createHarness({
       configureFake: (fake) => {
         fake.failedTerminalThreadStatus = "systemError";
+        fake.legacyFailedTurnReadbackAsCompleted = true;
       },
     });
     try {
@@ -2686,6 +2694,7 @@ describe("CodexExecutionBackend", () => {
         checkpointTurnStatus: "failed",
         checkpointTurnCount: 1,
       });
+      expect(harness.fake.turns).toEqual([{ id: "019f-turn-1", status: "completed" }]);
       expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
         .toBe(
           "Codex provider 拒绝当前隔离凭据；禁止继续发送 turn，需修复专用凭据并人工 release session",
@@ -2701,6 +2710,80 @@ describe("CodexExecutionBackend", () => {
         expect(bytes.includes(messageSensitive)).toBeFalse();
         expect(bytes.includes(detailsSensitive)).toBeFalse();
       }
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("0.145 legacy completed tail 缺少 systemError 见证时仍失败关闭", async () => {
+    const harness = await createHarness({
+      configureFake: (fake) => {
+        fake.failedTerminalThreadStatus = "idle";
+        fake.legacyFailedTurnReadbackAsCompleted = true;
+      },
+    });
+    try {
+      const job = claimJob(harness, "job-legacy-failed-without-system-error");
+      await harness.backend.dispatch(job);
+      await harness.fake.send({
+        method: "turn/completed",
+        params: {
+          threadId: harness.fake.threadId,
+          turn: {
+            id: "019f-turn-1",
+            status: "failed",
+            error: { message: "synthetic provider failure", codexErrorInfo: "other" },
+            items: [],
+          },
+        },
+      });
+
+      await waitFor(() => harness.disconnects.length === 1, "legacy tail without systemError");
+      expect(harness.failures).toEqual([]);
+      expect(harness.store.require(job.jobId)).toMatchObject({
+        status: "Interrupted",
+        outbox: null,
+      });
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")?.recoveryRequired)
+        .toBeTrue();
+      expect(harness.store.getSessionQuarantine("livis:agent-test")).not.toBeNull();
+      expect(harness.fake.turns).toEqual([{ id: "019f-turn-1", status: "completed" }]);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("0.145.1 不继承 0.145.0 的 legacy failed-tail 例外", async () => {
+    const harness = await createHarness({
+      commandRunner: async () => ({ exitCode: 0, stdout: "codex-cli 0.145.1", stderr: "" }),
+      configureFake: (fake) => {
+        fake.cliVersion = "0.145.1";
+        fake.failedTerminalThreadStatus = "systemError";
+        fake.legacyFailedTurnReadbackAsCompleted = true;
+      },
+    });
+    try {
+      const job = claimJob(harness, "job-legacy-projection-unreviewed-patch");
+      await harness.backend.dispatch(job);
+      await harness.fake.send({
+        method: "turn/completed",
+        params: {
+          threadId: harness.fake.threadId,
+          turn: {
+            id: "019f-turn-1",
+            status: "failed",
+            error: { message: "synthetic provider failure", codexErrorInfo: "other" },
+            items: [],
+          },
+        },
+      });
+
+      await waitFor(() => harness.disconnects.length === 1, "0.145.1 projection rejection");
+      expect(harness.failures).toEqual([]);
+      expect(harness.store.require(job.jobId)).toMatchObject({ status: "Interrupted", outbox: null });
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")?.recoveryRequired)
+        .toBeTrue();
+      expect(harness.store.getSessionQuarantine("livis:agent-test")).not.toBeNull();
     } finally {
       await harness.cleanup();
     }
@@ -2823,6 +2906,7 @@ describe("CodexExecutionBackend", () => {
     const harness = await createHarness({
       configureFake: (fake) => {
         fake.failedTerminalThreadStatus = "systemError";
+        fake.legacyFailedTurnReadbackAsCompleted = true;
       },
     });
     try {
@@ -2847,6 +2931,7 @@ describe("CodexExecutionBackend", () => {
       expect(harness.failures).toEqual(["Codex provider 返回未分类错误"]);
       expect(harness.store.getSessionQuarantine("livis:agent-test")).toBeNull();
       expect(harness.backend.ready).toBeTrue();
+      expect(harness.fake.turns).toEqual([{ id: "019f-turn-1", status: "completed" }]);
 
       harness.fake.nextTurnId = "019f-turn-2";
       const recoveredJob = claimJob(harness, "job-after-system-error", "继续执行");
@@ -2881,6 +2966,53 @@ describe("CodexExecutionBackend", () => {
       await harness.cleanup();
     }
   });
+
+  for (const scenario of [
+    { name: "completed→failed", initialLegacyProjection: true, changedStatus: "failed" },
+    { name: "failed→completed", initialLegacyProjection: false, changedStatus: "completed" },
+  ] as const) {
+    test(`systemError marker 拒绝 raw tail status 漂移：${scenario.name}`, async () => {
+      const harness = await createHarness({
+        configureFake: (fake) => {
+          fake.failedTerminalThreadStatus = "systemError";
+          fake.legacyFailedTurnReadbackAsCompleted = scenario.initialLegacyProjection;
+        },
+      });
+      try {
+        const failedJob = claimJob(harness, `job-raw-status-${scenario.name}`);
+        await harness.backend.dispatch(failedJob);
+        await harness.fake.send({
+          method: "turn/completed",
+          params: {
+            threadId: harness.fake.threadId,
+            turn: {
+              id: "019f-turn-1",
+              status: "failed",
+              error: { message: "synthetic provider failure", codexErrorInfo: "other" },
+              items: [],
+            },
+          },
+        });
+        await waitFor(
+          () => harness.store.require(failedJob.jobId).status === "Failed",
+          `raw status baseline ${scenario.name}`,
+        );
+
+        harness.fake.turns[0] = { id: "019f-turn-1", status: scenario.changedStatus };
+        harness.fake.nextTurnId = "019f-turn-2";
+        const nextJob = claimJob(harness, `job-after-raw-status-${scenario.name}`);
+        const turnStartsBefore = harness.fake.messages
+          .filter((message) => message.method === "turn/start").length;
+        expect(await harness.backend.dispatch(nextJob)).toBe("not_sent");
+        expect(harness.fake.messages.filter((message) => message.method === "turn/start"))
+          .toHaveLength(turnStartsBefore);
+        expect(harness.store.getSessionQuarantine("livis:agent-test")).not.toBeNull();
+        expect(harness.backend.ready).toBeFalse();
+      } finally {
+        await harness.cleanup();
+      }
+    });
+  }
 
   test("failed terminal 实际为 idle 时拒绝后来无关的同 tail systemError", async () => {
     const harness = await createHarness();
@@ -2976,6 +3108,59 @@ describe("CodexExecutionBackend", () => {
         .toHaveLength(turnStartsBefore);
       expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
         .toContain("systemError 未绑定");
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("0.145.0 legacy failed-tail 归一化不跨 idle recovery client epoch", async () => {
+    const initial = new FakeCodexAppServer();
+    initial.failedTerminalThreadStatus = "systemError";
+    initial.legacyFailedTurnReadbackAsCompleted = true;
+    const recovering = new FakeCodexAppServer();
+    const sequence = new FakeCodexAppServerSequence(
+      [initial, recovering],
+      (index) => {
+        if (index === 1) {
+          recovering.turns = initial.turns.map((turn) => ({ ...turn }));
+          recovering.threadStatus = "idle";
+        }
+      },
+    );
+    const harness = await createHarness({
+      fake: initial,
+      appServerSpawn: sequence.spawn,
+      recoveryDelaysMs: [0, 0, 0],
+    });
+    try {
+      const failedJob = claimJob(harness, "job-legacy-projection-old-epoch");
+      await harness.backend.dispatch(failedJob);
+      await initial.send({
+        method: "turn/completed",
+        params: {
+          threadId: initial.threadId,
+          turn: {
+            id: "019f-turn-1",
+            status: "failed",
+            error: { message: "synthetic provider failure", codexErrorInfo: "other" },
+            items: [],
+          },
+        },
+      });
+      await waitFor(
+        () => harness.store.require(failedJob.jobId).status === "Failed",
+        "legacy projection terminal before recovery",
+      );
+      expect(initial.turns).toEqual([{ id: "019f-turn-1", status: "completed" }]);
+
+      await initial.stop(45);
+      await waitFor(() => harness.disconnects.length === 1, "legacy projection recovery rejection");
+      await Bun.sleep(10);
+
+      expect(sequence.spawnCount).toBe(2);
+      expect(harness.backend.status()).toMatchObject({ state: "failed", ready: false });
+      expect(harness.store.getSessionQuarantine("livis:agent-test")).not.toBeNull();
+      expect(recovering.messages.some((message) => message.method === "turn/start")).toBeFalse();
     } finally {
       await harness.cleanup();
     }
