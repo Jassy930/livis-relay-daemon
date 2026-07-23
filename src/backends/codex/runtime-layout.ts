@@ -27,6 +27,7 @@ export function codexRemoteConfig(workspace: string): string {
 approval_policy = "never"
 approvals_reviewer = "user"
 web_search = "disabled"
+cli_auth_credentials_store = "file"
 
 [agents]
 enabled = false

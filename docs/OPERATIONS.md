@@ -264,14 +264,18 @@ test "$(cd "$STATE_DIR" && pwd -P)" = "$STATE_DIR"
 test "$(stat -f '%Lp' "$STATE_DIR")" = 700
 install -d -m 0700 "$CODEX_HOME"
 
-env CODEX_HOME="$CODEX_HOME" /绝对路径/codex login --device-auth
-env CODEX_HOME="$CODEX_HOME" /绝对路径/codex login status
+env CODEX_HOME="$CODEX_HOME" /绝对路径/codex \
+  -c 'cli_auth_credentials_store="file"' login --device-auth
 ```
 
 Linux 将权限检查替换为 `stat -c '%a'`。API key 登录只能从标准输入交给
-`codex login --with-api-key`，不得写入 argv、config、日志或 shell history。不要手写
-`<stateDir>/backends/codex/home/config.toml`；daemon 会生成固定安全配置并在每次执行前
-读回，已有内容不一致时失败关闭。
+`codex -c 'cli_auth_credentials_store="file"' login --with-api-key`，不得写入 argv、config、
+日志或 shell history。首次登录必须显式固定 `file`，后续 daemon 配置也会固定同一值，
+保证认证数据落在专用 `$CODEX_HOME/auth.json`，不复用系统 credential store；不得复制、
+symlink 或 hardlink 用户日常的 `auth.json`。`codex login status` 在部分认证模式下会显示
+API key 的掩码片段，不得采集到 CI、工单或共享日志；daemon 会通过 app-server 的脱敏
+`account/read` 在启动时验证账号。不要手写 `<stateDir>/backends/codex/home/config.toml`；
+daemon 会生成固定安全配置并在每次执行前读回，已有内容不一致时失败关闭。
 
 随后在 config 中显式选择 backend；`command` 应替换为刚才读回的绝对路径：
 

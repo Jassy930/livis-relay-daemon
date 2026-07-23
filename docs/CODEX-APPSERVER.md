@@ -173,14 +173,19 @@ test "$(cd "$STATE_DIR" && pwd -P)" = "$STATE_DIR"
 test "$(stat -f '%Lp' "$STATE_DIR")" = 700
 install -d -m 0700 "$CODEX_HOME"
 
-env CODEX_HOME="$CODEX_HOME" /绝对路径/codex login --device-auth
-env CODEX_HOME="$CODEX_HOME" /绝对路径/codex login status
+env CODEX_HOME="$CODEX_HOME" /绝对路径/codex \
+  -c 'cli_auth_credentials_store="file"' login --device-auth
 ```
 
 Linux 应使用等价的 `stat -c '%a'` 检查。若使用 API key 登录，应从标准输入传入
-`codex login --with-api-key`；不要把 key 拼进命令行。登录命令只负责专用 Codex
-账号，daemon 首次启动仍会生成并固定自己的 `config.toml`。如果该文件已由其他工具
-生成或被改写，daemon 会拒绝启动；不得为了启动而放宽或覆盖安全配置。
+`codex -c 'cli_auth_credentials_store="file"' login --with-api-key`；不要把 key 拼进命令行。
+首次登录必须显式固定 `file`，后续 daemon 安全配置也会固定同一值，保证认证数据落在
+专用 `$CODEX_HOME/auth.json`，不复用系统 credential store。不要复制、symlink 或 hardlink
+用户日常的 `auth.json`。`codex login status` 在部分认证模式下会显示 API key 的掩码片段，
+不得采集到 CI、工单或共享日志；daemon 会通过 app-server 的脱敏 `account/read` 在启动时
+验证账号。登录命令只负责专用 Codex 账号，daemon 首次启动仍会生成并固定自己的
+`config.toml`。如果该文件已由其他工具生成或被改写，daemon 会拒绝启动；不得为了启动
+而放宽或覆盖安全配置。
 
 退出账号前先停止 daemon，确认 app-server 子进程和可能的工具子进程均已退出，再用
 同一个专用 `CODEX_HOME` 执行本地 `codex logout`。LiViS `logout` 与 Codex logout

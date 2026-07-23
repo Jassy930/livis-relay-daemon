@@ -6,6 +6,7 @@
 
 ### 修复
 
+- Codex 固定安全配置现在强制把 CLI 认证凭据保存在 daemon 专用 `CODEX_HOME/auth.json`，登录 runbook 同步禁止复用系统 credential store、默认 `~/.codex` 凭据及可能泄露掩码片段的共享 `login status` 日志。
 - Codex app-server 现在以独立 POSIX 进程组运行；关闭按 `SIGTERM`、有界等待、`SIGKILL`、再次等待和进程组/stdio 收口回执执行，无法确认时向上抛错，不再把直接子进程退出等同于全部后代已结束。
 - Codex idle app-server 意外退出后新增 daemon 生命周期累计三次的有界自动恢复，固定退避为 `250/1000/5000 ms`。只有内存与 SQLite 都无 active attempt、无 recovery/quarantine 且 immutable metadata、Store anchor、rollout 与 thread-tail checkpoint 一致时，才会在确认旧进程组收口后对同一 thread 执行 `thread/resume + thread/read`；漂移立即 quarantine，候选进程组未确认关闭或预算耗尽均失败关闭，活动 turn 不进入自动恢复。`stop()` 会取消退避并等待 recovery、disconnect 与进程组关闭。
 - Codex turn 新增从 `turn/start` 前开始计算的绝对 deadline；超时后只允许一个 interrupt owner，并在固定 grace 后失败关闭。deadline 之后的 terminal、取消或迟到通知不会写入 result/outbox，`stop()` 会等待同一断连和进程组收口结果。

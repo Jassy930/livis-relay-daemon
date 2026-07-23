@@ -70,6 +70,7 @@ describe("Codex daemon 托管目录", () => {
       expect(await Bun.file(layout.configPath).text()).toBe(expectedConfig);
       expect(expectedConfig).toContain(`projects.${JSON.stringify(layout.workspace)}`);
       expect(expectedConfig).toContain('trust_level = "untrusted"');
+      expect(expectedConfig).toContain('cli_auth_credentials_store = "file"');
       expect(expectedConfig).toContain('exclude = ["CODEX_HOME", "OPENAI_*", "LIVIS_*"]');
       expect(expectedConfig).toContain(
         `set = { HOME = ${JSON.stringify(layout.agentHome)}, TMPDIR = ${JSON.stringify(layout.agentTmpDir)} }`,
