@@ -85,11 +85,14 @@ Codex 0.145.0 的真实非临时、零模型 turn canary 已在 macOS 命中 wor
 凭据/宿主 HOME 读写拒绝、workspace 外同卷牺牲文件 hardlink 拒绝、command identity、
 系统 `nc -O` 原始 `connect` 的精确 `EPERM` 和审批关闭边界，并恢复同一零 turn thread。
 daemon 还会流式绑定 command 内容摘要与文件身份，并在启动、恢复和持久 session 间失败
-关闭。2026-07-23 的单 turn 例外 canary 只取得一次 turn 提交及 provider
+关闭。2026-07-23 早先的单 turn 例外 canary 取得一次 turn 提交及 provider
 `401 invalid_api_key` 拒绝证据，并暴露 0.145.0 legacy `thread/read` 把 failed tail
-投影成 completed 的兼容缺口；
-本地已做窄归一化和 fake 回归，但没有再次发送真实 turn。真实账号 turn、Linux/cgroup、
-资源配额与 LiViS App 回显仍未验收，因此 Codex 仍是
+投影成 completed 的兼容缺口。提交 `65f00c1` 上的后续全新单 turn canary 使用获授权的
+隔离本地 ChatGPT OAuth 副本，provider 仍以 structured `unauthorized` 拒绝；但修复已把
+job 原子收口为 `Failed`、`Pending` outbox、`reserved → accepted → failed`、active clear、
+`recovery_required=false` 和单条凭据 quarantine，没有 assistant、工具或 token-count 记录。
+这只验证失败结算修复，不是成功模型 turn。专用登录后的成功模型 turn、Linux/cgroup、资源配额与
+LiViS App 回显仍未验收，因此 Codex 仍是
 Draft/受控开发功能，不应宣称生产上线，完整门禁见
 [`docs/CODEX-APPSERVER.md`](docs/CODEX-APPSERVER.md)。
 

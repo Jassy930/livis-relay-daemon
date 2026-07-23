@@ -6,7 +6,7 @@
 
 ### 修复
 
-- Codex failed turn 现在识别 0.145.0 实测到的 legacy history 投影缺陷：权威 `turn/completed=failed` 可能被同一 thread 的 `thread/read` 回读成 `systemError + completed tail`。例外版本 allowlist 只含精确 `0.145.0`；只有当前 failed 通知绑定同一 turn，或同一 app-server client epoch 的内存 marker、raw turns hash 与 SQLite checkpoint 完全一致时，才把 tail 的业务语义归一化为 failed。raw history 状态不改写，fresh start、重启、recovery、其他状态组合和其他版本仍失败关闭。provider 原始错误、JSON-RPC message/data 与 app-server stderr 不写入 JobStore/Relay/共享日志，失效凭据会以脱敏分类在同一事务中完成失败结算与 quarantine，关闭失败继续向上报告。
+- Codex failed turn 现在识别 0.145.0 实测到的 legacy history 投影缺陷：权威 `turn/completed=failed` 可能被同一 thread 的 `thread/read` 回读成 `systemError + completed tail`。例外版本 allowlist 只含精确 `0.145.0`；只有当前 failed 通知绑定同一 turn，或同一 app-server client epoch 的内存 marker、raw turns hash 与 SQLite checkpoint 完全一致时，才把 tail 的业务语义归一化为 failed。raw history 状态不改写，fresh start、重启、recovery、其他状态组合和其他版本仍失败关闭。provider 原始错误、JSON-RPC message/data 与 app-server stderr 不写入 JobStore/Relay/共享日志，失效凭据会以脱敏分类在同一事务中完成失败结算与 quarantine，关闭失败继续向上报告。提交 `65f00c1` 的一次性真实 canary 已验证 structured `unauthorized` 会收口为 `Failed + Pending outbox + failed ledger + active clear + credential quarantine`，不再误落成 `Interrupted + recovery_required`；凭据仍被拒绝，因此这不是成功模型 turn。
 - Codex `account/read.requiresOpenaiAuth` 现在按 provider 属性解析，不再把 API key/ChatGPT 账号正常返回的 `true` 误判为未登录；账号存在性仍由受支持的 `account` 对象失败关闭。
 - Codex 固定安全配置现在强制把 CLI 认证凭据保存在 daemon 专用 `CODEX_HOME/auth.json`，登录 runbook 同步禁止复用系统 credential store、默认 `~/.codex` 凭据及可能泄露掩码片段的共享 `login status` 日志。
 - Codex app-server 现在以独立 POSIX 进程组运行；关闭按 `SIGTERM`、有界等待、`SIGKILL`、再次等待和进程组/stdio 收口回执执行，无法确认时向上抛错，不再把直接子进程退出等同于全部后代已结束。
