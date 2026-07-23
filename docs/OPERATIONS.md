@@ -338,9 +338,9 @@ custom endpoint 会收到 API key、prompt、会话上下文和工具结果；
 WebSocket；API key 仍只由专用 `CODEX_HOME` 管理，不写入 JSON/TOML。
 
 当前默认 OpenAI 和 custom 路径都要求 `forced_login_method="api"` 与运行态
-`account.type=apiKey` 双门禁。custom 配置在固定 Codex `0.145.0` 上完成无秘密
-`--strict-config` 探针和获授权真实 Responses canary 前，只能作为受控开发候选，不能写成
-生产兼容已验证。
+`account.type=apiKey` 双门禁。精确提交 `56a1d77` 已在固定 Codex `0.145.0` 上完成无秘密
+`--strict-config` 探针、隔离 API-key 登录和获授权真实 Responses single turn；该回执只升级
+当前 macOS/CLI/provider/model 组合的功能结论，不能写成任意 custom endpoint 的生产兼容。
 
 只有在审阅 workspace 写权限、无工具网络、审批拒绝、terminal-only final、取消与
 quarantine 边界后才可把 acknowledgement 设为 `true`。Codex 模式代码级要求
@@ -354,9 +354,9 @@ quarantine 边界后才可把 acknowledgement 设为 `true`。Codex 模式代码
 的 fresh 非临时 canary 已完整通过基础读取、同卷外部牺牲文件 hardlink、command identity、
 系统 `nc -O` 精确 `EPERM` 与零 turn 重启恢复；该结果只覆盖当前 macOS/CLI/config 组合。
 完整 turn deadline 与同一 POSIX 进程组的 TERM/KILL
-收口已有代码和 fake 回归，但专用登录后的成功模型 turn、Linux/cgroup、资源配额、
-逃逸进程组后代和 LiViS App 回显仍未验收，因此本模式当前只用于受控开发，不得宣称
-生产上线。
+收口已有代码和 fake 回归；隔离 API-key 的成功 custom 模型 turn 也已完成，但
+Linux/cgroup、资源配额、逃逸进程组后代、请求层工具定义和 LiViS App 回显仍未验收，
+因此本模式当前只用于受控开发，不得宣称生产上线。
 
 2026-07-23 的一次获授权真实 canary 已确认 `turn/start` 能提交并取得 provider turn ID。
 本次是明确获授权的例外：日常 `~/.codex/auth.json` 被复制为隔离 `CODEX_HOME` 中权限
@@ -400,6 +400,25 @@ token-count 记录；源凭据文件没有被修改。报告顶层 `ok=false`，
 
 该轮目录 `.livis-relay-real-canary-20260723-65f00c1-r3` 同样是只读证据，不得复用、
 release、改库或清理。
+
+精确提交 `56a1d77` 上的 r4 canary 改用全新非临时 state，并从默认本机凭据中只读取
+`OPENAI_API_KEY`，直接经标准输入登录隔离 `CODEX_HOME`；没有复制默认 `auth.json`，也没有
+加载默认 config 中 custom provider 的自由 bearer token。生产 `CodexExecutionBackend`
+只 dispatch 一个固定短答 job，运行态读回 `accountType=apiKey`、
+`modelProvider=livis-custom-responses` 和固定模型。terminal 精确匹配，job 为 `Succeeded`、
+outbox 为 `Pending`、ledger 为
+`reserved → accepted → succeeded`、checkpoint 为 `completed/1`，active 全清、
+`recovery_required=false`、quarantine 为零；rollout 只有一条 assistant、零工具、零未知
+item，workspace 未变化，SQLite integrity/foreign key 与通用敏感模式扫描均通过。
+
+该轮 harness 顶层仍为 `ok=false`，唯一失败项是报告生成瞬间
+`openProcessCount=null`：独立进程组收口已经通过，且事后用相同 `lsof -Fn +D` 参数得到
+exit 1、stdout/stderr 均为空，按检查器语义为零句柄。没有为修正报告而重发 turn；因此应
+分别记录为“功能 canary GO、瞬时 lsof 回执 FIX_GO_ONLY”。临时 `auth.json` 随即 unlink，
+其余 23 个普通文件对同一 API key 的内存内精确扫描为零命中，三个 Codex arg0 executable
+symlink 未跟随；脱敏复核后整个可丢弃 r4 state 已清理。该回执只证明 daemon 侧一次
+dispatch、一个 provider operation 和本轮实际零工具，不证明 endpoint 内部 HTTP 请求精确
+一次，也不证明请求中没有工具 schema，更不替代 `Delivered → App 回显`。
 
 后续任何新的真实调用都必须先停止旧 daemon，换全新目录和真正专用的 `CODEX_HOME`，再以
 API key 登录并重新取得明确授权。

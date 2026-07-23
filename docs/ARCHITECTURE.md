@@ -183,7 +183,9 @@ tail；任一字段、未映射 turn 或固定配置漂移都失败关闭。
 `model_provider=livis-custom-responses`、HTTPS `base_url`、`wire_api=responses`、
 `requires_openai_auth=true`、零 request/SSE retry 和禁用 WebSocket。两者都要求专用
 API-key 账号。custom endpoint 是凭据与会话数据出口，不因 agent 工具网络关闭而变成本地
-执行；固定 Codex `0.145.0` 的 strict-config 与真实 Responses canary 仍是独立验收层。
+执行；固定 Codex `0.145.0` 的 strict-config 与真实 Responses canary 是独立验收层。精确
+提交 `56a1d77` 已对当前 custom endpoint/model 取得成功 single-turn 回执，但 endpoint、
+模型、平台或 CLI 变化后必须重新验收，且该回执不替代 LiViS 投递闭环。
 
 JobStore 先原子 claim job 并保留 backend attempt，随后才允许发送 `turn/start`。
 只有 transport 明确证明请求未写入时才可撤销 attempt；请求可能已写入、响应无法绑定

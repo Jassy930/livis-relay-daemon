@@ -113,8 +113,9 @@ supports_websockets = false
 `account/read.account.type=apiKey`；两项必须同时通过。上述 custom provider 字段已有官方
 [custom model provider](https://learn.chatgpt.com/docs/config-file/config-advanced#custom-model-providers)
 与 [config reference](https://learn.chatgpt.com/docs/config-file/config-reference#configtoml)
-依据，但在固定 Codex `0.145.0` 上的无秘密 `--strict-config` 探针和真实 custom canary 仍是
-上线前门禁，未取得回执前不得宣称 custom 路径已验证。
+依据。精确提交 `56a1d77` 已在固定 Codex `0.145.0` 上取得无秘密 `--strict-config` 和
+隔离 API-key 的真实 custom single-turn 回执；该结论绑定当前 endpoint/model/platform，
+任何一项变化都必须重跑，且不能据此宣称完整生产上线。
 
 `codex.command` 必须是绝对路径。daemon 启动前会解析其 canonical executable，并拒绝
 位于 state directory 内的命令；最终文件必须由当前 daemon 用户或 root 持有、不可被
@@ -519,18 +520,18 @@ macOS 的 `:minimal` 会为系统运行时开放一组平台路径，并包含 `
 也必须按目标版本重新核对平台基线，不能把 macOS 回执直接复用。
 
 因此当前实现与真实回执已经覆盖“空账号协议接线、读取隔离、hardlink/command/TCP
-组合门禁、零 turn 恢复与高风险 feature 冻结”，但整体仍只能作为受控开发功能，不能
-宣称生产上线。继续集成至少还要：
+组合门禁、零 turn 恢复、高风险 feature 冻结，以及一次隔离 API-key/custom provider
+成功 turn”，但整体仍只能作为受控开发功能，不能宣称生产上线。继续集成至少还要：
 
 - 用本地 fake Responses endpoint 截获工具定义，确认只有已审核的 core/workspace 工具；
 - 在 Linux、未来 Codex 版本和 filesystem profile 变更后重跑牺牲文件 hardlink、原始
   TCP errno 与 command identity canary；当前系统 `nc -O` 回执只覆盖 macOS/Codex 0.145.0；
 - 在真实 Codex 进程上分别验证 idle app-server kill 按固定预算恢复，以及 active turn kill
   和 daemon restart 进入预期 quarantine、release 前不派发；
-- 为专用账号完成一个受控、成功的真实模型 turn，验证已实现的总体 deadline、输出与工具事件归属；
-- 在固定 Codex `0.145.0` 上完成 custom provider 的无秘密 strict-config 探针，并用全新
-  state/CODEX_HOME 做一次获授权 Responses canary，确认 endpoint、模型、零内部 retry 与
-  脱敏失败/成功回执；
+- 用 endpoint 侧脱敏计数独立确认 Responses HTTP 请求数与重试行为；当前固定 retry=0、
+  单一 provider operation 和单次 dispatch 不能证明 provider 内部只收到一个 HTTP 请求；
+- 在请求层移除或 allowlist 工具 schema；当前只证明该成功 turn 实际产生零工具/审批事件，
+  不能把提示词、workspace 不变和沙箱约束表述为硬 `tool_choice=none`；
 - 唯一设备的纯文本 job 只在 terminal 后产生一个 final，并完成
   `Succeeded → Delivered → App 回显`。
 
@@ -548,7 +549,7 @@ bun run smoke:codex:app-server -- \
   --verify-read-isolation
 ```
 
-`bun run check` 通过 379 个 Bun 测试和 22 个 Hermes pytest。本轮真实 Codex 0.145.0
+`bun run check` 通过 389 个 Bun 测试和 22 个 Hermes pytest。本轮真实 Codex 0.145.0
 零模型 turn smoke 得到 `sentModelTurn=false`、`zeroTurnMaterialized=true` 和
 `zeroTurnResumeVerified=true`；最终 fresh 非临时 canary 的全部读取隔离、hardlink、command
 identity 与网络 required fields 均为 true，其中系统 `nc -O` 对已监听 loopback 返回精确
@@ -604,6 +605,28 @@ turn，session quarantine 仍会阻止自动重试，不能据此视为 backend 
 该轮证据目录 `.livis-relay-real-canary-20260723-65f00c1-r3` 同样不得复用、release、改库或
 清理。后续任何真实 canary 都必须使用全新 `stateDir` 与独立 `CODEX_HOME`；不得复用日常
 凭据、历史证据目录或旧 `auth.json`。
+
+随后在精确提交 `56a1d77` 上创建全新 r4 state，用标准输入把默认本机凭据中的 API key
+登录到隔离 `CODEX_HOME`，没有复制默认 `auth.json`，也没有加载默认 config 中的自由 bearer
+token。固定 custom provider/model 的生产 backend 只 dispatch 一个固定短答 job，并取得
+如下脱敏结果：
+
+- `accountType=apiKey`、`modelProvider=livis-custom-responses`，请求与实际模型精确一致；
+- terminal fixed reply 匹配，job `Succeeded`、outbox `Pending`、ledger
+  `reserved → accepted → succeeded`、checkpoint `completed/1`；
+- active 四字段清空、`recovery_required=false`、quarantine 为零；
+- rollout 只有一条 assistant、零工具、零未知 item、一个 `task_started/task_complete`，
+  workspace 前后不变；
+- SQLite schema v7、integrity、foreign key 和通用敏感模式扫描通过，临时 API-key 文件删除后，
+  其余普通文件对该 key 的精确扫描为零命中；
+- 默认生产 spawn 的独立进程组已确认关闭。报告瞬间 `lsof` 无法裁决，令 harness 顶层
+  `ok=false`；事后相同参数确认零句柄，没有重发 turn，故业务功能结论为 GO、瞬时 lsof
+  回执为 `FIX_GO_ONLY`。
+
+脱敏复核后整个可丢弃 r4 state 已清理；r2/r3 只读证据仍原样保留。该成功回执没有 endpoint
+侧请求计数，故只证明一次 daemon dispatch 和单一 provider operation，不证明内部 HTTP
+请求精确一次；它也只证明本轮实际零工具，不证明请求层未携带工具 schema，更没有经过
+LiViS Relay 的 `Delivered → App 回显`。
 
 前述零模型 smoke 回执只证明当前 macOS/Codex 0.145.0 组合上的无模型协议、持久化和安全边界。smoke 使用未登录的
 可丢弃专用 `CODEX_HOME`，所以 `backendStartReady=false` 是预期结果；它没有验证专用真实
