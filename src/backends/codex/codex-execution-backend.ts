@@ -87,6 +87,7 @@ export interface CodexExecutionBackendOptions {
   /** 唯一获授权的远端设备节点；参与 sessionHash，禁止换设备复用旧 thread。 */
   remoteNodeId: string;
   command: string;
+  toolchainReadRoots?: readonly string[];
   model: string | null;
   provider: CodexProviderConfig;
   maxOutputChars: number;
@@ -1132,6 +1133,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
         sessionKey: this.options.sessionKey,
         remoteNodeId: this.options.remoteNodeId,
         provider: this.options.provider,
+        toolchainReadRoots: this.options.toolchainReadRoots,
       });
       await assertCodexRuntimeLayout(layout);
       const environment = await buildCodexEnvironment(layout);

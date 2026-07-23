@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import { lstat, open, realpath, stat } from "node:fs/promises";
-import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   durableAtomicWritePrivate,
   durableMkdirPrivate,
@@ -28,10 +28,15 @@ export function expectedCodexModelProvider(provider: CodexProviderConfig): strin
 export function codexRemoteConfig(
   workspace: string,
   provider: CodexProviderConfig,
+  toolchainReadRoots: readonly string[] = [],
 ): string {
   const canonicalWorkspace = resolve(workspace);
   const agentHome = join(canonicalWorkspace, ".agent-home");
   const agentTmpDir = join(canonicalWorkspace, ".agent-tmp");
+  const toolchainPermissions = [...toolchainReadRoots]
+    .sort()
+    .map((path) => `${JSON.stringify(path)} = "read"`)
+    .join("\n");
   const providerSelection = provider.type === "openai"
     ? ""
     : `model_provider = "${CODEX_CUSTOM_RESPONSES_PROVIDER_ID}"
@@ -76,6 +81,7 @@ description = "LiViS 远程会话：仅访问 daemon 托管 workspace"
 ":root" = "deny"
 ":minimal" = "read"
 ":workspace_roots" = "write"
+${toolchainPermissions}
 
 [permissions.${CODEX_REMOTE_PERMISSION_PROFILE}.network]
 enabled = false
@@ -104,6 +110,8 @@ export interface CodexRuntimeLayout {
   agentTmpDir: string;
   configPath: string;
   provider: CodexProviderConfig;
+  toolchainReadRoots: readonly string[];
+  toolchainIdentities: Readonly<Record<string, DirectoryIdentity>>;
   expectedModelProvider: string;
   identities: Readonly<Record<string, DirectoryIdentity>>;
 }
@@ -188,6 +196,7 @@ export async function ensureCodexRuntimeLayout(options: {
   sessionKey: string;
   remoteNodeId: string;
   provider: CodexProviderConfig;
+  toolchainReadRoots?: readonly string[];
 }): Promise<CodexRuntimeLayout> {
   const canonicalState = await canonicalPrivateStateDir(options.stateDir);
   const stateDir = canonicalState.path;
@@ -214,7 +223,30 @@ export async function ensureCodexRuntimeLayout(options: {
       baseUrl: options.provider.baseUrl,
       acknowledgeApiKeyTransmission: true,
     };
-  const expectedConfig = codexRemoteConfig(workspace, provider);
+  const toolchainReadRoots: string[] = [];
+  const toolchainIdentities: Record<string, DirectoryIdentity> = {};
+  for (const requestedRoot of options.toolchainReadRoots ?? []) {
+    if (!isAbsolute(requestedRoot)) {
+      throw new Error(`Codex 工具链只读根必须是绝对路径：${requestedRoot}`);
+    }
+    const requested = resolve(requestedRoot);
+    const requestedInfo = await lstat(requested);
+    if (requestedInfo.isSymbolicLink() || !requestedInfo.isDirectory()) {
+      throw new Error(`Codex 工具链只读根必须是普通目录且不能是 symlink：${requested}`);
+    }
+    const canonical = await realpath(requested);
+    if (
+      canonical === dirname(canonical) ||
+      isWithin(stateDir, canonical) ||
+      isWithin(canonical, stateDir)
+    ) {
+      throw new Error(`Codex 工具链只读根不能是根目录、stateDir 或其祖先/后代：${canonical}`);
+    }
+    if (!toolchainReadRoots.includes(canonical)) toolchainReadRoots.push(canonical);
+    toolchainIdentities[canonical] = { dev: requestedInfo.dev, ino: requestedInfo.ino };
+  }
+  toolchainReadRoots.sort();
+  const expectedConfig = codexRemoteConfig(workspace, provider, toolchainReadRoots);
   for (const path of [
     backendRoot,
     codexHome,
@@ -271,6 +303,8 @@ export async function ensureCodexRuntimeLayout(options: {
     agentTmpDir,
     configPath,
     provider,
+    toolchainReadRoots,
+    toolchainIdentities,
     expectedModelProvider: expectedCodexModelProvider(provider),
     identities,
   };
@@ -280,9 +314,21 @@ export async function assertCodexRuntimeLayout(layout: CodexRuntimeLayout): Prom
   for (const [path, identity] of Object.entries(layout.identities)) {
     await requirePrivateDirectory(path, `Codex runtime 目录 ${path}`, identity);
   }
+  for (const [path, identity] of Object.entries(layout.toolchainIdentities)) {
+    const info = await lstat(path);
+    if (
+      info.isSymbolicLink() ||
+      !info.isDirectory() ||
+      info.dev !== identity.dev ||
+      info.ino !== identity.ino ||
+      await realpath(path) !== path
+    ) {
+      throw new Error(`Codex 工具链只读根身份已漂移：${path}`);
+    }
+  }
   if (
     await readPrivateFileText(layout.configPath, "Codex 安全 config") !==
-      codexRemoteConfig(layout.workspace, layout.provider)
+      codexRemoteConfig(layout.workspace, layout.provider, layout.toolchainReadRoots)
   ) {
     throw new Error(`Codex 安全 config 已漂移，拒绝继续执行：${layout.configPath}`);
   }
@@ -431,7 +477,9 @@ export function codexSecurityBindingSha256(
   layout: CodexRuntimeLayout,
   command: PinnedCodexCommand | null,
 ): string {
-  const configSha256 = sha256(codexRemoteConfig(layout.workspace, layout.provider));
+  const configSha256 = sha256(
+    codexRemoteConfig(layout.workspace, layout.provider, layout.toolchainReadRoots),
+  );
   if (command === null) return configSha256;
   return sha256(JSON.stringify([
     "livis-codex-security-binding-v3",
@@ -452,7 +500,7 @@ export async function buildCodexEnvironment(
   source: NodeJS.ProcessEnv = process.env,
 ): Promise<Record<string, string>> {
   const environment: Record<string, string> = {};
-  const safePathEntries: string[] = [];
+  const safePathEntries: string[] = [...layout.toolchainReadRoots];
   for (const entry of (source.PATH ?? "").split(delimiter)) {
     if (entry.length === 0 || !isAbsolute(entry)) continue;
     const resolved = resolve(entry);

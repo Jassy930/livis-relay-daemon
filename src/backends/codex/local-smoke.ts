@@ -43,6 +43,7 @@ export interface CodexAppServerLocalSmokeOptions {
   command: string;
   model: string | null;
   provider: CodexProviderConfig;
+  toolchainReadRoots?: readonly string[];
   stateDir?: string;
   createStateDir?: string;
   verifyReadIsolation?: boolean;
@@ -835,6 +836,7 @@ export async function runCodexAppServerLocalSmoke(
     sessionKey: "livis:local-smoke",
     remoteNodeId: "local-smoke-node",
     provider: options.provider,
+    toolchainReadRoots: options.toolchainReadRoots,
   });
   await assertCodexRuntimeLayout(layout);
   const commandPin = await pinCodexCommand(layout, options.command);

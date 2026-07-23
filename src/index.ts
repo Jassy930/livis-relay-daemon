@@ -519,6 +519,7 @@ async function commandDoctor(args: string[]): Promise<void> {
         sessionKey: `livis:${context.identity.agentId}`,
         remoteNodeId: context.config.security.allowedNodeIds[0]!,
         provider: context.config.codex.provider,
+        toolchainReadRoots: context.config.codex.toolchainReadRoots,
       });
       await assertCodexRuntimeLayout(layout);
       const command = await pinCodexCommand(layout, context.config.codex.command);
@@ -701,12 +702,13 @@ async function commandCodexSmokeAppServer(args: string[]): Promise<void> {
   }
   const configPath = optionValue(args, "--config");
   const codexConfig = configPath === undefined
-    ? { model: null, provider: { type: "openai" as const } }
+    ? { model: null, provider: { type: "openai" as const }, toolchainReadRoots: [] }
     : (await loadRelayConfig(configPath)).config.codex;
   const report = await runCodexAppServerLocalSmoke({
     command,
     model: codexConfig.model,
     provider: codexConfig.provider,
+    toolchainReadRoots: codexConfig.toolchainReadRoots,
     stateDir: optionValue(args, "--state-dir"),
     createStateDir: optionValue(args, "--create-state-dir"),
     verifyReadIsolation: args.includes("--verify-read-isolation"),

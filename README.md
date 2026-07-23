@@ -41,6 +41,7 @@ flowchart LR
 - Codex model provider 与 API key 都属于 state directory 的不可变安全边界。同一 `stateDir` 不允许从 OpenAI 切到 custom、在 custom 端点之间切换或轮换 key；这些变化必须使用全新 `stateDir` 和全新专用 `CODEX_HOME`，`session release` 不是 provider/key 切换工具。
 - 切换 backend 前必须先用原 backend 排空其 `Received/Acked/Dispatching/Running/Cancelling` 积压；`serve` 会在启动 backend 或 Relay 前拒绝异 backend 非终态 job，`doctor` 的 `execution_backend_backlog` 与 `status.backendBacklog/recentJobs[].latestAttempt` 提供本地观测。终态历史不会阻止切换，未完成的 outbox 投递仍独立恢复。
 - Codex 只在完整 turn deadline 内的 terminal `turn/completed` 后返回一个 agent final；超时先请求 interrupt，再按固定 grace 失败关闭。工具网络关闭、workspace 是唯一可写根，审批请求默认拒绝。
+- Codex 完整编码态可显式配置经审核的 `toolchainReadRoots`；这些目录只读加入 permission profile 与 PATH，仍不增加 writable root，且不得指向 `/`、state directory、用户 HOME 或含凭据/业务数据的宽泛目录。
 - Codex app-server 使用 workspace 外的宿主 HOME/TMPDIR，agent 使用 workspace 内独立 HOME/TMPDIR；关闭时按独立 POSIX 进程组执行 `SIGTERM → SIGKILL → 收口确认`。
 - Codex app-server 只在无内存/SQLite active attempt、无 recovery/quarantine 且持久 Store anchor 未漂移的 idle 状态自动恢复；daemon 生命周期累计最多按 `250/1000/5000 ms` 尝试三次，只恢复并回读同一 thread。活动 turn 期间退出仍失败关闭并要求人工处置，绝不自动重放。
 - LiViS profile 按 SHA-256 固定；未知 wire protocol、版本或 artifact 漂移默认拒绝。

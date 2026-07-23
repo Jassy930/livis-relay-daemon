@@ -37,6 +37,7 @@
   },
   "codex": {
     "command": "codex",
+    "toolchainReadRoots": [],
     "model": null,
     "provider": {
       "type": "openai"

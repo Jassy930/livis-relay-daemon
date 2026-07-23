@@ -178,6 +178,7 @@ export class RelayDaemon {
         sessionKey,
         remoteNodeId: dependencies.config.security.allowedNodeIds[0]!,
         command: dependencies.config.codex.command,
+        toolchainReadRoots: dependencies.config.codex.toolchainReadRoots,
         model: dependencies.config.codex.model,
         provider: dependencies.config.codex.provider,
         maxOutputChars: dependencies.config.security.maxOutputChars,

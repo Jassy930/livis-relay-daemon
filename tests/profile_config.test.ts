@@ -149,12 +149,14 @@ describe("配置与协议 profile", () => {
     expect(parsedLegacy.execution.legacyV4JobBackend).toBeNull();
     expect(parsedLegacy.codex.acknowledgeRemoteExecution).toBeFalse();
     expect(parsedLegacy.codex.provider).toEqual({ type: "openai" });
+    expect(parsedLegacy.codex.toolchainReadRoots).toEqual([]);
 
     const codex = parseRelayConfig(JSON.stringify({
       ...config,
       execution: { backend: "codex" },
       codex: {
         command: "/opt/homebrew/bin/codex",
+        toolchainReadRoots: ["/opt/homebrew/bin"],
         model: "gpt-5.6-sol",
         provider: {
           type: "custom",
@@ -171,6 +173,7 @@ describe("配置与协议 profile", () => {
     expect(codex.execution.backend).toBe("codex");
     expect(codex.codex).toEqual({
       command: "/opt/homebrew/bin/codex",
+      toolchainReadRoots: ["/opt/homebrew/bin"],
       model: "gpt-5.6-sol",
       provider: {
         type: "custom",
@@ -226,6 +229,17 @@ describe("配置与协议 profile", () => {
       execution: { backend: "codex" },
       codex: { ...config.codex, command: "codex" },
     }), "/tmp/config.json")).toThrow("必须是绝对路径");
+    for (const toolchainReadRoots of [["relative/bin"], ["/"]]) {
+      expect(() => parseRelayConfig(JSON.stringify({
+        ...config,
+        execution: { backend: "codex" },
+        codex: {
+          ...config.codex,
+          command: "/opt/homebrew/bin/codex",
+          toolchainReadRoots,
+        },
+      }), "/tmp/config.json")).toThrow("toolchainReadRoots");
+    }
     for (const provider of [
       { type: "custom", baseUrl: "http://provider.example.invalid", acknowledgeApiKeyTransmission: true },
       { type: "custom", baseUrl: "https://user:secret@provider.example.invalid", acknowledgeApiKeyTransmission: true },

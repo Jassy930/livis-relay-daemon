@@ -60,6 +60,11 @@ export interface RelayConfig {
   };
   codex: {
     command: string;
+    /**
+     * 显式暴露给远程工具沙箱的只读工具链目录。它们会加入 PATH，但绝不会
+     * 成为 writable root；空数组保持现有最小系统工具边界。
+     */
+    toolchainReadRoots: string[];
     model: string | null;
     provider: CodexProviderConfig;
     requestTimeoutMs: number;
@@ -208,6 +213,11 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
   const codexCommand = codex?.command === undefined
     ? "codex"
     : asNonEmptyString(codex.command, "config.codex.command");
+  const codexToolchainReadRootsRaw = stringArray(
+    codex?.toolchainReadRoots ?? [],
+    "config.codex.toolchainReadRoots",
+  );
+  const codexToolchainReadRoots = codexToolchainReadRootsRaw.map((path) => expandHome(path));
   const codexModel = optionalNonEmptyString(codex?.model, "config.codex.model");
   const codexProvider = parseCodexProvider(codex);
   if (executionBackend === "codex" && (allowAllNodes || allowedNodeIds.length !== 1)) {
@@ -217,6 +227,16 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
   }
   if (executionBackend === "codex" && !isAbsolute(codexCommand)) {
     throw new Error("Codex backend 的 config.codex.command 必须是绝对路径");
+  }
+  if (
+    executionBackend === "codex" &&
+    codexToolchainReadRoots.some((path, index) =>
+      (!isAbsolute(codexToolchainReadRootsRaw[index]!) &&
+        !codexToolchainReadRootsRaw[index]!.startsWith("~/")) ||
+      resolve(path) === dirname(resolve(path))
+    )
+  ) {
+    throw new Error("Codex backend 的 config.codex.toolchainReadRoots 必须是绝对非根目录路径");
   }
   if (executionBackend === "codex" && codexProvider.type === "custom" && codexModel === null) {
     throw new Error("Codex custom provider 必须显式设置 config.codex.model");
@@ -295,6 +315,7 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
     },
     codex: {
       command: codexCommand,
+      toolchainReadRoots: codexToolchainReadRoots,
       model: codexModel,
       provider: codexProvider,
       requestTimeoutMs: codex?.requestTimeoutMs === undefined
@@ -387,6 +408,7 @@ export async function initializeConfig(options: {
     },
     codex: {
       command: "codex",
+      toolchainReadRoots: [],
       model: null,
       provider: { type: "openai" },
       requestTimeoutMs: DEFAULT_CODEX_REQUEST_TIMEOUT_MS,

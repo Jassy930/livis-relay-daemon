@@ -1090,6 +1090,7 @@ describe("CodexExecutionBackend", () => {
 
   test("smoke 入口 fake 轨迹固定且绝不发送模型 turn", async () => {
     const commandDirectory = await temporaryDirectory("livis-codex-smoke-command-");
+    const toolchainDirectory = await temporaryDirectory("livis-codex-smoke-toolchain-");
     const command = `${commandDirectory.path}/codex`;
     await writeFile(command, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
     const freshFake = new FakeCodexAppServer();
@@ -1097,7 +1098,9 @@ describe("CodexExecutionBackend", () => {
     freshFake.account = null;
     resumedFake.account = null;
     let spawnCount = 0;
+    const observedPaths: string[] = [];
     const smokeSpawn: CodexAppServerSpawn = (argv, options) => {
+      observedPaths.push(options.env?.PATH ?? "");
       const fake = spawnCount++ === 0 ? freshFake : resumedFake;
       if (fake === resumedFake) {
         resumedFake.threadId = freshFake.threadId;
@@ -1111,6 +1114,7 @@ describe("CodexExecutionBackend", () => {
         command,
         model: null,
         provider: OPENAI_PROVIDER,
+        toolchainReadRoots: [toolchainDirectory.path],
         requestTimeoutMs: 1_000,
         shutdownTimeoutMs: 1_000,
       }, {
@@ -1152,12 +1156,17 @@ describe("CodexExecutionBackend", () => {
         "thread/resume",
       ]);
       expect(messages.some((message) => message.method === "turn/start")).toBeFalse();
+      const canonicalToolchain = await realpath(toolchainDirectory.path);
+      expect(observedPaths).toHaveLength(2);
+      expect(observedPaths.every((path) => path.split(":")[0] === canonicalToolchain)).toBeTrue();
+      expect(await Bun.file(join(report.stateDir, "backends", "codex", "home", "config.toml")).text())
+        .toContain(`${JSON.stringify(canonicalToolchain)} = "read"`);
     } finally {
       await Promise.all([freshFake.stop(0), resumedFake.stop(0)]);
       if (smokeStateDir !== null) {
         await rm(smokeStateDir, { recursive: true, force: true });
       }
-      await commandDirectory.cleanup();
+      await Promise.all([commandDirectory.cleanup(), toolchainDirectory.cleanup()]);
     }
   });
 

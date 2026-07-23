@@ -193,6 +193,59 @@ describe("Codex daemon 托管目录", () => {
     }
   });
 
+  test("显式工具链目录只读加入 permission profile 与 PATH，且拒绝 stateDir 祖先", async () => {
+    const directory = await temporaryDirectory("livis-codex-toolchain-state-");
+    const toolchain = await temporaryDirectory("livis-codex-toolchain-bin-");
+    try {
+      await chmod(directory.path, 0o700);
+      const layout = await ensureCodexRuntimeLayout({
+        stateDir: directory.path,
+        scopeKey: "scope",
+        sessionKey: "session",
+        remoteNodeId: "node-a",
+        provider: OPENAI_PROVIDER,
+        toolchainReadRoots: [toolchain.path, toolchain.path],
+      });
+      const canonicalToolchain = await realpath(toolchain.path);
+      expect(layout.toolchainReadRoots).toEqual([canonicalToolchain]);
+      const toolchainInfo = await lstat(canonicalToolchain);
+      expect(layout.toolchainIdentities[canonicalToolchain]).toEqual({
+        dev: toolchainInfo.dev,
+        ino: toolchainInfo.ino,
+      });
+      expect(await Bun.file(layout.configPath).text()).toContain(
+        `${JSON.stringify(canonicalToolchain)} = "read"`,
+      );
+      const env = await buildCodexEnvironment(layout, { PATH: "/usr/bin" });
+      expect(env.PATH?.split(":")[0]).toBe(canonicalToolchain);
+      await assertCodexRuntimeLayout(layout);
+
+      const movedToolchain = `${toolchain.path}-moved`;
+      await rename(toolchain.path, movedToolchain);
+      await mkdir(toolchain.path, { mode: 0o700 });
+      await expect(assertCodexRuntimeLayout(layout)).rejects.toThrow("工具链只读根身份已漂移");
+      await rm(toolchain.path, { recursive: true });
+      await rename(movedToolchain, toolchain.path);
+
+      const fresh = await temporaryDirectory("livis-codex-toolchain-ancestor-state-");
+      try {
+        await chmod(fresh.path, 0o700);
+        await expect(ensureCodexRuntimeLayout({
+          stateDir: fresh.path,
+          scopeKey: "scope",
+          sessionKey: "session",
+          remoteNodeId: "node-a",
+          provider: OPENAI_PROVIDER,
+          toolchainReadRoots: [fresh.path],
+        })).rejects.toThrow("stateDir");
+      } finally {
+        await fresh.cleanup();
+      }
+    } finally {
+      await Promise.all([directory.cleanup(), toolchain.cleanup()]);
+    }
+  });
+
   test("Codex command 固定为 stateDir 外的 canonical 可执行文件", async () => {
     const state = await temporaryDirectory("livis-codex-command-state-");
     const binaries = await temporaryDirectory("livis-codex-command-bin-");

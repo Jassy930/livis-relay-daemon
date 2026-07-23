@@ -297,6 +297,7 @@ provider 依赖 OpenAI 认证。生产门禁要求 `account.type` 精确为 `api
   },
   "codex": {
     "command": "/绝对路径/codex",
+    "toolchainReadRoots": [],
     "model": null,
     "provider": {
       "type": "openai"
@@ -310,6 +311,12 @@ provider 依赖 OpenAI 认证。生产门禁要求 `account.type` 精确为 `api
 }
 ```
 
+纯文本模式可保持 `toolchainReadRoots=[]`。完整编码态必须先在可信终端确认工具目录只包含
+计划暴露的运行时，再逐项填写绝对路径；例如 Bun 由 Homebrew 管理且 `bun --version`
+命中审核版本时，可使用 `"toolchainReadRoots":["/opt/homebrew/bin"]`。不要填写用户 HOME、
+state directory、整个项目父目录或其他含凭据/业务数据的目录。配置后必须按
+[Codex 完整 LiViS 人在环 canary](CODEX-E2E-CANARY.md)第 5 节验证真实工具事件、文件和测试。
+
 上述是默认 OpenAI provider。要连接显式 custom Responses endpoint，必须使用已审核模型、
 HTTPS URL 和复合数据出口确认：
 
@@ -320,6 +327,7 @@ HTTPS URL 和复合数据出口确认：
   },
   "codex": {
     "command": "/绝对路径/codex",
+    "toolchainReadRoots": ["/绝对/只读/工具链/bin"],
     "model": "已审核的模型 ID",
     "provider": {
       "type": "custom",

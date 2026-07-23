@@ -115,6 +115,10 @@ Codex session 中完成本节；未取得全部回执时继续标记为“纯文
 根。Codex 工具网络仍为关闭，审批策略仍为 `never`；不得为通过本 canary 临时加入额外
 writable root、启用网络或复用宿主项目目录。
 
+若工具链不在 `:minimal` 可发现范围，允许使用配置中预先审核并持久绑定的
+`codex.toolchainReadRoots` 只读目录；它必须在 daemon 启动前已配置并通过 doctor，不能在
+canary 期间临时改写。该只读目录不等于额外 writable root，仍不得包含凭据或业务数据。
+
 目标机器必须已经安装可由 Codex sandbox 执行的 Bun，但 canary 不得安装或更新工具链、
 下载依赖或访问 package registry。`command -v bun`、`bun --version` 任一失败都按
 `TOOLCHAIN_BLOCKED` 收口，不能退化成只写文件不运行测试。
