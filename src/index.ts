@@ -518,6 +518,7 @@ async function commandDoctor(args: string[]): Promise<void> {
         scopeKey: IdentityStore.scopeKey(context.identity),
         sessionKey: `livis:${context.identity.agentId}`,
         remoteNodeId: context.config.security.allowedNodeIds[0]!,
+        provider: context.config.codex.provider,
       });
       await assertCodexRuntimeLayout(layout);
       const command = await pinCodexCommand(layout, context.config.codex.command);
@@ -695,11 +696,17 @@ async function commandCodexSmokeAppServer(args: string[]): Promise<void> {
   const command = optionValue(args, "--command");
   if (!command) {
     throw new Error(
-      "用法：codex smoke-app-server --command /绝对路径/codex [--state-dir 已有可丢弃目录 | --create-state-dir 新目录] [--verify-read-isolation]",
+      "用法：codex smoke-app-server --command /绝对路径/codex [--config PATH] [--state-dir 已有可丢弃目录 | --create-state-dir 新目录] [--verify-read-isolation]",
     );
   }
+  const configPath = optionValue(args, "--config");
+  const codexConfig = configPath === undefined
+    ? { model: null, provider: { type: "openai" as const } }
+    : (await loadRelayConfig(configPath)).config.codex;
   const report = await runCodexAppServerLocalSmoke({
     command,
+    model: codexConfig.model,
+    provider: codexConfig.provider,
     stateDir: optionValue(args, "--state-dir"),
     createStateDir: optionValue(args, "--create-state-dir"),
     verifyReadIsolation: args.includes("--verify-read-isolation"),
@@ -724,7 +731,7 @@ function printHelp(): void {
   process.stdout.write("  profile rollback-migration --receipt PATH --apply --acknowledge-daemon-and-hermes-stopped [--config PATH]\n");
   process.stdout.write("  connector-token [--config PATH]\n");
   process.stdout.write("  session release <sessionKey> [--config PATH]\n");
-  process.stdout.write("  codex smoke-app-server --command PATH [--state-dir PATH | --create-state-dir PATH] [--verify-read-isolation]\n");
+  process.stdout.write("  codex smoke-app-server --command PATH [--config PATH] [--state-dir PATH | --create-state-dir PATH] [--verify-read-isolation]\n");
 }
 
 async function main(): Promise<void> {

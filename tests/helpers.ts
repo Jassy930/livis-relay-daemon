@@ -63,6 +63,7 @@ export function testConfig(stateDir: string): RelayConfig {
     codex: {
       command: "codex",
       model: null,
+      provider: { type: "openai" as const },
       requestTimeoutMs: 30_000,
       turnTimeoutMs: 900_000,
       interruptGraceMs: 5_000,

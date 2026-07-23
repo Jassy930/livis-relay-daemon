@@ -32,6 +32,10 @@
 - 官方 OAuth client identity 只以 SHA-256 指纹识别，所有文本文件均无例外，仓库不保存或打印原始值；
 - 私钥头在任意文本文件中都会被拒绝。
 - `protocol-probes/` 默认全部拒绝；只有 Git index 中 `src/protocol/wire-contract-registry.json` 精确登记、mode 为 `100644`、SHA-256 和内部 contract 均匹配的 canonical 脱敏 S2 artifact 可以发布。任意其他 JSON、私有回执、raw frame、trace、HAR、pcap 或改名文件一律拒绝。
+- Codex custom provider 示例只能使用 `.invalid` 域名。真实 provider URL、API key、
+  `auth.json`、包含 provider 自由文本的 stderr/rollout、真实 Responses 请求/响应和 canary
+  trace 都不得进入发布候选；即使自动门禁尚未识别某个新格式，也必须在 staged diff 与
+  归档中人工拒绝。
 
 `bun run wire-contract:append-only:check` 还会把候选 Git index 与 base commit 比较：既有 registry definition 和 artifact 原始字节不可删除、改名或原地修改；每个候选最多新增一个 revision，且必须成为 current 接受 generator 重建校验。没有新增时不得切换 current。CI checkout 使用完整历史，并从 PR base SHA 或 push before SHA 取基线；基线不可读或不是当前 HEAD 祖先时失败关闭。首次 bootstrap 只有在 base 同时没有 registry 和任何 `protocol-probes/` 文件时才允许，且只能登记一个 current revision。
 

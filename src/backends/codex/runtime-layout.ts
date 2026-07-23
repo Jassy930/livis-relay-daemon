@@ -9,8 +9,14 @@ import {
   readPrivateFileText,
   sha256,
 } from "../../util.ts";
+import type { CodexProviderConfig } from "../../types.ts";
 
 export const CODEX_REMOTE_PERMISSION_PROFILE = "livis-remote";
+export const CODEX_CUSTOM_RESPONSES_PROVIDER_ID = "livis-custom-responses";
+
+export function expectedCodexModelProvider(provider: CodexProviderConfig): string {
+  return provider.type === "openai" ? "openai" : CODEX_CUSTOM_RESPONSES_PROVIDER_ID;
+}
 
 /**
  * 该文件属于 daemon 的安全配置，不是用户 Codex 配置。workspace 是唯一声明为
@@ -19,17 +25,37 @@ export const CODEX_REMOTE_PERMISSION_PROFILE = "livis-remote";
  * 必须预先把 workspace 标成 untrusted。Codex 0.145.0 否则会在 thread/start 时把
  * 该项目追加成 trusted，既会修改 daemon 固定的 config，也会扩大项目配置面。
  */
-export function codexRemoteConfig(workspace: string): string {
+export function codexRemoteConfig(
+  workspace: string,
+  provider: CodexProviderConfig,
+): string {
   const canonicalWorkspace = resolve(workspace);
   const agentHome = join(canonicalWorkspace, ".agent-home");
   const agentTmpDir = join(canonicalWorkspace, ".agent-tmp");
-  return `default_permissions = "${CODEX_REMOTE_PERMISSION_PROFILE}"
+  const providerSelection = provider.type === "openai"
+    ? ""
+    : `model_provider = "${CODEX_CUSTOM_RESPONSES_PROVIDER_ID}"
+`;
+  const providerTable = provider.type === "openai"
+    ? ""
+    : `[model_providers.${CODEX_CUSTOM_RESPONSES_PROVIDER_ID}]
+name = "LiViS custom Responses"
+base_url = ${JSON.stringify(provider.baseUrl)}
+wire_api = "responses"
+requires_openai_auth = true
+request_max_retries = 0
+stream_max_retries = 0
+supports_websockets = false
+
+`;
+  return `forced_login_method = "api"
+${providerSelection}default_permissions = "${CODEX_REMOTE_PERMISSION_PROFILE}"
 approval_policy = "never"
 approvals_reviewer = "user"
 web_search = "disabled"
 cli_auth_credentials_store = "file"
 
-[agents]
+${providerTable}[agents]
 enabled = false
 
 [skills]
@@ -77,6 +103,8 @@ export interface CodexRuntimeLayout {
   agentHome: string;
   agentTmpDir: string;
   configPath: string;
+  provider: CodexProviderConfig;
+  expectedModelProvider: string;
   identities: Readonly<Record<string, DirectoryIdentity>>;
 }
 
@@ -159,6 +187,7 @@ export async function ensureCodexRuntimeLayout(options: {
   scopeKey: string;
   sessionKey: string;
   remoteNodeId: string;
+  provider: CodexProviderConfig;
 }): Promise<CodexRuntimeLayout> {
   const canonicalState = await canonicalPrivateStateDir(options.stateDir);
   const stateDir = canonicalState.path;
@@ -178,7 +207,14 @@ export async function ensureCodexRuntimeLayout(options: {
   const agentHome = join(workspace, ".agent-home");
   const agentTmpDir = join(workspace, ".agent-tmp");
   const configPath = join(codexHome, "config.toml");
-  const expectedConfig = codexRemoteConfig(workspace);
+  const provider: CodexProviderConfig = options.provider.type === "openai"
+    ? { type: "openai" }
+    : {
+      type: "custom",
+      baseUrl: options.provider.baseUrl,
+      acknowledgeApiKeyTransmission: true,
+    };
+  const expectedConfig = codexRemoteConfig(workspace, provider);
   for (const path of [
     backendRoot,
     codexHome,
@@ -234,6 +270,8 @@ export async function ensureCodexRuntimeLayout(options: {
     agentHome,
     agentTmpDir,
     configPath,
+    provider,
+    expectedModelProvider: expectedCodexModelProvider(provider),
     identities,
   };
 }
@@ -244,7 +282,7 @@ export async function assertCodexRuntimeLayout(layout: CodexRuntimeLayout): Prom
   }
   if (
     await readPrivateFileText(layout.configPath, "Codex 安全 config") !==
-      codexRemoteConfig(layout.workspace)
+      codexRemoteConfig(layout.workspace, layout.provider)
   ) {
     throw new Error(`Codex 安全 config 已漂移，拒绝继续执行：${layout.configPath}`);
   }
@@ -393,10 +431,10 @@ export function codexSecurityBindingSha256(
   layout: CodexRuntimeLayout,
   command: PinnedCodexCommand | null,
 ): string {
-  const configSha256 = sha256(codexRemoteConfig(layout.workspace));
+  const configSha256 = sha256(codexRemoteConfig(layout.workspace, layout.provider));
   if (command === null) return configSha256;
   return sha256(JSON.stringify([
-    "livis-codex-security-binding-v2",
+    "livis-codex-security-binding-v3",
     configSha256,
     command.identitySha256,
   ]));

@@ -17,7 +17,7 @@ import {
   validateCodexInitializeResponse,
   validatePersistedCodexThread,
   validatePermissionProfiles,
-  validateThreadResponse,
+  inspectThreadResponse,
   type CodexCommandRunner,
 } from "./codex-execution-backend.ts";
 import {
@@ -34,12 +34,15 @@ import {
   readPrivateFileText,
   sha256,
 } from "../../util.ts";
+import type { CodexProviderConfig } from "../../types.ts";
 
 const SMOKE_STATE_MARKER = "livis-codex-app-server-local-smoke-v1\n";
 const SMOKE_STATE_MARKER_NAME = ".livis-codex-app-server-smoke";
 
 export interface CodexAppServerLocalSmokeOptions {
   command: string;
+  model: string | null;
+  provider: CodexProviderConfig;
   stateDir?: string;
   createStateDir?: string;
   verifyReadIsolation?: boolean;
@@ -76,6 +79,8 @@ export interface CodexAppServerLocalSmokeReport {
   codexCommandContentSha256: string;
   codexCommandIdentitySha256: string;
   cliVersion: string;
+  effectiveModel: string;
+  modelProvider: string;
   account: {
     authenticated: boolean;
     requiresOpenaiAuth: boolean;
@@ -818,6 +823,9 @@ export async function runCodexAppServerLocalSmoke(
   dependencies: CodexAppServerLocalSmokeDependencies = {},
 ): Promise<CodexAppServerLocalSmokeReport> {
   if (!isAbsolute(options.command)) throw new Error("Codex smoke command 必须是绝对路径");
+  if (options.provider.type === "custom" && options.model === null) {
+    throw new Error("Codex custom provider smoke 必须显式固定 model");
+  }
   const requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
   const shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000;
   const stateDir = await prepareSmokeStateDirectory(options);
@@ -826,6 +834,7 @@ export async function runCodexAppServerLocalSmoke(
     scopeKey: "local-smoke",
     sessionKey: "livis:local-smoke",
     remoteNodeId: "local-smoke-node",
+    provider: options.provider,
   });
   await assertCodexRuntimeLayout(layout);
   const commandPin = await pinCodexCommand(layout, options.command);
@@ -854,6 +863,8 @@ export async function runCodexAppServerLocalSmoke(
   let account: ReturnType<typeof inspectCodexAccountResponse> | null = null;
   let readIsolationCanary: CodexAppServerLocalSmokeReport["readIsolationCanary"] = null;
   let threadId: string | null = null;
+  let effectiveModel: string | null = null;
+  let modelProvider: string | null = null;
   try {
     validateCodexInitializeResponse(client.initializeResult, layout, cliVersion);
     account = inspectCodexAccountResponse(
@@ -861,6 +872,9 @@ export async function runCodexAppServerLocalSmoke(
     );
     if (account.accountType !== null && account.accountType !== "apiKey") {
       throw new Error("Codex smoke 只允许未登录或 API key account");
+    }
+    if (account.accountType === "apiKey" && !account.requiresOpenaiAuth) {
+      throw new Error("Codex smoke 的 API key provider 必须声明 requiresOpenaiAuth=true");
     }
     if (options.stateDir === undefined && account.accountType !== null) {
       throw new Error("全新 Codex smoke state 意外继承了账号，拒绝继续创建 thread");
@@ -891,8 +905,15 @@ export async function runCodexAppServerLocalSmoke(
       permissions: CODEX_REMOTE_PERMISSION_PROFILE,
       environments: codexLocalEnvironment(layout.workspace),
       ephemeral: false,
+      ...(options.model === null ? {} : { model: options.model }),
     });
-    threadId = validateThreadResponse(threadResponse, layout, null);
+    const threadInspection = inspectThreadResponse(threadResponse, layout, null);
+    threadId = threadInspection.threadId;
+    effectiveModel = threadInspection.effectiveModel;
+    modelProvider = threadInspection.modelProvider;
+    if (options.model !== null && effectiveModel !== options.model) {
+      throw new Error("Codex smoke 实际 model 与请求 model 不一致");
+    }
     validateFreshSmokeThread(threadResponse, cliVersion);
     await materializeFreshCodexThread(client, layout, threadId, requestTimeoutMs);
     await assertCodexRuntimeLayout(layout);
@@ -935,8 +956,15 @@ export async function runCodexAppServerLocalSmoke(
       approvalPolicy: "never",
       approvalsReviewer: "user",
       permissions: CODEX_REMOTE_PERMISSION_PROFILE,
+      ...(options.model === null ? {} : { model: options.model }),
     });
-    validateThreadResponse(resumed, layout, threadId);
+    const resumedInspection = inspectThreadResponse(resumed, layout, threadId);
+    if (
+      resumedInspection.effectiveModel !== effectiveModel ||
+      resumedInspection.modelProvider !== modelProvider
+    ) {
+      throw new Error("Codex smoke 重启后的 model/provider 发生变化");
+    }
     await validatePersistedCodexThread(resumed, layout, threadId);
     await assertCodexRuntimeLayout(layout);
     await assertPinnedCodexCommand(commandPin);
@@ -946,16 +974,21 @@ export async function runCodexAppServerLocalSmoke(
   } finally {
     await resumeClient.close();
   }
+  if (effectiveModel === null || modelProvider === null) {
+    throw new Error("Codex smoke 未完成 model/provider 回读");
+  }
   return {
     ok: true,
     sentModelTurn: false,
-    backendStartReady: account.accountType === "apiKey",
+    backendStartReady: account.accountType === "apiKey" && account.requiresOpenaiAuth,
     stateDir,
     workspace: layout.workspace,
     codexCommand: command,
     codexCommandContentSha256: commandPin.contentSha256,
     codexCommandIdentitySha256: commandPin.identitySha256,
     cliVersion,
+    effectiveModel,
+    modelProvider,
     account: {
       authenticated: account.accountType !== null,
       requiresOpenaiAuth: account.requiresOpenaiAuth,

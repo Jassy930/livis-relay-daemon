@@ -179,6 +179,7 @@ export class RelayDaemon {
         remoteNodeId: dependencies.config.security.allowedNodeIds[0]!,
         command: dependencies.config.codex.command,
         model: dependencies.config.codex.model,
+        provider: dependencies.config.codex.provider,
         maxOutputChars: dependencies.config.security.maxOutputChars,
         requestTimeoutMs: dependencies.config.codex.requestTimeoutMs,
         turnTimeoutMs: dependencies.config.codex.turnTimeoutMs,

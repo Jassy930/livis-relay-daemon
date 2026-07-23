@@ -23,8 +23,17 @@ import {
   pinCodexCommand,
   resolveCodexCommand,
 } from "../src/backends/codex/runtime-layout.ts";
+import type { CodexProviderConfig } from "../src/types.ts";
 import { sha256 } from "../src/util.ts";
 import { temporaryDirectory } from "./helpers.ts";
+
+const OPENAI_PROVIDER = { type: "openai" } as const satisfies CodexProviderConfig;
+const CUSTOM_PROVIDER = {
+  type: "custom",
+  baseUrl: "https://provider.example.invalid/v1",
+  acknowledgeApiKeyTransmission: true,
+} as const satisfies CodexProviderConfig;
+const CUSTOM_PROVIDER_ID = "livis-custom-responses";
 
 describe("Codex daemon 托管目录", () => {
   test("使用 scope/backend/session 哈希创建固定 0700 workspace 和安全配置", async () => {
@@ -36,6 +45,7 @@ describe("Codex daemon 托管目录", () => {
         scopeKey: "scope-a",
         sessionKey: "livis:agent/../../secret",
         remoteNodeId: "node-a",
+        provider: OPENAI_PROVIDER,
       });
       expect(layout.sessionHash).toMatch(/^[0-9a-f]{64}$/);
       expect(layout.sessionHash).toBe(
@@ -66,11 +76,13 @@ describe("Codex daemon 托管目录", () => {
         expect(await realpath(path)).toBe(path);
         expect(layout.identities[path]).toEqual({ dev: info.dev, ino: info.ino });
       }
-      const expectedConfig = codexRemoteConfig(layout.workspace);
+      expect(layout.expectedModelProvider).toBe("openai");
+      const expectedConfig = codexRemoteConfig(layout.workspace, OPENAI_PROVIDER);
       expect(await Bun.file(layout.configPath).text()).toBe(expectedConfig);
       expect(expectedConfig).toContain(`projects.${JSON.stringify(layout.workspace)}`);
       expect(expectedConfig).toContain('trust_level = "untrusted"');
       expect(expectedConfig).toContain('cli_auth_credentials_store = "file"');
+      expect(expectedConfig).toContain('forced_login_method = "api"');
       expect(expectedConfig).toContain('exclude = ["CODEX_HOME", "OPENAI_*", "LIVIS_*"]');
       expect(expectedConfig).toContain(
         `set = { HOME = ${JSON.stringify(layout.agentHome)}, TMPDIR = ${JSON.stringify(layout.agentTmpDir)} }`,
@@ -91,12 +103,52 @@ describe("Codex daemon 托管目录", () => {
         scopeKey: "scope-a",
         sessionKey: "livis:agent/../../secret",
         remoteNodeId: "node-a",
+        provider: OPENAI_PROVIDER,
       });
       expect(reopened.workspace).toBe(layout.workspace);
       expect(codexSessionHash("scope-b", "livis:agent/../../secret", "node-a"))
         .not.toBe(layout.sessionHash);
       expect(codexSessionHash("scope-a", "livis:agent/../../secret", "node-b"))
         .not.toBe(layout.sessionHash);
+    } finally {
+      await directory.cleanup();
+    }
+  });
+
+  test("custom provider 固定为 Responses、API key auth、零重试且禁用 WebSocket", async () => {
+    const directory = await temporaryDirectory("livis-codex-custom-provider-layout-");
+    try {
+      await chmod(directory.path, 0o700);
+      const layout = await ensureCodexRuntimeLayout({
+        stateDir: directory.path,
+        scopeKey: "scope-custom",
+        sessionKey: "livis:custom-agent",
+        remoteNodeId: "node-custom",
+        provider: CUSTOM_PROVIDER,
+      });
+      const expectedConfig = codexRemoteConfig(layout.workspace, CUSTOM_PROVIDER);
+      expect(layout.expectedModelProvider).toBe(CUSTOM_PROVIDER_ID);
+      expect(await Bun.file(layout.configPath).text()).toBe(expectedConfig);
+      expect(expectedConfig).toContain(`model_provider = "${CUSTOM_PROVIDER_ID}"`);
+      expect(expectedConfig).toContain('forced_login_method = "api"');
+      expect(expectedConfig).toContain(`[model_providers.${CUSTOM_PROVIDER_ID}]`);
+      expect(expectedConfig).toContain(`base_url = ${JSON.stringify(CUSTOM_PROVIDER.baseUrl)}`);
+      expect(expectedConfig).toContain('wire_api = "responses"');
+      expect(expectedConfig).toContain("requires_openai_auth = true");
+      expect(expectedConfig).toContain("request_max_retries = 0");
+      expect(expectedConfig).toContain("stream_max_retries = 0");
+      expect(expectedConfig).toContain("supports_websockets = false");
+      expect(expectedConfig).not.toContain("experimental_bearer_token");
+      expect(expectedConfig).not.toContain("env_key");
+      await assertCodexRuntimeLayout(layout);
+
+      await expect(ensureCodexRuntimeLayout({
+        stateDir: directory.path,
+        scopeKey: "scope-custom",
+        sessionKey: "livis:custom-agent",
+        remoteNodeId: "node-custom",
+        provider: OPENAI_PROVIDER,
+      })).rejects.toThrow("安全 config 已漂移");
     } finally {
       await directory.cleanup();
     }
@@ -112,6 +164,7 @@ describe("Codex daemon 托管目录", () => {
         scopeKey: "scope",
         sessionKey: "session",
         remoteNodeId: "node-a",
+        provider: OPENAI_PROVIDER,
       });
       const safeBin = join(external.path, "safe-bin");
       const outsideLinkIntoState = join(external.path, "outside-link-into-state");
@@ -150,6 +203,7 @@ describe("Codex daemon 托管目录", () => {
         scopeKey: "scope",
         sessionKey: "session",
         remoteNodeId: "node-a",
+        provider: OPENAI_PROVIDER,
       });
       const executable = join(binaries.path, "codex-real");
       const commandLink = join(binaries.path, "codex");
@@ -179,6 +233,7 @@ describe("Codex daemon 托管目录", () => {
         scopeKey: "scope",
         sessionKey: "session",
         remoteNodeId: "node-a",
+        provider: OPENAI_PROVIDER,
       });
       const bytes = "#!/bin/sh\nprintf 'codex-cli 0.145.0\\n'\n";
       const executable = join(binaries.path, "codex-real");
@@ -193,7 +248,7 @@ describe("Codex daemon 托管目录", () => {
       expect(pin.identitySha256).toMatch(/^[0-9a-f]{64}$/);
       expect(codexSecurityBindingSha256(layout, pin)).toMatch(/^[0-9a-f]{64}$/);
       expect(codexSecurityBindingSha256(layout, pin))
-        .not.toBe(sha256(codexRemoteConfig(layout.workspace)));
+        .not.toBe(sha256(codexRemoteConfig(layout.workspace, OPENAI_PROVIDER)));
       await assertPinnedCodexCommand(pin);
 
       const hardlink = join(binaries.path, "codex-hardlink");
@@ -216,6 +271,7 @@ describe("Codex daemon 托管目录", () => {
         scopeKey: "scope",
         sessionKey: "session",
         remoteNodeId: "node-a",
+        provider: OPENAI_PROVIDER,
       });
       const executable = join(binaries.path, "codex-real");
       await writeFile(executable, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
@@ -246,6 +302,7 @@ describe("Codex daemon 托管目录", () => {
         scopeKey: "scope",
         sessionKey: "session",
         remoteNodeId: "node-a",
+        provider: OPENAI_PROVIDER,
       });
       await writeFile(layout.configPath, "default_permissions = \":danger-full-access\"\n", { mode: 0o600 });
       await expect(assertCodexRuntimeLayout(layout)).rejects.toThrow("安全 config 已漂移");
@@ -263,6 +320,7 @@ describe("Codex daemon 托管目录", () => {
         scopeKey: "scope",
         sessionKey: "session",
         remoteNodeId: "node-a",
+        provider: OPENAI_PROVIDER,
       });
       await chmod(layout.hostHome, 0o755);
       await expect(assertCodexRuntimeLayout(layout)).rejects.toThrow("0700");
@@ -287,6 +345,7 @@ describe("Codex daemon 托管目录", () => {
         scopeKey: "scope",
         sessionKey: "session",
         remoteNodeId: "node-a",
+        provider: OPENAI_PROVIDER,
       });
       await rm(layout.hostTmpDir, { recursive: true });
       await symlink(layout.workspace, layout.hostTmpDir);
@@ -295,6 +354,7 @@ describe("Codex daemon 托管目录", () => {
         scopeKey: "scope",
         sessionKey: "session",
         remoteNodeId: "node-a",
+        provider: OPENAI_PROVIDER,
       })).rejects.toThrow("类型或权限不安全");
 
       const stateLink = join(external.path, "state-link");
@@ -304,6 +364,7 @@ describe("Codex daemon 托管目录", () => {
         scopeKey: "scope",
         sessionKey: "session",
         remoteNodeId: "node-a",
+        provider: OPENAI_PROVIDER,
       })).rejects.toThrow("stateDir 必须是 0700 普通目录且不能是 symlink");
     } finally {
       await Promise.all([directory.cleanup(), external.cleanup()]);

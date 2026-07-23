@@ -42,6 +42,12 @@
 
 ### 变更
 
+- Codex model provider 边界固定为默认 OpenAI 或显式 custom Responses endpoint。custom
+  配置只允许无 userinfo/query/fragment 的 HTTPS `baseUrl` 与复合数据出口确认，固定
+  Responses wire、API-key 双门禁、零 request/SSE retry 和禁用 WebSocket；额外 header、
+  query、环境/命令认证与未知字段失败关闭。同一 state directory 禁止切换 provider、
+  endpoint 或 key，`session release` 不作为切换工具；custom 路径仍需固定 Codex 0.145.0
+  strict-config 与真实 Responses canary 才能升级验证结论。
 - 执行后端配置固定为 Hermes/Codex/Claude 三选一；Claude 尚未实现时 `doctor` 与 `serve` 明确失败关闭。JobStore v5 让 job 首次入库绑定目标 backend，含待派发 job 的 v4 数据库必须显式声明原始 backend；v6 继续绑定 Codex 账号身份摘要/强度、请求与实际模型、模型 provider、安全配置 SHA、feature 快照 SHA 和单调 thread-tail checkpoint，旧 v5 session 只有在没有 active/recovery 证据时才允许首次安全补绑。
 - JobStore schema 升级为 v7：SQLite trigger 强制 `jobs.target_backend` 不可变，并新增拒绝 UPDATE/DELETE 的 `execution_attempt_events` 账本，永久保留 job/backend/session/lease/execution、Codex thread/turn 与 runtime/model/account/安全摘要。v6 active attempt 以 `legacy_active_imported` 导入，不猜测更早历史。
 - backend 切换新增失败关闭门禁：`serve` 在启动 execution backend 或 Relay 前拒绝异 backend 非终态积压；`doctor.execution_backend_backlog`、`status.backendBacklog` 与 `recentJobs[].latestAttempt` 提供观测。终态 job 不阻止切换，outbox 仍独立投递。

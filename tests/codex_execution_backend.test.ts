@@ -32,9 +32,17 @@ import { runCodexAppServerLocalSmoke } from "../src/backends/codex/local-smoke.t
 import { Logger, type LogLevel } from "../src/logger.ts";
 import { serializeResult } from "../src/protocol/livis.ts";
 import { JobStore } from "../src/state/store.ts";
-import type { StoredJob } from "../src/types.ts";
+import type { CodexProviderConfig, StoredJob } from "../src/types.ts";
 import { sha256 } from "../src/util.ts";
 import { incomingJob, temporaryDirectory } from "./helpers.ts";
+
+const OPENAI_PROVIDER = { type: "openai" } as const satisfies CodexProviderConfig;
+const CUSTOM_PROVIDER = {
+  type: "custom",
+  baseUrl: "https://provider.example.invalid/v1",
+  acknowledgeApiKeyTransmission: true,
+} as const satisfies CodexProviderConfig;
+const CUSTOM_PROVIDER_ID = "livis-custom-responses";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -144,6 +152,8 @@ class FakeCodexAppServer {
   ) => FakeCodexFeature[] = (features) => features;
   threadReadbackOverride: Record<string, unknown> = {};
   materializationMode: "valid" | "missing" | "wrong-id" = "valid";
+  effectiveModel = "gpt-5.6-sol";
+  modelProvider = "openai";
   commandExecHandler: (
     params: Record<string, unknown>,
   ) => Promise<Record<string, unknown>> | Record<string, unknown> = () => ({
@@ -401,8 +411,8 @@ class FakeCodexAppServer {
         excludeTmpdirEnvVar: true,
         excludeSlashTmp: true,
       },
-      model: "gpt-5.6-sol",
-      modelProvider: "openai",
+      model: this.effectiveModel,
+      modelProvider: this.modelProvider,
       ...this.threadReadbackOverride,
     };
   }
@@ -592,13 +602,19 @@ async function createHarness(options: {
   appServerSpawn?: CodexAppServerSpawn;
   recoveryDelaysMs?: readonly number[];
   shutdownTimeoutMs?: number;
+  model?: string | null;
+  provider?: CodexProviderConfig;
 } = {}): Promise<Harness> {
   const directory = await temporaryDirectory("livis-codex-backend-");
   await chmod(directory.path, 0o700);
   const scopeKey = "scope-test";
   const sessionKey = "livis:agent-test";
+  const model = options.model ?? null;
+  const provider = options.provider ?? OPENAI_PROVIDER;
   const store = new JobStore(`${directory.path}/relay.db`, scopeKey);
   const fake = options.fake ?? new FakeCodexAppServer();
+  fake.modelProvider = provider.type === "custom" ? CUSTOM_PROVIDER_ID : "openai";
+  if (model !== null) fake.effectiveModel = model;
   options.configureFake?.(fake);
   if (options.existingThreadId) {
     const layout = await ensureCodexRuntimeLayout({
@@ -606,6 +622,7 @@ async function createHarness(options: {
       scopeKey,
       sessionKey,
       remoteNodeId: "node-1",
+      provider,
     });
     store.ensureBackendSession({
       backend: "codex",
@@ -616,9 +633,9 @@ async function createHarness(options: {
       accountType: "apiKey",
       accountSubjectSha256: null,
       accountIdentityStrength: "type-only",
-      requestedModel: null,
-      effectiveModel: "gpt-5.6-sol",
-      modelProvider: "openai",
+      requestedModel: model,
+      effectiveModel: fake.effectiveModel,
+      modelProvider: fake.modelProvider,
       securityConfigSha256: codexSecurityBindingSha256(layout, fakeCommandPin()),
       featureSnapshotSha256: validateDisabledCodexFeatures({
         data: codex0145FeatureSnapshot(),
@@ -745,7 +762,8 @@ async function createHarness(options: {
     sessionKey,
     remoteNodeId: "node-1",
     command: "/test/bin/codex",
-    model: null,
+    model,
+    provider,
     maxOutputChars: options.maxOutputChars ?? 1_048_576,
     requestTimeoutMs: options.requestTimeoutMs ?? 100,
     turnTimeoutMs: options.turnTimeoutMs ?? 5_000,
@@ -961,6 +979,8 @@ async function createReadIsolationSmokeHarness(scenario: ReadIsolationScenario):
   return {
     run: () => runCodexAppServerLocalSmoke({
       command,
+      model: null,
+      provider: OPENAI_PROVIDER,
       createStateDir: stateDir,
       verifyReadIsolation: true,
       requestTimeoutMs: 1_000,
@@ -1089,6 +1109,8 @@ describe("CodexExecutionBackend", () => {
     try {
       const report = await runCodexAppServerLocalSmoke({
         command,
+        model: null,
+        provider: OPENAI_PROVIDER,
         requestTimeoutMs: 1_000,
         shutdownTimeoutMs: 1_000,
       }, {
@@ -1101,6 +1123,8 @@ describe("CodexExecutionBackend", () => {
         sentModelTurn: false,
         backendStartReady: false,
         cliVersion: "0.145.0",
+        effectiveModel: "gpt-5.6-sol",
+        modelProvider: "openai",
         account: { authenticated: false, requiresOpenaiAuth: true, type: null },
         permissionProfile: "livis-remote",
         environmentId: "local",
@@ -1152,6 +1176,8 @@ describe("CodexExecutionBackend", () => {
     try {
       await expect(runCodexAppServerLocalSmoke({
         command,
+        model: null,
+        provider: OPENAI_PROVIDER,
         createStateDir: stateDir,
         requestTimeoutMs: 1_000,
         shutdownTimeoutMs: 1_000,
@@ -1541,6 +1567,7 @@ describe("CodexExecutionBackend", () => {
         remoteNodeId: "node-1",
         command: "/test/bin/codex",
         model: null,
+        provider: OPENAI_PROVIDER,
         maxOutputChars: 1_048_576,
         requestTimeoutMs: 100,
         turnTimeoutMs: 5_000,
@@ -1592,6 +1619,7 @@ describe("CodexExecutionBackend", () => {
         remoteNodeId: "node-1",
         command: "/test/bin/codex",
         model: null,
+        provider: OPENAI_PROVIDER,
         maxOutputChars: 1_048_576,
         requestTimeoutMs: 100,
         turnTimeoutMs: 5_000,
@@ -1820,6 +1848,78 @@ describe("CodexExecutionBackend", () => {
       });
       expect(harness.fake.messages.some((message) => message.method === "thread/start")).toBeTrue();
       expect(harness.fake.messages.some((message) => message.method === "turn/start")).toBeFalse();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("生产 backend 拒绝 requiresOpenaiAuth=false 的 API key account", async () => {
+    const harness = await createHarness({
+      start: false,
+      configureFake: (fake) => {
+        fake.account = { type: "apiKey" };
+        fake.requiresOpenaiAuth = false;
+      },
+    });
+    try {
+      await expect(harness.backend.start()).rejects.toThrow("requiresOpenaiAuth=true");
+      expect(harness.fake.messages.some((message) => message.method === "permissionProfile/list"))
+        .toBeFalse();
+      expect(harness.fake.messages.some((message) => message.method === "thread/start"))
+        .toBeFalse();
+      expect(harness.fake.messages.some((message) => message.method === "thread/resume"))
+        .toBeFalse();
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")).toBeNull();
+      expect(harness.backend.ready).toBeFalse();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("custom provider 首次启动只接受固定 provider ID 并回读 model", async () => {
+    const harness = await createHarness({
+      provider: CUSTOM_PROVIDER,
+      model: "custom-model",
+    });
+    try {
+      expect(harness.backend.status()).toMatchObject({
+        ready: true,
+        requestedModel: "custom-model",
+        effectiveModel: "custom-model",
+        modelProvider: CUSTOM_PROVIDER_ID,
+      });
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")).toMatchObject({
+        requestedModel: "custom-model",
+        effectiveModel: "custom-model",
+        modelProvider: CUSTOM_PROVIDER_ID,
+      });
+      expect(harness.fake.messages.find((message) => message.method === "thread/start")?.params)
+        .toMatchObject({ model: "custom-model" });
+      const config = await Bun.file(
+        join(harness.directory.path, "backends", "codex", "home", "config.toml"),
+      ).text();
+      expect(config).toContain(`model_provider = "${CUSTOM_PROVIDER_ID}"`);
+      expect(config).toContain(`base_url = ${JSON.stringify(CUSTOM_PROVIDER.baseUrl)}`);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("custom provider 首次 thread 回读 provider 不匹配时 quarantine", async () => {
+    const harness = await createHarness({
+      start: false,
+      provider: CUSTOM_PROVIDER,
+      model: "custom-model",
+      configureFake: (fake) => {
+        fake.modelProvider = "openai";
+      },
+    });
+    try {
+      await expect(harness.backend.start()).rejects.toThrow("固定 provider");
+      expect(harness.fake.messages.some((message) => message.method === "thread/start")).toBeTrue();
+      expect(harness.fake.messages.some((message) => message.method === "turn/start")).toBeFalse();
+      expect(harness.store.getSessionQuarantine("livis:agent-test")).not.toBeNull();
+      expect(harness.backend.ready).toBeFalse();
     } finally {
       await harness.cleanup();
     }
@@ -3747,7 +3847,7 @@ describe("CodexExecutionBackend", () => {
     }
   });
 
-  for (const variant of ["account-policy", "checkpoint", "tail"] as const) {
+  for (const variant of ["account-policy", "model-provider", "checkpoint", "tail"] as const) {
     test(`idle recovery 发现 ${variant} 漂移会立即 quarantine 且停止重试`, async () => {
       const initial = new FakeCodexAppServer();
       const drifted = new FakeCodexAppServer();
@@ -3768,6 +3868,8 @@ describe("CodexExecutionBackend", () => {
             email: "other-account@example.com",
             planType: "plus",
           };
+        } else if (variant === "model-provider") {
+          drifted.modelProvider = "unexpected-provider";
         } else if (variant === "checkpoint") {
           harness.store.checkpointBackendThreadTail({
             backend: "codex",

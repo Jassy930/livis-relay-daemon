@@ -9,6 +9,18 @@ export type ExecutionBackendKind = "hermes" | "codex" | "claude";
 /** schema v4 发布时实际存在的两个 backend；仅用于一次性迁移声明。 */
 export type LegacyV4JobBackendKind = Exclude<ExecutionBackendKind, "claude">;
 
+/**
+ * Codex 模型 provider 边界。自定义 provider 只允许固定 Responses wire，API key 仍由
+ * daemon 专用 CODEX_HOME/auth.json 管理；baseUrl 配置不得承载任何凭据。
+ */
+export type CodexProviderConfig =
+  | { type: "openai" }
+  | {
+      type: "custom";
+      baseUrl: string;
+      acknowledgeApiKeyTransmission: true;
+    };
+
 export type JobStatus =
   | "Received"
   | "Acked"

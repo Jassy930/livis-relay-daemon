@@ -148,6 +148,7 @@ describe("配置与协议 profile", () => {
     expect(parsedLegacy.execution.backend).toBe("hermes");
     expect(parsedLegacy.execution.legacyV4JobBackend).toBeNull();
     expect(parsedLegacy.codex.acknowledgeRemoteExecution).toBeFalse();
+    expect(parsedLegacy.codex.provider).toEqual({ type: "openai" });
 
     const codex = parseRelayConfig(JSON.stringify({
       ...config,
@@ -155,6 +156,11 @@ describe("配置与协议 profile", () => {
       codex: {
         command: "/opt/homebrew/bin/codex",
         model: "gpt-5.6-sol",
+        provider: {
+          type: "custom",
+          baseUrl: "https://provider.example.invalid/responses-root",
+          acknowledgeApiKeyTransmission: true,
+        },
         requestTimeoutMs: 12_000,
         turnTimeoutMs: 45_000,
         interruptGraceMs: 3_000,
@@ -166,6 +172,11 @@ describe("配置与协议 profile", () => {
     expect(codex.codex).toEqual({
       command: "/opt/homebrew/bin/codex",
       model: "gpt-5.6-sol",
+      provider: {
+        type: "custom",
+        baseUrl: "https://provider.example.invalid/responses-root",
+        acknowledgeApiKeyTransmission: true,
+      },
       requestTimeoutMs: 12_000,
       turnTimeoutMs: 45_000,
       interruptGraceMs: 3_000,
@@ -215,6 +226,35 @@ describe("配置与协议 profile", () => {
       execution: { backend: "codex" },
       codex: { ...config.codex, command: "codex" },
     }), "/tmp/config.json")).toThrow("必须是绝对路径");
+    for (const provider of [
+      { type: "custom", baseUrl: "http://provider.example.invalid", acknowledgeApiKeyTransmission: true },
+      { type: "custom", baseUrl: "https://user:secret@provider.example.invalid", acknowledgeApiKeyTransmission: true },
+      { type: "custom", baseUrl: "https://provider.example.invalid?token=secret", acknowledgeApiKeyTransmission: true },
+      { type: "custom", baseUrl: "https://provider.example.invalid", acknowledgeApiKeyTransmission: false },
+      { type: "custom", baseUrl: "https://provider.example.invalid", acknowledgeApiKeyTransmission: true, experimentalBearerToken: "secret" },
+      { type: "openai", baseUrl: "https://provider.example.invalid" },
+      { type: "unknown" },
+    ]) {
+      expect(() => parseRelayConfig(JSON.stringify({
+        ...config,
+        execution: { backend: "codex" },
+        codex: { ...config.codex, command: "/opt/homebrew/bin/codex", provider },
+      }), "/tmp/config.json")).toThrow();
+    }
+    expect(() => parseRelayConfig(JSON.stringify({
+      ...config,
+      execution: { backend: "codex" },
+      codex: {
+        ...config.codex,
+        command: "/opt/homebrew/bin/codex",
+        model: null,
+        provider: {
+          type: "custom",
+          baseUrl: "https://provider.example.invalid/v1",
+          acknowledgeApiKeyTransmission: true,
+        },
+      },
+    }), "/tmp/config.json")).toThrow("custom provider 必须显式设置");
   });
 
   test("旧配置兼容 relay 帧默认上限，并拒绝无效或过大的显式值", () => {

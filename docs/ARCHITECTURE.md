@@ -9,7 +9,8 @@
 - 默认 Hermes backend 通过本机 connector IPC 与 `MessageEvent` / `SendResult` 转换；
   plugin 不连接 LiViS、不打开 relay SQLite，也不隐式启动 daemon。
 - 显式 Codex backend 由 daemon 直接管理一个 `codex app-server --stdio` 子进程，不
-  经过 Hermes connector，也不把 thread 当作 job 状态真源。
+  经过 Hermes connector，也不把 thread 当作 job 状态真源。`codex` 是 execution backend；
+  其下的默认 OpenAI 或显式 custom Responses 是 model provider，不是第四种 backend。
 - Hermes 模式下 daemon 与专用 Hermes Gateway 分别由 launchd/systemd 管理；Codex
   模式只管理 daemon 服务，app-server 随 daemon 启停。
 
@@ -24,7 +25,8 @@
 attempt fencing、terminal/cancel 能力和 provider session/execution 标识；Codex 的
 JSON-RPC stdio 与 Claude 的 SDK/CLI stream-json 必须保留为两个独立 transport，不能
 为了复用代码把它们伪装成同一协议。当前产品边界已经固定为 Hermes、Codex、Claude
-三选一，不支持同一 daemon 同时承载多个 provider。
+三选一，不支持同一 daemon 同时承载多个 execution backend；选择 Codex 后也只能固定一个
+model provider。
 
 这里的“协议所有者”描述本地状态职责，不代表项目掌握服务端规范。服务端已经接受、仅由官方客户端观察、只在 fake Relay 验证或仍未知的行为，统一登记在[LiViS 服务端协议证据与支持边界](LIVIS-RELAY-PROTOCOL-BOUNDARY.md)。
 
@@ -63,9 +65,12 @@ Pending → Delivering → Delivered
 
 `Succeeded` 只表示 Agent final 已持久化；远端完成还要求 outbox 收到 `ack_send_result`。重启时：
 
-- job 首次入库时会把所选 provider 写入 `jobs.target_backend`，schema v7 的 SQLite
+- job 首次入库时会把所选 execution backend 写入 `jobs.target_backend`，schema v7 的 SQLite
   trigger 会拒绝后续改写；重复投递或配置切换都不能重新绑定。未派发 job 只有在当前
   backend 与该绑定一致时才可继续派发。
+- `jobs.target_backend=codex` 当前没有继续绑定 OpenAI/custom 子 provider。Codex session 与
+  attempt ledger 会记录实际 `model_provider` 和安全摘要，但不能替代 job 入库时的子 provider
+  fence；所以同一 `stateDir` 禁止切换 provider 或 key，避免旧 backlog 跨出口执行。
 - `Dispatching/Running/Cancelling` 属于 ambiguous execution，不自动重跑。
 - 未 ACK 的结果只重发 outbox，每次生成新的 `msg_id`，保留原 `job_id` 和结果内容。
 
@@ -106,6 +111,11 @@ dev/ino/mode/link/内容摘要”。它在项目协作路径、daemon 重启与 
 guard，并固定同一 canonical state directory 打开 SQLite，再由同一个事务返回实际退役的
 backend 列表。旧 Codex 绑定会被退役；后续若成功到达 thread 物化阶段，必须创建新 thread，
 但 release 不保证下一次启动本身会成功。job/outbox 和旧 rollout 仍保留。
+
+安全 config 摘要包含 OpenAI/custom 选择、custom `baseUrl`、Responses wire 与固定 retry
+策略，但不包含 API key；`account/read` 也只有 type-only 强度，不能区分两把 key。因此
+provider、endpoint 或 key 的合法变更必须使用全新 state/CODEX_HOME。`session release`
+只退役 session row，既不补足 job 级 provider fence，也不是凭据轮换机制。
 
 fresh 数据库直接创建为 v7，v1-v6 数据库都在同一个 `BEGIN IMMEDIATE` 事务内完成版本
 读取、DDL、旧 `AckFailed` 恢复为 `Pending`、完整性与外键检查以及最终版本提交。版本
@@ -168,6 +178,12 @@ cancel     → turn/interrupt
 恢复 thread 后读回 cwd、runtime workspace roots、permission profile、approval policy
 与 sandbox，并比较账号身份强度、实际 model/provider、配置/feature 摘要及稳定 thread
 tail；任一字段、未映射 turn 或固定配置漂移都失败关闭。
+
+默认 OpenAI provider 使用 Codex 内建 Responses 路径；custom provider 固定生成
+`model_provider=livis-custom-responses`、HTTPS `base_url`、`wire_api=responses`、
+`requires_openai_auth=true`、零 request/SSE retry 和禁用 WebSocket。两者都要求专用
+API-key 账号。custom endpoint 是凭据与会话数据出口，不因 agent 工具网络关闭而变成本地
+执行；固定 Codex `0.145.0` 的 strict-config 与真实 Responses canary 仍是独立验收层。
 
 JobStore 先原子 claim job 并保留 backend attempt，随后才允许发送 `turn/start`。
 只有 transport 明确证明请求未写入时才可撤销 attempt；请求可能已写入、响应无法绑定

@@ -8,7 +8,7 @@ import {
   CODEX_MINIMUM_VERSION,
 } from "../../config.ts";
 import type { JobStore } from "../../state/store.ts";
-import type { StoredBackendSession, StoredJob } from "../../types.ts";
+import type { CodexProviderConfig, StoredBackendSession, StoredJob } from "../../types.ts";
 import {
   parseSemverTriplet,
   sha256,
@@ -88,6 +88,7 @@ export interface CodexExecutionBackendOptions {
   remoteNodeId: string;
   command: string;
   model: string | null;
+  provider: CodexProviderConfig;
   maxOutputChars: number;
   requestTimeoutMs: number;
   /** 从 turn/start 发起前开始计算的整轮绝对时限。 */
@@ -452,6 +453,9 @@ function validateAccountResponse(value: unknown): AuthenticatedCodexAccountInspe
   if (inspection.accountType !== "apiKey") {
     throw new Error("Codex 私有 CODEX_HOME 只允许 API key account（account.type 必须为 apiKey）");
   }
+  if (!inspection.requiresOpenaiAuth) {
+    throw new Error("Codex 当前 provider 必须声明 requiresOpenaiAuth=true 才能使用 API key");
+  }
   return {
     accountType: inspection.accountType,
     accountSubjectSha256: inspection.accountSubjectSha256,
@@ -621,13 +625,19 @@ export function inspectThreadResponse(
   if (sandbox.writableRoots.length !== 0) {
     throw new Error("Codex sandbox 回读不应包含 runtime workspace 之外的额外 writable root");
   }
+  const modelProvider = nonEmptyString(
+    response.modelProvider,
+    "Codex thread response.modelProvider",
+  );
+  if (modelProvider !== layout.expectedModelProvider) {
+    throw new Error(
+      `Codex thread 实际 provider ${modelProvider} 与固定 provider ${layout.expectedModelProvider} 不一致`,
+    );
+  }
   return {
     threadId,
     effectiveModel: nonEmptyString(response.model, "Codex thread response.model"),
-    modelProvider: nonEmptyString(
-      response.modelProvider,
-      "Codex thread response.modelProvider",
-    ),
+    modelProvider,
   };
 }
 
@@ -1060,6 +1070,9 @@ export class CodexExecutionBackend implements ExecutionBackend {
     if (!options.command.trim()) throw new Error("Codex command 不能为空");
     if (!isAbsolute(options.command)) throw new Error("Codex command 必须是绝对路径");
     if (!options.remoteNodeId.trim()) throw new Error("Codex remoteNodeId 不能为空");
+    if (options.provider.type === "custom" && options.model === null) {
+      throw new Error("Codex custom provider 必须显式固定 model");
+    }
     if (!Number.isSafeInteger(options.maxOutputChars) || options.maxOutputChars <= 0) {
       throw new Error("Codex maxOutputChars 必须是正整数");
     }
@@ -1118,6 +1131,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
         scopeKey: this.options.scopeKey,
         sessionKey: this.options.sessionKey,
         remoteNodeId: this.options.remoteNodeId,
+        provider: this.options.provider,
       });
       await assertCodexRuntimeLayout(layout);
       const environment = await buildCodexEnvironment(layout);

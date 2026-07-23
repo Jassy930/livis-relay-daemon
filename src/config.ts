@@ -11,7 +11,11 @@ import {
   sha256,
   versionLessThan,
 } from "./util.ts";
-import type { ExecutionBackendKind, LegacyV4JobBackendKind } from "./types.ts";
+import type {
+  CodexProviderConfig,
+  ExecutionBackendKind,
+  LegacyV4JobBackendKind,
+} from "./types.ts";
 
 export interface RelayConfig {
   schemaVersion: 1;
@@ -57,6 +61,7 @@ export interface RelayConfig {
   codex: {
     command: string;
     model: string | null;
+    provider: CodexProviderConfig;
     requestTimeoutMs: number;
     turnTimeoutMs: number;
     interruptGraceMs: number;
@@ -111,6 +116,60 @@ function stringArray(value: unknown, label: string): string[] {
   return [...value] as string[];
 }
 
+function parseCodexProvider(codex: Record<string, unknown> | undefined): CodexProviderConfig {
+  const value = codex?.provider;
+  if (value === undefined) return { type: "openai" };
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("config.codex.provider 必须是对象");
+  }
+  const provider = value as Record<string, unknown>;
+  const type = asNonEmptyString(provider.type, "config.codex.provider.type");
+  if (type === "openai") {
+    const unexpected = Object.keys(provider).filter((key) => key !== "type");
+    if (unexpected.length > 0) {
+      throw new Error(`config.codex.provider(openai) 包含未审核字段：${unexpected.sort().join(",")}`);
+    }
+    return { type: "openai" };
+  }
+  if (type !== "custom") {
+    throw new Error("config.codex.provider.type 只支持 openai 或 custom");
+  }
+  const unexpected = Object.keys(provider).filter((key) =>
+    !["type", "baseUrl", "acknowledgeApiKeyTransmission"].includes(key)
+  );
+  if (unexpected.length > 0) {
+    throw new Error(`config.codex.provider(custom) 包含未审核字段：${unexpected.sort().join(",")}`);
+  }
+  if (provider.acknowledgeApiKeyTransmission !== true) {
+    throw new Error(
+      "自定义 Codex provider 必须设置 acknowledgeApiKeyTransmission=true，明确确认 API key 将发送到该端点",
+    );
+  }
+  const rawBaseUrl = asNonEmptyString(provider.baseUrl, "config.codex.provider.baseUrl");
+  if (rawBaseUrl !== rawBaseUrl.trim() || rawBaseUrl.length > 2048) {
+    throw new Error("config.codex.provider.baseUrl 必须是长度不超过 2048 的无首尾空白 HTTPS URL");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(rawBaseUrl);
+  } catch {
+    throw new Error("config.codex.provider.baseUrl 必须是有效 HTTPS URL");
+  }
+  if (
+    parsed.protocol !== "https:" || parsed.username !== "" || parsed.password !== "" ||
+    parsed.search !== "" || parsed.hash !== ""
+  ) {
+    throw new Error(
+      "config.codex.provider.baseUrl 必须是无用户名、密码、query 与 fragment 的 HTTPS URL",
+    );
+  }
+  return {
+    type: "custom",
+    baseUrl: parsed.toString(),
+    acknowledgeApiKeyTransmission: true,
+  };
+}
+
 export function parseRelayConfig(text: string, configPath: string): RelayConfig {
   const root = parseJsonObject(text, configPath);
   if (root.schemaVersion !== 1) {
@@ -149,6 +208,8 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
   const codexCommand = codex?.command === undefined
     ? "codex"
     : asNonEmptyString(codex.command, "config.codex.command");
+  const codexModel = optionalNonEmptyString(codex?.model, "config.codex.model");
+  const codexProvider = parseCodexProvider(codex);
   if (executionBackend === "codex" && (allowAllNodes || allowedNodeIds.length !== 1)) {
     throw new Error(
       "Codex backend 只支持单设备：config.security.allowAllNodes 必须为 false，且 allowedNodeIds 必须恰好包含一个 nodeId",
@@ -156,6 +217,9 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
   }
   if (executionBackend === "codex" && !isAbsolute(codexCommand)) {
     throw new Error("Codex backend 的 config.codex.command 必须是绝对路径");
+  }
+  if (executionBackend === "codex" && codexProvider.type === "custom" && codexModel === null) {
+    throw new Error("Codex custom provider 必须显式设置 config.codex.model");
   }
   const stateDirRaw = asNonEmptyString(root.stateDir, "config.stateDir");
   const hermesMinimumVersion = asNonEmptyString(hermes.minimumVersion, "config.hermes.minimumVersion");
@@ -231,7 +295,8 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
     },
     codex: {
       command: codexCommand,
-      model: optionalNonEmptyString(codex?.model, "config.codex.model"),
+      model: codexModel,
+      provider: codexProvider,
       requestTimeoutMs: codex?.requestTimeoutMs === undefined
         ? DEFAULT_CODEX_REQUEST_TIMEOUT_MS
         : asPositiveInteger(codex.requestTimeoutMs, "config.codex.requestTimeoutMs"),
@@ -323,6 +388,7 @@ export async function initializeConfig(options: {
     codex: {
       command: "codex",
       model: null,
+      provider: { type: "openai" },
       requestTimeoutMs: DEFAULT_CODEX_REQUEST_TIMEOUT_MS,
       turnTimeoutMs: DEFAULT_CODEX_TURN_TIMEOUT_MS,
       interruptGraceMs: DEFAULT_CODEX_INTERRUPT_GRACE_MS,

@@ -38,6 +38,9 @@
   "codex": {
     "command": "codex",
     "model": null,
+    "provider": {
+      "type": "openai"
+    },
     "requestTimeoutMs": 30000,
     "turnTimeoutMs": 900000,
     "interruptGraceMs": 5000,
