@@ -10,9 +10,9 @@ import { temporaryDirectory, testConfig, testProfile } from "./helpers.ts";
 
 const PROJECT_ROOT = resolve(import.meta.dir, "..");
 const SESSION_METADATA = {
-  accountType: "chatgpt",
-  accountSubjectSha256: "b".repeat(64),
-  accountIdentityStrength: "subject" as const,
+  accountType: "apiKey",
+  accountSubjectSha256: null,
+  accountIdentityStrength: "type-only" as const,
   requestedModel: null,
   effectiveModel: "gpt-5.6-sol",
   modelProvider: "openai",

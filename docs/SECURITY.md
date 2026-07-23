@@ -24,7 +24,10 @@
 - Hermes streaming、tool progress、interim message、附件和远程审批全部关闭。
 - Hermes runtime 审核范围默认是 `[0.15.1, 0.15.2)`；bridge 范围是 `[0.1.0, 0.2.0)`。
 - Codex CLI 审核范围固定为 `[0.145.0, 0.146.0)`；必须使用 daemon state
-  directory 内单独登录的 `CODEX_HOME`，不得复用 `~/.codex`。
+  directory 内通过标准输入单独写入 API key 的 `CODEX_HOME`，不得复用 `~/.codex`。
+  生产 backend 只接受 `account.type=apiKey`；OAuth/ChatGPT、Bedrock、空账号和未知类型
+  都必须在 permission profile、thread 与 turn RPC 前失败关闭。每次 dispatch 都必须在
+  `turn/start` 前重新回读账号并与内存/SQLite 锚点核对，运行中认证模式漂移同样失败关闭。
 - 未知版本、哈希、wire protocol 或运行契约变化 fail closed。
 - job 在首次入库事务内持久绑定 `target_backend`；schema v7 的 SQLite trigger 会拒绝
   任何后续改写，积压 job 不会跟随后来配置切换。`serve` 在启动 backend 或 Relay 前

@@ -42,7 +42,7 @@ export type ExecutionAttemptEventType =
 /** 只有已经稳定落盘的 terminal turn 才能成为恢复 checkpoint。 */
 export type BackendCheckpointTurnStatus = "completed" | "failed" | "interrupted";
 
-/** 账号身份绑定能否区分同类型账号；API key/Bedrock 当前只能绑定账号类型。 */
+/** 账号身份绑定能否区分同类型账号；当前生产支持的 API key 只能绑定账号类型。 */
 export type BackendAccountIdentityStrength = "subject" | "type-only";
 
 export interface RelayMetadata {

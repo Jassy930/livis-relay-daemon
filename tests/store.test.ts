@@ -13,9 +13,9 @@ import {
 import { incomingJob, temporaryDirectory } from "./helpers.ts";
 
 const BACKEND_SESSION_METADATA = {
-  accountType: "chatgpt",
-  accountSubjectSha256: "b".repeat(64),
-  accountIdentityStrength: "subject" as const,
+  accountType: "apiKey",
+  accountSubjectSha256: null,
+  accountIdentityStrength: "type-only" as const,
   requestedModel: null,
   effectiveModel: "gpt-5.6-sol",
   modelProvider: "openai",
@@ -753,7 +753,7 @@ describe("backend session durability", () => {
     expect(created.recoveryRequired).toBeFalse();
     expect(created.accountType).toBe(BACKEND_SESSION_METADATA.accountType);
     expect(created.accountSubjectSha256).toBe(BACKEND_SESSION_METADATA.accountSubjectSha256);
-    expect(created.accountIdentityStrength).toBe("subject");
+    expect(created.accountIdentityStrength).toBe("type-only");
     expect(created.requestedModel).toBeNull();
     expect(created.effectiveModel).toBe(BACKEND_SESSION_METADATA.effectiveModel);
     expect(created.modelProvider).toBe(BACKEND_SESSION_METADATA.modelProvider);
@@ -782,7 +782,11 @@ describe("backend session durability", () => {
     })).toThrow(BackendSessionConflictError);
 
     for (const immutableDrift of [
-      { accountType: "apiKey", accountSubjectSha256: null, accountIdentityStrength: "type-only" as const },
+      {
+        accountType: "chatgpt",
+        accountSubjectSha256: "b".repeat(64),
+        accountIdentityStrength: "subject" as const,
+      },
       { requestedModel: "gpt-5.6-sol" },
       { effectiveModel: "gpt-5.7" },
       { modelProvider: "different-provider" },
@@ -1930,14 +1934,14 @@ describe("SQLite schema v7 migration", () => {
 
       const partialBinding = new Database(databasePath, { strict: true });
       expect(() => partialBinding
-        .query(`UPDATE backend_sessions SET account_type='chatgpt'
+        .query(`UPDATE backend_sessions SET account_type='apiKey'
                 WHERE backend='codex' AND session_key=?`)
         .run(sessionInput.sessionKey)).toThrow("metadata binding must be complete");
       partialBinding.close();
 
       const bound = migrated.ensureBackendSession(sessionInput);
-      expect(bound.accountType).toBe("chatgpt");
-      expect(bound.accountIdentityStrength).toBe("subject");
+      expect(bound.accountType).toBe("apiKey");
+      expect(bound.accountIdentityStrength).toBe("type-only");
       expect(bound.threadId).toBe("legacy-thread");
       expect(bound.checkpointTurnId).toBe("legacy-turn");
       expect(bound.checkpointTurnCount).toBe(1);

@@ -859,6 +859,9 @@ export async function runCodexAppServerLocalSmoke(
     account = inspectCodexAccountResponse(
       await client.request("account/read", { refreshToken: false }),
     );
+    if (account.accountType !== null && account.accountType !== "apiKey") {
+      throw new Error("Codex smoke 只允许未登录或 API key account");
+    }
     if (options.stateDir === undefined && account.accountType !== null) {
       throw new Error("全新 Codex smoke state 意外继承了账号，拒绝继续创建 thread");
     }
@@ -946,7 +949,7 @@ export async function runCodexAppServerLocalSmoke(
   return {
     ok: true,
     sentModelTurn: false,
-    backendStartReady: account.accountType !== null,
+    backendStartReady: account.accountType === "apiKey",
     stateDir,
     workspace: layout.workspace,
     codexCommand: command,

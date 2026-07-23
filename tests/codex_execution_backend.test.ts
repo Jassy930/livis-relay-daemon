@@ -135,7 +135,7 @@ class FakeCodexAppServer {
   cliVersion = "0.145.0";
   nextTurnId = "019f-turn-1";
   turns: Array<Record<string, unknown>> = [];
-  account: Record<string, unknown> | null = { type: "chatgpt", email: null, planType: "plus" };
+  account: Record<string, unknown> | null = { type: "apiKey" };
   requiresOpenaiAuth = true;
   permissionAllowed = true;
   enabledHighRiskFeature: string | null = null;
@@ -613,7 +613,7 @@ async function createHarness(options: {
       sessionHash: layout.sessionHash,
       cwd: layout.workspace,
       cliVersion: "0.145.0",
-      accountType: "chatgpt",
+      accountType: "apiKey",
       accountSubjectSha256: null,
       accountIdentityStrength: "type-only",
       requestedModel: null,
@@ -1012,7 +1012,7 @@ async function listHardlinkCanaryFiles(stateDir: string): Promise<string[]> {
 }
 
 describe("CodexExecutionBackend", () => {
-  test("account/read 将 requiresOpenaiAuth 作为 provider 属性而不是登录状态", () => {
+  test("account/read 区分上游账号类型，requiresOpenaiAuth 不是登录状态", () => {
     expect(inspectCodexAccountResponse({
       account: { type: "apiKey" },
       requiresOpenaiAuth: true,
@@ -1049,10 +1049,19 @@ describe("CodexExecutionBackend", () => {
       accountSubjectSha256: null,
       identityStrength: null,
     });
-    expect(() => inspectCodexAccountResponse({
-      account: { type: "unknown" },
-      requiresOpenaiAuth: true,
-    })).toThrow("account.type 未经审核");
+    const sensitiveAccountType = "sensitive-account-type-must-not-leak";
+    let unknownAccountError: unknown = null;
+    try {
+      inspectCodexAccountResponse({
+        account: { type: sensitiveAccountType },
+        requiresOpenaiAuth: true,
+      });
+    } catch (error) {
+      unknownAccountError = error;
+    }
+    expect(unknownAccountError).toBeInstanceOf(Error);
+    expect((unknownAccountError as Error).message).toBe("Codex account.type 未经审核");
+    expect((unknownAccountError as Error).message).not.toContain(sensitiveAccountType);
     expect(() => inspectCodexAccountResponse({
       account: null,
       requiresOpenaiAuth: null,
@@ -1125,6 +1134,38 @@ describe("CodexExecutionBackend", () => {
         await rm(smokeStateDir, { recursive: true, force: true });
       }
       await commandDirectory.cleanup();
+    }
+  });
+
+  test("smoke 显式 state 在创建 thread 前拒绝非 API key account", async () => {
+    const commandDirectory = await temporaryDirectory("livis-codex-smoke-command-");
+    const stateParent = await temporaryDirectory("livis-codex-smoke-account-policy-");
+    const command = `${commandDirectory.path}/codex`;
+    const stateDir = join(await realpath(stateParent.path), "state");
+    await writeFile(command, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    const fake = new FakeCodexAppServer();
+    fake.account = {
+      type: "chatgpt",
+      email: "sensitive-smoke-account-must-not-leak@example.invalid",
+      planType: "plus",
+    };
+    try {
+      await expect(runCodexAppServerLocalSmoke({
+        command,
+        createStateDir: stateDir,
+        requestTimeoutMs: 1_000,
+        shutdownTimeoutMs: 1_000,
+      }, {
+        appServerSpawn: fake.spawn,
+        commandRunner: successfulVersion,
+      })).rejects.toThrow("Codex smoke 只允许未登录或 API key account");
+      expect(fake.messages.some((message) => message.method === "permissionProfile/list"))
+        .toBeFalse();
+      expect(fake.messages.some((message) => message.method === "thread/start")).toBeFalse();
+      expect(fake.messages.some((message) => message.method === "turn/start")).toBeFalse();
+    } finally {
+      await fake.stop(0);
+      await Promise.all([commandDirectory.cleanup(), stateParent.cleanup()]);
     }
   });
 
@@ -1777,10 +1818,47 @@ describe("CodexExecutionBackend", () => {
         accountType: "apiKey",
         accountIdentityStrength: "type-only",
       });
+      expect(harness.fake.messages.some((message) => message.method === "thread/start")).toBeTrue();
+      expect(harness.fake.messages.some((message) => message.method === "turn/start")).toBeFalse();
     } finally {
       await harness.cleanup();
     }
   });
+
+  for (const accountType of ["chatgpt", "amazonBedrock"] as const) {
+    test(`生产 backend 在创建 thread 前拒绝非 API key account：${accountType}`, async () => {
+      const sensitiveAccountField = `sensitive-${accountType}-field-must-not-leak`;
+      const harness = await createHarness({
+        start: false,
+        configureFake: (fake) => {
+          fake.account = accountType === "chatgpt"
+            ? { type: accountType, email: sensitiveAccountField, planType: "plus" }
+            : { type: accountType, credentialSource: sensitiveAccountField };
+          fake.requiresOpenaiAuth = accountType === "chatgpt";
+        },
+      });
+      try {
+        await expect(harness.backend.start()).rejects.toThrow(
+          "Codex 私有 CODEX_HOME 只允许 API key account",
+        );
+        expect(
+          harness.fake.messages.some((message) => message.method === "permissionProfile/list"),
+        ).toBeFalse();
+        expect(harness.fake.messages.some((message) => message.method === "thread/start"))
+          .toBeFalse();
+        expect(harness.fake.messages.some((message) => message.method === "thread/resume"))
+          .toBeFalse();
+        expect(harness.fake.messages.some((message) => message.method === "turn/start"))
+          .toBeFalse();
+        expect(harness.store.getBackendSession("codex", "livis:agent-test")).toBeNull();
+        expect(harness.events).toEqual([]);
+        expect(harness.logs.join("\n")).not.toContain(sensitiveAccountField);
+        expect(harness.backend.ready).toBeFalse();
+      } finally {
+        await harness.cleanup();
+      }
+    });
+  }
 
   test("account=null 即使 requiresOpenaiAuth=false 仍拒绝生产启动", async () => {
     const harness = await createHarness({
@@ -1795,6 +1873,10 @@ describe("CodexExecutionBackend", () => {
         "Codex 私有 CODEX_HOME account 必须是对象",
       );
       expect(harness.fake.messages.some((message) => message.method === "thread/start")).toBeFalse();
+      expect(harness.fake.messages.some((message) => message.method === "thread/resume")).toBeFalse();
+      expect(harness.fake.messages.some((message) => message.method === "turn/start")).toBeFalse();
+      expect(harness.events).toEqual([]);
+      expect(harness.store.getBackendSession("codex", "livis:agent-test")).toBeNull();
       expect(harness.backend.ready).toBeFalse();
     } finally {
       await harness.cleanup();
@@ -2008,7 +2090,7 @@ describe("CodexExecutionBackend", () => {
       expect(harness.backend.status().active).toBeNull();
       expect(harness.store.require(job.jobId).outbox?.resultJson).toBe(serializeResult("最终答案"));
       expect(harness.store.getBackendSession("codex", "livis:agent-test")).toMatchObject({
-        accountType: "chatgpt",
+        accountType: "apiKey",
         accountIdentityStrength: "type-only",
         requestedModel: null,
         effectiveModel: "gpt-5.6-sol",
@@ -2180,6 +2262,48 @@ describe("CodexExecutionBackend", () => {
       )?.status).toBe("Cancelled");
       expect(harness.store.require(job.jobId).status).toBe("Cancelled");
       expect(harness.backend.ready).toBeTrue();
+      expect(harness.backend.status().active).toBeNull();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("dispatch 前 API key account policy 锚点漂移时隔离并关闭 backend", async () => {
+    const harness = await createHarness();
+    try {
+      const job = claimJob(harness, "job-account-policy-drift");
+      Object.assign(harness.backend, { accountType: "chatgpt" });
+
+      expect(await harness.backend.dispatch(job)).toBe("not_sent");
+      expect(harness.fake.messages.some((message) => message.method === "turn/start")).toBeFalse();
+      expect(harness.store.require(job.jobId).status).toBe("Dispatching");
+      expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
+        .toContain("API key account policy 锚点漂移");
+      expect(harness.backend.ready).toBeFalse();
+      expect(harness.backend.status().active).toBeNull();
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  test("dispatch 前重新回读 account，运行中切换为 ChatGPT 时不发送 turn/start", async () => {
+    const harness = await createHarness();
+    const sensitiveAccountField = "runtime-account-drift-must-not-leak@example.invalid";
+    try {
+      const job = claimJob(harness, "job-runtime-account-policy-drift");
+      harness.fake.account = {
+        type: "chatgpt",
+        email: sensitiveAccountField,
+        planType: "plus",
+      };
+
+      expect(await harness.backend.dispatch(job)).toBe("not_sent");
+      expect(harness.fake.messages.some((message) => message.method === "turn/start")).toBeFalse();
+      expect(harness.store.require(job.jobId).status).toBe("Dispatching");
+      expect(harness.store.getSessionQuarantine("livis:agent-test")?.reason)
+        .toContain("API key account policy 回读失败");
+      expect(harness.logs.join("\n")).not.toContain(sensitiveAccountField);
+      expect(harness.backend.ready).toBeFalse();
       expect(harness.backend.status().active).toBeNull();
     } finally {
       await harness.cleanup();
@@ -3379,7 +3503,7 @@ describe("CodexExecutionBackend", () => {
         ready: true,
         executionId,
         threadId,
-        accountType: "chatgpt",
+        accountType: "apiKey",
         accountIdentityStrength: "type-only",
         requestedModel: null,
         effectiveModel: "gpt-5.6-sol",
@@ -3623,7 +3747,7 @@ describe("CodexExecutionBackend", () => {
     }
   });
 
-  for (const variant of ["metadata", "checkpoint", "tail"] as const) {
+  for (const variant of ["account-policy", "checkpoint", "tail"] as const) {
     test(`idle recovery 发现 ${variant} 漂移会立即 quarantine 且停止重试`, async () => {
       const initial = new FakeCodexAppServer();
       const drifted = new FakeCodexAppServer();
@@ -3638,7 +3762,7 @@ describe("CodexExecutionBackend", () => {
         recoveryDelaysMs: [0, 0, 0],
       });
       try {
-        if (variant === "metadata") {
+        if (variant === "account-policy") {
           drifted.account = {
             type: "chatgpt",
             email: "other-account@example.com",
@@ -3676,6 +3800,9 @@ describe("CodexExecutionBackend", () => {
           },
         });
         expect(harness.store.getSessionQuarantine("livis:agent-test")).not.toBeNull();
+        if (variant === "account-policy") {
+          expect(drifted.messages.some((message) => message.method === "thread/resume")).toBeFalse();
+        }
         expect(drifted.messages.some((message) => message.method === "turn/start")).toBeFalse();
       } finally {
         await harness.cleanup();

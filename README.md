@@ -24,7 +24,7 @@ flowchart LR
 - 只支持纯文本、单个 final result。
 - 一期暂将 LiViS `node_id` 视为设备来源标识；每套 daemon、config 与 state directory 只允许一个预先配置的 `node_id`。
 - 不支持多设备同时接入、跨设备共享后端会话或原地换设备；稳定 session key 固定为 `livis:<agentId>`。
-- Hermes 必须使用专用 profile、专用工作区和只读工具集；Codex 必须使用 state directory 内的专用 `CODEX_HOME` 和 workspace。
+- Hermes 必须使用专用 profile、专用工作区和只读工具集；Codex 必须使用 state directory 内的专用 `CODEX_HOME`、API key 凭据和 workspace，OAuth/ChatGPT 与 Bedrock 账号不属于支持范围。
 - 不支持远程审批、附件、token stream、tool progress、管理命令和远程 `/update`。
 - 取消语义为 `best_effort`；无法证明工具线程退出时进入 `CancelUnknown` 并隔离 session。
 
@@ -37,6 +37,7 @@ flowchart LR
 - Hermes connector 只开放权限 `0600` 的 Unix socket，不监听 TCP。
 - `execution.backend` 固定为 Hermes/Codex/Claude 三选一；Claude 尚未实现并在 `doctor`/`serve` 失败关闭，不会回退到其他 backend。
 - Codex 由 daemon 通过 stdio app-server 直接管理；当前 JobStore schema v7 以数据库 trigger 强制 `jobs.target_backend` 不可变，在 v6 的账号、模型、安全配置与 thread-tail checkpoint 之上新增 append-only execution attempt 账本。`jobs/outbox` 仍是业务状态真源，`backend_sessions` 只保存可变的当前 session 与恢复锚点。
+- Codex 生产启动、idle recovery 与 dispatch 只接受 `account.type=apiKey`；每次 dispatch 都会在 `turn/start` 前重新回读账号并与内存/SQLite 锚点核对。空账号、ChatGPT/OAuth、Bedrock、未知账号类型或运行中认证模式漂移都不能创建、恢复或执行生产 thread。无账号零模型 smoke 是不进入生产 backend 的协议诊断例外。
 - 切换 backend 前必须先用原 backend 排空其 `Received/Acked/Dispatching/Running/Cancelling` 积压；`serve` 会在启动 backend 或 Relay 前拒绝异 backend 非终态 job，`doctor` 的 `execution_backend_backlog` 与 `status.backendBacklog/recentJobs[].latestAttempt` 提供本地观测。终态历史不会阻止切换，未完成的 outbox 投递仍独立恢复。
 - Codex 只在完整 turn deadline 内的 terminal `turn/completed` 后返回一个 agent final；超时先请求 interrupt，再按固定 grace 失败关闭。工具网络关闭、workspace 是唯一可写根，审批请求默认拒绝。
 - Codex app-server 使用 workspace 外的宿主 HOME/TMPDIR，agent 使用 workspace 内独立 HOME/TMPDIR；关闭时按独立 POSIX 进程组执行 `SIGTERM → SIGKILL → 收口确认`。
@@ -55,7 +56,7 @@ flowchart LR
 - Bun 1.3.14+；CI 与锁文件基线为 1.3.14。
 - uv 0.11+ 与 Python 3.11–3.13。
 - 使用 Hermes 时，本地 Hermes 版本须位于配置中的已审核范围。
-- 使用 Codex 时，Codex CLI 必须位于 `[0.145.0, 0.146.0)`，并为 daemon 专用 `CODEX_HOME` 单独登录。
+- 使用 Codex 时，Codex CLI 必须位于 `[0.145.0, 0.146.0)`，并通过标准输入为 daemon 专用 `CODEX_HOME` 单独写入 API key 登录凭据。
 
 ### 开发环境快速准备
 
@@ -85,13 +86,15 @@ Codex 0.145.0 的真实非临时、零模型 turn canary 已在 macOS 命中 wor
 凭据/宿主 HOME 读写拒绝、workspace 外同卷牺牲文件 hardlink 拒绝、command identity、
 系统 `nc -O` 原始 `connect` 的精确 `EPERM` 和审批关闭边界，并恢复同一零 turn thread。
 daemon 还会流式绑定 command 内容摘要与文件身份，并在启动、恢复和持久 session 间失败
-关闭。2026-07-23 早先的单 turn 例外 canary 取得一次 turn 提交及 provider
+关闭。2026-07-23 早先的 API-key 单 turn 例外 canary 取得一次 turn 提交及 provider
 `401 invalid_api_key` 拒绝证据，并暴露 0.145.0 legacy `thread/read` 把 failed tail
-投影成 completed 的兼容缺口。提交 `65f00c1` 上的后续全新单 turn canary 使用获授权的
-隔离本地 ChatGPT OAuth 副本，provider 仍以 structured `unauthorized` 拒绝；但修复已把
+投影成 completed 的兼容缺口。提交 `65f00c1` 上的后续全新单 turn canary 误选了本机非默认
+凭据副本；app-server 运行态将其识别为 `account_type=chatgpt`，不属于项目支持的 API-key
+路径。provider 仍以 structured `unauthorized` 拒绝，但修复已把
 job 原子收口为 `Failed`、`Pending` outbox、`reserved → accepted → failed`、active clear、
 `recovery_required=false` 和单条凭据 quarantine，没有 assistant、工具或 token-count 记录。
-这只验证失败结算修复，不是成功模型 turn。专用登录后的成功模型 turn、Linux/cgroup、资源配额与
+这只验证通用失败结算修复，不是 API-key 凭据 canary 或成功模型 turn；当前代码会在创建
+thread 前拒绝同类非 API-key 账号。专用 API key 的成功模型 turn、Linux/cgroup、资源配额与
 LiViS App 回显仍未验收，因此 Codex 仍是
 Draft/受控开发功能，不应宣称生产上线，完整门禁见
 [`docs/CODEX-APPSERVER.md`](docs/CODEX-APPSERVER.md)。

@@ -420,11 +420,11 @@ export function inspectCodexAccountResponse(value: unknown): CodexAccountInspect
   const account = requireRecord(response.account, "Codex 私有 CODEX_HOME account");
   const accountType = nonEmptyString(account.type, "Codex account.type");
   if (!["apiKey", "chatgpt", "amazonBedrock"].includes(accountType)) {
-    throw new Error(`Codex account.type 未经审核：${accountType}`);
+    throw new Error("Codex account.type 未经审核");
   }
   // requiresOpenaiAuth 描述当前 provider 是否依赖 OpenAI 认证，不描述登录是否缺失。
   // 官方协议明确允许 apiKey/chatgpt account 与 true，以及 null 与 false 的组合；
-  // 生产启动是否已配置账号只由 account 是否为对象裁决。
+  // 本解析器只识别协议形态，生产准入由下方精确 account.type=apiKey 门禁裁决。
   const normalizedEmail = accountType === "chatgpt" && typeof account.email === "string"
     ? account.email.trim().toLowerCase()
     : "";
@@ -439,7 +439,7 @@ export function inspectCodexAccountResponse(value: unknown): CodexAccountInspect
 }
 
 interface AuthenticatedCodexAccountInspection {
-  accountType: string;
+  accountType: "apiKey";
   accountSubjectSha256: string | null;
   identityStrength: "subject" | "type-only";
 }
@@ -448,6 +448,9 @@ function validateAccountResponse(value: unknown): AuthenticatedCodexAccountInspe
   const inspection = inspectCodexAccountResponse(value);
   if (inspection.accountType === null || inspection.identityStrength === null) {
     throw new Error("Codex 私有 CODEX_HOME account 必须是对象");
+  }
+  if (inspection.accountType !== "apiKey") {
+    throw new Error("Codex 私有 CODEX_HOME 只允许 API key account（account.type 必须为 apiKey）");
   }
   return {
     accountType: inspection.accountType,
@@ -1958,6 +1961,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
     if (!this.ready || !this.client || !this.layout || !this.threadId || !this._executionId) {
       return "not_sent";
     }
+    const client = this.client;
     if (
       this.activeAttempt !== null ||
       job.status !== "Dispatching" ||
@@ -1977,6 +1981,14 @@ export class CodexExecutionBackend implements ExecutionBackend {
       storedSession.activeTurnId !== null ||
       storedSession.recoveryRequired
     ) {
+      return "not_sent";
+    }
+    if (this.accountType !== "apiKey" || storedSession.accountType !== "apiKey") {
+      this.store.quarantineSession(
+        this.options.sessionKey,
+        "Codex turn/start 前 API key account policy 锚点漂移",
+      );
+      await this.disableBeforeSubmission("Codex API key account policy 锚点漂移");
       return "not_sent";
     }
 
@@ -2006,6 +2018,29 @@ export class CodexExecutionBackend implements ExecutionBackend {
     this.activeAttempt = attempt;
 
     try {
+      const currentAccount = validateAccountResponse(
+        await client.request("account/read", { refreshToken: false }),
+      );
+      if (
+        currentAccount.accountType !== this.accountType ||
+        currentAccount.accountType !== storedSession.accountType ||
+        currentAccount.accountSubjectSha256 !== storedSession.accountSubjectSha256 ||
+        currentAccount.identityStrength !== storedSession.accountIdentityStrength
+      ) {
+        throw new Error("Codex API key account policy 锚点漂移");
+      }
+    } catch {
+      attempt.turnReady.reject(new Error("Codex turn/start 前 API key account policy 回读失败"));
+      this.activeAttempt = null;
+      this.store.quarantineSession(
+        this.options.sessionKey,
+        "Codex turn/start 前 API key account policy 回读失败",
+      );
+      await this.disableBeforeSubmission("Codex API key account policy 回读失败");
+      return "not_sent";
+    }
+
+    try {
       await assertCodexRuntimeLayout(this.layout);
       await this.assertStoredThreadTailBeforeDispatch();
     } catch (error) {
@@ -2021,7 +2056,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
 
     if (
       this.activeAttempt !== attempt || attempt.terminal || this.disconnectPromise ||
-      !this.ready || !this.client
+      !this.ready || this.client !== client
     ) {
       attempt.turnReady.reject(new Error("Codex preflight 后 backend 已失效"));
       if (this.activeAttempt === attempt) this.activeAttempt = null;
@@ -2037,7 +2072,7 @@ export class CodexExecutionBackend implements ExecutionBackend {
 
     let response: unknown;
     try {
-      response = await this.client.turnStart({
+      response = await client.turnStart({
         threadId: this.threadId,
         input: [{ type: "text", text: job.text, text_elements: [] }],
         environments: codexLocalEnvironment(this.layout.workspace),
