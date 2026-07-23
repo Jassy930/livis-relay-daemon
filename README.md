@@ -122,6 +122,10 @@ state 按 fail-closed 保留，清理结论为 `CREDENTIAL_CLEANUP_BLOCKED`。Co
 Draft/受控开发功能，不应宣称生产上线；完整复验与证据保留流程见
 [`docs/CODEX-E2E-CANARY.md`](docs/CODEX-E2E-CANARY.md)。
 
+上述回执只完成纯文本功能链；真实 shell、工作区写入与 `bun test` 的完整编码态 canary
+尚未执行。只有按该文档第 5 节取得 rollout 工具事件、workspace 文件、测试结果、SQLite
+终态和 App 单 final 的一致回执后，才能把当前部署标记为“完整编码态已通过”。
+
 仓库提供 Relay LaunchAgent 模板、Hermes 双服务运行手册和 Codex 单服务边界，但安装、加载、
 启停与真实消息 canary 都是操作者在获授权环境中的显式步骤；除上述绑定精确提交的受控
 canary 外，合并文档或 `plutil -lint` 通过不代表用户服务已被修改，也不代表其他部署已完成

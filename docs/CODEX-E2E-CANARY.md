@@ -101,7 +101,66 @@ LIVIS_CODEX_E2E_OK_<UTC>_<16_HEX>
 若出现 `Interrupted`、`CancelUnknown`、active/recovery/quarantine、无法确认的进程组收口，
 或 App/数据库关联不一致，立即按 `FAIL_CLOSED` 保留整个 state；不得为了取得绿灯重跑。
 
-## 5. 收口与恢复
+## 5. 完整编码态工具 canary（待执行）
+
+第 4 节只验证纯文本 turn 和 durable result，不证明 Codex 实际获得 shell、修改文件或运行
+测试。启用完整编码态前，必须在全新 state directory 或已确认 idle、零 quarantine 的专用
+Codex session 中完成本节；未取得全部回执时继续标记为“纯文本功能 canary”，不得称为
+完整编码态。
+
+### 5.1 工具链前置读回
+
+发送消息前，由操作者从 `status` 记录脱敏 workspace 路径、thread checkpoint 和 backend
+状态。daemon 必须为 `running/ready`，active 为空，workspace 必须是 daemon 管理的唯一可写
+根。Codex 工具网络仍为关闭，审批策略仍为 `never`；不得为通过本 canary 临时加入额外
+writable root、启用网络或复用宿主项目目录。
+
+目标机器必须已经安装可由 Codex sandbox 执行的 Bun，但 canary 不得安装或更新工具链、
+下载依赖或访问 package registry。`command -v bun`、`bun --version` 任一失败都按
+`TOOLCHAIN_BLOCKED` 收口，不能退化成只写文件不运行测试。
+
+### 5.2 唯一编码请求
+
+每次生成新的 `<NONCE>`，只发送一次以下形状的消息：
+
+```text
+请完成一次本地完整编码验收，必须实际调用工具，不得只描述步骤，也不得访问网络或工作区外路径。
+1. 先运行 pwd、command -v bun 和 bun --version。
+2. 在当前工作区创建目录 coding-canary-<NONCE>。
+3. 在该目录创建 package.json、src/add.ts 和 tests/add.test.ts；实现并测试两个整数相加，至少覆盖正数、负数和零。
+4. 使用 bun test 运行测试。
+5. 只有测试通过后才回复一行：LIVIS_CODEX_CODING_OK_<NONCE> tests=<通过数> files=3
+若任何工具、写文件或测试失败，只回复一行：LIVIS_CODEX_CODING_FAILED_<NONCE>
+```
+
+消息发出后不得重发、人工补文件、在 workspace 中手动运行测试、切换 model/provider/key，
+也不得用另一条消息提示 Agent 修正。失败证据必须原样保留；需要修复后重验时使用全新 nonce，
+并明确记录为另一次 canary。
+
+### 5.3 三方验收
+
+完整通过必须同时满足：
+
+- SQLite 中 nonce 只命中一个 job；job 为 `Succeeded`、`run_generation=1`，attempt ledger
+  精确为 `reserved → accepted → succeeded`，outbox 为 `Delivered`；
+- rollout 至少出现一个真实 command execution/tool item，且实际包含工作区内文件创建和
+  `bun test`；approval、user-input request、unknown item 均为 0；
+- 所有 tool cwd 与 thread/runtime workspace 精确一致，没有额外 writable root，没有网络
+  命中，也没有访问宿主 HOME、CODEX_HOME、daemon state 或系统临时目录；
+- 操作者只读检查 `coding-canary-<NONCE>`：三个要求的文件均为普通文件且位于 workspace 内，
+  `package.json` 不含第三方依赖，源码与测试内容符合请求；
+- 操作者在同一 workspace 以已审核 Bun 再运行一次 `bun test`，全部测试通过；这次只读验收
+  是独立复核，不得发生安装、格式化或源码修改；
+- App 只显示一个 final 气泡，正文精确等于成功行；数据库结果正文哈希与该行一致；
+- terminal 后 backend checkpoint 增加 1，active 四字段清空，零 recovery、quarantine 和
+  backend backlog。
+
+模型声称“已运行”但 rollout 没有 tool item、只创建文件未运行测试、工具链不可见、审批被
+拒绝、网络被访问、App/数据库/文件系统任一方不一致，都必须裁决为 `FAIL_CLOSED`。成功目录
+作为编码态验收证据保留到部署回执完成；后续清理必须由操作者按精确 workspace 路径处理，
+不能让 Agent 自行删除证据。
+
+## 6. 收口与恢复
 
 只有 terminal、outbox `Delivered`、active 为空且人工回显确认完成后，才能优雅停止 canary。
 必须看到 `daemon 已停止`，确认 connector socket 不存在、daemon/app-server PID 已消失，且
@@ -121,11 +180,13 @@ LIVIS_CODEX_E2E_OK_<UTC>_<16_HEX>
   token。网络失败或非 2xx 时必须保留 token 和 state 以便重试，并在私有回执记录失败；
   不得手工删除后宣称撤销完成。
 
-## 6. 仍未证明的边界
+## 7. 仍未证明的边界
 
 - 单一 daemon provider operation 与 `retry=0` 不等于 custom endpoint 内部只收到一个
   Responses HTTP 请求；需要 endpoint 侧脱敏计数。
 - rollout 零工具只证明本轮实际没有工具 item，不证明请求 payload 完全不含工具 schema。
+- 第 5 节在取得真实回执前只是验收合同；文档存在不表示 Bun 工具链可见、模型一定调用工具，
+  或完整编码态已经通过。
 - 本轮只覆盖 macOS/Codex 0.145.0、固定 model/provider/profile 与未知 Relay build；Linux、
   未来 Codex、资源配额、长期重连、取消和在线 token refresh 必须独立验证。
 - App 回显是人工确认；没有字段级原始 Relay trace、公开截图或 S5 服务端规范。
