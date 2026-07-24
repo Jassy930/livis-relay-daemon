@@ -27,7 +27,7 @@ connector 已实现；Codex app-server backend 也已实现并取得受控 canar
 | --- | --- | --- | --- |
 | Hermes | daemon → UDS connector → 专用 Hermes Gateway | Hermes 专用 profile | 已实现；远程输入门禁与 canary 已落地 |
 | Codex | daemon → stdio JSON-RPC → `codex app-server` | `<stateDir>/backends/codex/home` 中由 Codex 管理的专用 API key | 已实现、实验性；不是用户日常 Codex 当前登录态 |
-| Claude | 尚无 transport | 尚未定义 | `contract-only` |
+| Claude | 尚无 transport | 尚未定义 | `contract-only`；`execution.backend=claude` 可被配置解析，但 `serve` 明确失败关闭 |
 
 当前 `execution.backend` 是 daemon 级三选一配置；切换需要停服、排空异 backend 非终态 job
 并重启。它不是“同一 daemon 在线同时连接三个后端、每次请求只切路由”的最终形态。
@@ -56,7 +56,7 @@ LiViS OAuth 与本地推理后端认证是两个独立安全域。backend adapte
 或 `SecretStore`，daemon 也不得把 LiViS token 交给本地后端。这里描述目标 adapter contract；
 现有 Codex 的私有 `CODEX_HOME` 是需要迁移的兼容路径，不得被文档隐藏。
 
-## 4. 强制认证边界
+## 4. 认证边界与当前门禁强度
 
 daemon 和 backend adapter 必须遵守以下规则：
 
@@ -68,11 +68,22 @@ daemon 和 backend adapter 必须遵守以下规则：
 6. 收到 `authentication-required` 时只映射为稳定错误 `backend_auth_unavailable`；认证必须由操作者在原生客户端完成。
 7. 后端切换不得删除、覆盖或迁移任何后端的现有认证状态。
 
-这些边界由 [`src/backend/contract.ts`](../src/backend/contract.ts)、[`tests/local_backend_contract.test.ts`](../tests/local_backend_contract.test.ts) 和 [`tests/auth_boundary.test.ts`](../tests/auth_boundary.test.ts) 共同约束。契约同时公开当前实现状态与认证集成状态，防止再次把 Codex 误写为 `contract-only`，或把私有 `CODEX_HOME` 误写成原生认证复用。
+当前代码通过静态声明和源码扫描建立第一层门禁：
+[`src/backend/contract.ts`](../src/backend/contract.ts) 公开实现状态、认证集成状态和无凭据的
+概念 payload，[`tests/local_backend_contract.test.ts`](../tests/local_backend_contract.test.ts)
+检查这些声明；[`tests/auth_boundary.test.ts`](../tests/auth_boundary.test.ts) 扫描
+`daemon.ts`、`connector/server.ts` 和 `src/backend(s)`，拒绝已知凭据路径、认证环境变量、
+Keychain 读取与登录命令字面量。
+
+这不是完整的运行时强制：`contract.ts` 尚未被生产执行路径导入，源码扫描也不覆盖
+`config.ts`、state 等所有数据路径，且不能识别 `process.env` 整体继承之类的间接泄漏。
+因此当前门禁只能捕获已枚举的显式越界；在各 adapter 增加专用运行时 guard、环境白名单和
+端到端负向测试前，其余边界仍依赖 code review 与实现纪律。不能把测试通过表述为 daemon
+已经在运行时强制了全部认证边界。
 
 ## 5. 后端中立调用契约
 
-目标 adapter 只暴露三类动作：
+当前 [`src/backend/contract.ts`](../src/backend/contract.ts) 用三类动作表达概念调用面：
 
 - `probe()`：返回实现名称、版本和标准化 readiness。
 - `invoke()`：接收 `jobId + leaseId + runGeneration + text + optional session ref`，返回纯文本 final 与本地 session ID。
@@ -80,13 +91,30 @@ daemon 和 backend adapter 必须遵守以下规则：
 
 调用 payload 不包含 credential、token、API key、环境变量、命令行或工作目录。二进制路径、固定参数、工作区和资源限制属于操作者审核的本地配置，不来自远端消息。
 
-当前一期 Hermes UDS WebSocket 协议继续运行，不在本阶段改变。后续 adapter 可以使用不同的本机 transport，但进入 daemon 前必须映射到相同的 job、lease、取消和唯一 final 语义。
+这里的 `invoke(): Promise<final>` 只是 payload/result 草案，不足以作为生产执行生命周期契约。
+生产 adapter 在进入 daemon 前必须映射到现有
+[`ExecutionBackend`](../src/backends/execution-backend.ts) 的以下语义：
+
+- dispatch/cancel 返回 `not_sent | submitted`；只有能够证明请求没有离开 daemon 时才允许
+  `not_sent`，其余错误一律按已提交或 ambiguous execution 隔离，不能自动重试；
+- 独立传递 accepted、唯一 final、failed、cancelled 和 disconnected 事件，不能用一次
+  Promise reject 抹平提交后断连；
+- provider 明确拒绝当前 session 凭据时携带 `sessionDisposition=credential_rejected`，使 daemon
+  原子提交失败结果、清理 attempt 并隔离 session；
+- event handler 只在对应持久化迁移完成后返回，后端 transport 才能 ACK 或释放内存映射。
+
+若未来仍保留 `invoke()` 外形，其稳定错误类型必须显式携带提交状态与 session disposition，
+adapter 还必须提供断连事件通道；在这些字段和映射测试落地前，`LocalBackendAdapter` 不能接入
+生产派发。当前一期 Hermes UDS WebSocket 协议继续运行，不在本阶段改变；后续 adapter 可以
+使用不同本机 transport，但必须保留上述 job、lease、提交可证明性、取消、隔离和唯一 final
+语义。
 
 ## 6. 路由与会话
 
 - 后端选择来自操作者批准的本地路由配置，不能由未受信任的消息正文隐式改变。
 - 同一个 LiViS session 默认固定一个本地后端和原生 session ID。
-- 切换后端默认新建原生 session；若要延续上下文，只能传递经过长度和内容限制的文本摘要。
+- 切换后端默认新建原生 session；若要延续上下文，必须由操作者对本次切换或固定路由显式授权，
+  才能传递经过长度和内容限制的文本摘要。摘要属于跨后端数据流，不能作为默认能力或静默 fallback。
 - 不复制 Codex、Claude 或 Hermes 的原生 session 文件，也不伪造其 session ID。
 - backend 断开、取消不确定或结果状态不明时，沿用现有 ambiguous execution 隔离，不自动换后端重跑。
 - 自动 fallback 必须单独设计和授权；认证不可用不能静默降级到另一个可能具有不同数据边界的后端。
@@ -95,7 +123,7 @@ daemon 和 backend adapter 必须遵守以下规则：
 
 ### 7.1 当前收口状态
 
-- 契约与离线认证边界已经完成：调用契约不含凭据字段，Codex 实现状态与认证集成状态分开，Claude 明确为 `contract-only`。
+- 认证所有权的静态声明与离线扫描基线已经完成：概念 payload 不含凭据字段，Codex 实现状态与认证集成状态分开，Claude 明确为 `contract-only`。生产 adapter 生命周期契约仍需补齐提交可证明性、断连与 session disposition，不能把声明层视为已完成接线。
 - 当前只有 `bun run src/index.ts ...` 和 package script，没有安装后可直接调用的稳定 `livis-relay` / `livis-relayd` bin 入口。
 - 当前 `main` 使用 `livis-relay-v1-access-only-r2`，本地 S2 门禁已闭合；最终组合 head 的真实 Relay access-only canary 仍是正式启用阻塞项。
 - 旧 `worktree-arch-refactor` 的多 connector/outbox pump 原型假设与当前 JobStore v7、ExecutionBackend 和单 backend 失败关闭边界不同，只能作为设计输入，不能直接 cherry-pick。旧 Hermes 0.18.2 / connector v2 / 远程 `/sethome` 路线同样不得进入当前基线。
@@ -117,10 +145,15 @@ daemon 和 backend adapter 必须遵守以下规则：
 
 目标是不复制凭据地复用用户已登录的 Codex，同时保留现有 app-server 执行与安全门禁。
 
+已知冲突：当前 Codex 隔离依赖重定向 `HOME`、`TMPDIR` 和 `CODEX_HOME`，而原生当前认证可能与
+用户真实 `HOME`/`CODEX_HOME` 强绑定。不能为了读到认证就直接让 daemon 子进程继承真实 HOME，
+因为这会同时暴露可写配置、session 和 rollout。阶段 B 必须找到受支持的认证与可写状态分离或
+attach 入口；若上游没有该边界，就需要重新设计 workspace/env 隔离并保持能力为 `unsupported`。
+
 工作包：
 
 1. 用固定 Codex 版本验证是否存在受支持的“认证由原生客户端持有、workspace/config/thread 仍可隔离”的 app-server 或本地服务入口；记录 Desktop、CLI 与 app-server 并发行为。
-2. 给 Codex adapter 增加显式认证模式，保留现有 `private-api-key` 兼容路径；新模式只能请求原生 runtime 执行，不能读取、复制、链接或导出默认 `~/.codex`、Keychain 或 `auth.json`。
+2. 给 Codex adapter 增加显式认证模式，保留现有 `private-api-key` 兼容路径；新模式只能请求原生 runtime 执行，不能读取、复制、链接或导出默认 `~/.codex`、Keychain 或 `auth.json`，也不能用继承整个真实 HOME 代替受支持的认证复用接口。
 3. readiness 只返回标准状态和稳定错误分类；账号、token、scope、cookie、原始 provider 错误不进入 daemon 状态、SQLite 或日志。
 4. 覆盖未认证、已认证、运行中注销/切换、并发 Desktop/CLI、超时、取消、进程退出、resume、daemon 重启和认证状态漂移。
 
@@ -134,8 +167,9 @@ daemon 和 backend adapter 必须遵守以下规则：
 
 1. 固定版本窗和 transport，定义 initialize/readiness、invoke、唯一 final、session ref、cancel、timeout 与进程收口语义。
 2. 只允许 Claude 原生进程访问其 Keychain/凭据；daemon 不执行登录、不接收 API key、不解析凭据文件。
-3. 将 Claude 事件映射到现有 job、lease、run generation、append-only attempt ledger 与 ambiguous execution 隔离，不伪装成 Codex JSON-RPC。
-4. 覆盖未登录、已登录、运行中注销、超时、取消、崩溃、迟到事件、resume 和版本漂移，再完成受控本机 canary。
+3. 为 Claude 子进程建立独立 runtime layout 和 spawn 环境白名单；禁止整体继承 daemon 的 `process.env`，显式清除 API key、OAuth token 和其他未审核凭据变量，只透传固定的非敏感 locale/terminal 与经审核路径。
+4. 将 Claude 事件映射到现有 job、lease、run generation、提交可证明性、append-only attempt ledger、credential-rejected session disposition 与 disconnect/ambiguous execution 隔离，不伪装成 Codex JSON-RPC。
+5. 覆盖未登录、已登录、运行中注销、环境变量污染、超时、取消、崩溃、迟到事件、resume 和版本漂移，再完成受控本机 canary。
 
 完成定义：transport、认证复用和 session 恢复分别有证据后，才将 `claude_execution` 从 `unsupported` 提升；任一缺失都不能因“命令能返回文本”而标为已实现。
 
