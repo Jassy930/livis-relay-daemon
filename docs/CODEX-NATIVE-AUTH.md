@@ -81,7 +81,27 @@ proxy initialize 尝试在 5 秒内未得到响应，没有创建 thread、调�
 - 离线开发只能连接测试拥有的 fake proxy/daemon，不得把真实 Desktop socket 作为自动化测试夹具；
 - 不兼容时不能自动回退到现有私有 API-key 后端；认证模式和目标端点都必须来自操作者显式配置。
 
-## 7. 下一实现门禁
+## 7. 离线执行生命周期原型
+
+第二个实现切片新增
+[`CodexNativeExecutionLifecycle`](../src/backends/codex/native-execution-lifecycle.ts)。它接收一个
+已经由上层建立的 proxy client，只负责把 turn 事件映射为 `ExecutionBackend` 既有语义；它不
+连接 socket、不做认证、不管理原生 daemon，也没有被 `daemon.ts` 或 `serve` 导入。
+
+[`codex_native_execution_lifecycle.test.ts`](../tests/codex_native_execution_lifecycle.test.ts) 只用
+测试拥有的 fake proxy 验证：
+
+- 只有 `turn/start` 可证明未写入时才返回 `not_sent`，已写入超时或未知错误返回 `submitted`
+  并进入 ambiguous disconnect；
+- `accepted` handler 完成后才允许交付 terminal，重复 terminal 只产生一个 final；
+- provider 明确拒绝认证时只输出稳定分类并携带 `credential_rejected`；
+- cancel、terminal timeout 和 proxy 意外退出都按现有 fencing/disconnect 语义收口；
+- lifecycle stop 只关闭测试 proxy，fake 原生 daemon 保持运行且零生命周期调用。
+
+该原型的 `status.productionReady` 固定为 `false`。它没有验证安全 attach、原生认证、thread
+创建/恢复、server config/sandbox 回读或 session checkpoint，不能单独构成生产 backend。
+
+## 8. 下一实现门禁
 
 在生产接线前还必须独立闭合：
 
@@ -89,8 +109,7 @@ proxy initialize 尝试在 5 秒内未得到响应，没有创建 thread、调�
    并得到 `ready` 探针；relay 不执行任何对齐、升级或重启动作；
 2. 证明共享原生 daemon 时，LiViS thread 能以逐 thread 的固定审批、sandbox、工具和网络策略
    隔离，不依赖或改写用户默认 config；
-3. 把 proxy transport 映射到 `ExecutionBackend` 的 `not_sent | submitted`、accepted、唯一 final、
-   credential-rejected、disconnect 与 ambiguous execution 语义；
-4. 用 fake 端点覆盖 transport 生命周期、运行中注销/切换、被动观察到的 daemon 重启、resume 和
-   旧事件 fencing；真实 Desktop/CLI 并发只能在另行授权的非生产 canary 中验证；
-5. 完成不复制凭据的受控本机 canary 后，才允许修改机器可读 capability 状态。
+3. 把已离线验证的 lifecycle 与安全 attach、持久 session/checkpoint 和 daemon handler 组合，
+   继续用 fake 端点覆盖运行中注销/切换、被动观察到的 daemon 重启、resume 和旧事件 fencing；
+4. 真实 Desktop/CLI 并发只能在另行授权的非生产 canary 中验证；完成不复制凭据且不影响 Desktop
+   的 canary 后，才允许修改机器可读 capability 状态。

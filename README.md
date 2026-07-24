@@ -153,6 +153,7 @@ canary 外，合并文档或 `plutil -lint` 通过不代表用户服务已被修
 - [本地协议探针](docs/PROTOCOL-PROBES.md)
 - [运行手册](docs/OPERATIONS.md)
 - [Codex app-server 执行后端](docs/CODEX-APPSERVER.md)
+- [Codex 原生认证只读探针与离线 lifecycle](docs/CODEX-NATIVE-AUTH.md)
 - [Codex LiViS 人在环 E2E canary](docs/CODEX-E2E-CANARY.md)
 - [机器可读能力契约](docs/CAPABILITIES.md)
 - [Hermes 实网 canary](docs/HERMES-CANARY.md)

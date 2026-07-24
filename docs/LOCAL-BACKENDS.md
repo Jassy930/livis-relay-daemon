@@ -162,12 +162,21 @@ daemon/app-server 版本与私有 Unix socket，并通过官方 proxy 只执行 
 因为这会同时暴露可写配置、session 和 rollout。阶段 B 必须找到受支持的认证与可写状态分离或
 attach 入口；若上游没有该边界，就需要重新设计 workspace/env 隔离并保持能力为 `unsupported`。
 
+第二个纯离线切片已经完成：
+[`CodexNativeExecutionLifecycle`](../src/backends/codex/native-execution-lifecycle.ts) 在不连接真实
+socket 的前提下，把预先建立的 proxy client 映射到 `not_sent | submitted`、accepted、唯一
+final、credential-rejected、cancel、timeout、disconnect 与 ambiguous execution 语义；对应
+[`fake proxy 测试`](../tests/codex_native_execution_lifecycle.test.ts) 还证明关闭 proxy 不会调用
+原生 daemon 生命周期。该类没有被生产入口导入，`productionReady` 固定为 `false`，不代表
+安全 attach、认证复用、thread sandbox 或 session checkpoint 已闭合。
+
 工作包：
 
-1. 先用 fake proxy 补齐 transport 生命周期与失败语义；等 Desktop/原生 daemon 自然进入审核窗口，
-   或操作者提供另一个不影响 Desktop 的兼容端点后，再验证官方 daemon/proxy 能否在认证由原生
-   daemon 持有时，为 LiViS thread 提供不依赖用户默认 config 的 workspace、权限、工具和网络
-   隔离。只读 transport/auth 探针已落地，真实 Desktop/CLI 并发仍未验证。
+1. fake proxy 的基础 turn 生命周期与失败语义已经闭合；下一步继续覆盖认证状态漂移、resume、
+   checkpoint 和旧事件 fencing。等 Desktop/原生 daemon 自然进入审核窗口，或操作者提供另一个
+   不影响 Desktop 的兼容端点后，再验证官方 daemon/proxy 能否在认证由原生 daemon 持有时，为
+   LiViS thread 提供不依赖用户默认 config 的 workspace、权限、工具和网络隔离。只读
+   transport/auth 探针已落地，真实 Desktop/CLI 并发仍未验证。
 2. 给 Codex adapter 增加显式认证模式，保留现有 `private-api-key` 兼容路径；新模式只能请求原生 runtime 执行，不能读取、复制、链接或导出默认 `~/.codex`、Keychain 或 `auth.json`，也不能用继承整个真实 HOME 代替受支持的认证复用接口。
 3. readiness 只返回标准状态和稳定错误分类；账号、token、scope、cookie、原始 provider 错误不进入 daemon 状态、SQLite 或日志。
 4. 用 fake 端点覆盖未认证、已认证、运行中注销/切换、超时、取消、proxy 退出、被动观察到的
