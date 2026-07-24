@@ -7,7 +7,7 @@ daemon，并使用本地当前状态执行。relay 不读取、判断、绑定�
 拦截，也不把其中任何一种识别成特殊认证状态。只要 transport 可连接且协议兼容，就直接调用；
 执行失败按普通 backend failed 结算，不自动重试、不 fallback，也不隔离账号。
 
-transport probe 已完成一次真实 fail-closed Gate 1；attach 后的 thread/turn/session 仍只有离线原型，
+transport probe 已完成真实版本观测与协议握手 Gate；attach 后的 thread/turn/session 仍只有离线原型，
 不会把 `codex_native_auth_reuse` 提升为已支持。
 
 ## 1. Transport-only 探针
@@ -41,9 +41,9 @@ runtime、不打开数据库，也不读取 SecretStore。显式模式使用仓�
 探针按以下顺序失败关闭：
 
 1. 解析并固定 Codex CLI 的 canonical 可执行文件及内容身份；
-2. 运行 `codex --version`，要求位于仓库审核窗口；
-3. 运行官方 `codex app-server daemon version`，要求 daemon 已运行、管理 CLI 版本一致，且运行中
-   app-server 位于同一审核窗口；
+2. 运行 `codex --version`，只要求返回有界、可记录的 semver；
+3. 运行官方 `codex app-server daemon version`，要求 daemon 已运行、report 与已固定管理 CLI 一致；
+   app-server 版本只作为观测和漂移证据，不与 CLI 做强制相等或版本窗裁决；
 4. 要求 daemon 报告的 socket 与操作者显式传入值完全一致；socket 必须是当前用户持有的
    `0600` Unix socket，直属父目录必须是同一用户持有的固定 `0700` 普通目录；
 5. 通过 `codex app-server proxy --sock ...` 完成 `initialize` / `initialized`；
@@ -69,7 +69,12 @@ initialize 必须证明原生 runtime 的 `codexHome` 位于 relay stateDir 之�
 | --- | --- | --- |
 | `ready` | CLI、socket、proxy 与 initialize transport 兼容 | 否 |
 | `offline` | daemon 未运行或 proxy 无法 initialize | 否 |
-| `incompatible` | CLI/app-server 版本、socket 身份或 initialize 不满足门禁 | 否 |
+| `incompatible` | 版本报告格式、socket 身份或 initialize 响应结构不满足门禁 | 否 |
+
+成功报告固定写明 `compatibilityBasis=protocol-handshake`，并用 `versionRelation=same|different`
+观测 CLI 与 app-server 是否同版。版本不同本身不改变 readiness；只有真实 proxy/initialize 结果
+裁决 transport 是否兼容。版本字符串仍必须是有界 semver，daemon report 仍必须与本次固定 CLI
+和显式 socket 自洽，这属于输入完整性，不是版本 allowlist。
 
 这里没有 `authentication-required`。本地 backend 即使处于未登录或 provider 错误状态，transport
 仍可为 `ready`；具体错误只有执行时由本地 backend 返回。relay 不提前判定。
@@ -77,24 +82,26 @@ initialize 必须证明原生 runtime 的 `codexHome` 位于 relay stateDir 之�
 报告只把 `native-daemon-transport` 列为已验证。server config 隔离、thread/turn 生命周期、session
 resume、真实执行状态和 Desktop/CLI 并发仍明确未验证。
 
-## 4. 2026-07-24 本机 Gate 1 观察
+## 4. 2026-07-24 本机协议优先 Gate 观察
 
-本轮获授权后先用官方只读 `daemon version` 建立前置基线，再用显式 command/stateDir 模式运行
-真实 probe。固定 CLI 为 `0.145.0`，运行中的原生 app-server 为 `0.144.1`，因此探针在启动 proxy
-前返回 `native_daemon_version_incompatible`，并明确报告 `startedNativeDaemon=false`、
-`sentModelTurn=false`、`productionReady=false`。
+最初的严格版本窗实现观察到固定 CLI `0.145.0` 与运行中的原生 app-server `0.144.1` 不同，因而
+在 proxy 前停止。随后按“版本只观测、协议握手裁决”重构：同一真实端点不再因版本差异短路，
+实际进入官方 proxy/initialize，最终因无法完成 initialize 返回 `native_proxy_unavailable` 与
+`readiness=offline`。这证明放宽的是版本判断，不是把失败端点强行标记为兼容。
 
-probe 后再次读取官方 daemon report 和精确原生 app-server 进程，版本、socket 与进程身份均未改变。
-本次没有 initialize、thread、turn、账号状态读取或 daemon 生命周期操作。它只证明真实 Gate 1
-失败关闭且未干扰 Desktop，不证明 transport initialize、并发或执行可用。
+probe 后再次读取官方 daemon report 和精确原生 app-server 进程，版本、socket 与 PID `72289` 均
+未改变；relay 自有 probe/proxy 已全部收口。本次尝试了 initialize，但没有创建 thread、发送 turn、
+读取账号状态或执行 daemon 生命周期操作。当前真实 transport 仍不是 `ready`，不能据此进入并发
+或执行 canary。
 
 relay 不会为了通过门禁而启动、停止、重启、替换或升级 Desktop 及其原生 daemon，也不会启用或
 关闭 remote control。
 
 ## 5. Desktop 不干扰不变量
 
-- relay 只能连接操作者显式配置、已经存在且通过版本与文件身份门禁的 socket；
-- 版本不兼容、端点离线或协议不兼容时保持失败关闭，不执行修复性生命周期操作；
+- relay 只能连接操作者显式配置、已经存在且通过 command/socket 文件身份门禁的 socket；
+- 版本只记录不裁决；端点离线、协议握手失败或响应结构不兼容时保持失败关闭，不执行修复性
+  生命周期操作；
 - relay 关闭的只能是自己启动的 proxy 子进程，不能向原生 daemon 发送停止、重启、升级、
   remote-control 切换或状态变更请求；
 - 离线测试只能连接测试拥有的 fake proxy/daemon，不得把真实 Desktop socket 作为夹具；
@@ -193,8 +200,8 @@ daemon report、socket pin 和 proxy，覆盖：
 
 离线 attach 与执行状态组合已经完成，下一阶段仍不引入账号处理：
 
-1. 当前真实 Gate 1 已在版本门禁前安全停止；在端点进入审核窗口或 `0.144.1` 获得独立兼容审计前，
-   不运行 initialize、并发、逐 thread 隔离或被动 daemon 重启 canary；
+1. 当前真实端点已经越过版本观测并进入 initialize，但返回 `native_proxy_unavailable`；在真实
+   initialize 变为 `ready` 前，不运行并发、逐 thread 隔离或被动 daemon 重启 canary；
 2. canary 必须使用操作者显式配置的现有 socket，不启动、停止、重启、升级或修改 Desktop daemon；
 3. 保持 coordinator/harness 不读取或持久化 account type、主体、登录状态、token、scope 或 provider
    认证分类；本地错误继续按普通 execution failed；

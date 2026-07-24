@@ -12,7 +12,6 @@ import {
 } from "./app-server-client.ts";
 import {
   runCodexCommand,
-  validateCodexVersion,
   type CodexCommandRunner,
 } from "./codex-execution-backend.ts";
 import {
@@ -20,16 +19,9 @@ import {
   type PinnedCodexCommand,
 } from "./runtime-layout.ts";
 import type { CodexNativeExecutionClient } from "./native-execution-lifecycle.ts";
-import {
-  parseSemverTriplet,
-  versionAtLeast,
-  versionLessThan,
-} from "../../util.ts";
-
 export type CodexNativeDaemonProbeErrorCode =
   | "native_daemon_not_running"
   | "native_daemon_report_incompatible"
-  | "native_daemon_version_incompatible"
   | "native_daemon_socket_mismatch"
   | "native_daemon_socket_insecure"
   | "native_proxy_unavailable"
@@ -52,6 +44,8 @@ export interface CodexNativeDaemonProbeReport {
   probeCompleted: true;
   readiness: "ready";
   transport: "app-server-daemon-proxy";
+  compatibilityBasis: "protocol-handshake";
+  versionRelation: "same" | "different";
   cliVersion: string;
   appServerVersion: string;
   startedNativeDaemon: false;
@@ -102,6 +96,8 @@ export interface CodexNativeAttachedClient extends CodexNativeExecutionClient {
 export interface CodexNativeDaemonAttachment {
   client: CodexNativeAttachedClient;
   transport: "app-server-daemon-proxy";
+  compatibilityBasis: "protocol-handshake";
+  versionRelation: "same" | "different";
   cliVersion: string;
   appServerVersion: string;
   startedNativeDaemon: false;
@@ -114,8 +110,6 @@ export interface CodexNativeDaemonProbeOptions {
   stateDir: string;
   cwd: string;
   sourceEnv?: NodeJS.ProcessEnv;
-  minimumVersion: string;
-  maximumExclusiveVersion: string;
   requestTimeoutMs: number;
   shutdownTimeoutMs: number;
   clientVersion: string;
@@ -146,6 +140,7 @@ export interface CodexNativeDaemonAttachDependencies {
 interface CodexNativeDaemonValidatedTarget {
   cliVersion: string;
   appServerVersion: string;
+  versionRelation: "same" | "different";
   socketPin: PinnedCodexNativeSocket;
 }
 
@@ -293,40 +288,40 @@ export async function assertPinnedCodexNativeDaemonSocket(
   }
 }
 
-function exactVersion(value: unknown, label: string): string {
-  if (typeof value !== "string") {
+const OBSERVED_SEMVER_PATTERN =
+  /^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/;
+
+/** 版本仅用于观测和漂移审计，不作为 native transport 兼容性判据。 */
+function observedVersion(value: unknown, label: string): string {
+  if (
+    typeof value !== "string" || value.length > 64 ||
+    !OBSERVED_SEMVER_PATTERN.test(value)
+  ) {
     throw new CodexNativeDaemonProbeError(
       "native_daemon_report_incompatible",
-      `${label} 必须是版本字符串`,
-    );
-  }
-  const parsed = parseSemverTriplet(value);
-  if (!parsed || parsed.join(".") !== value) {
-    throw new CodexNativeDaemonProbeError(
-      "native_daemon_report_incompatible",
-      `${label} 必须是精确 semver triplet`,
+      `${label} 必须是有界 semver 字符串`,
     );
   }
   return value;
 }
 
-function assertVersionWindow(
-  version: string,
-  minimumVersion: string,
-  maximumExclusiveVersion: string,
-): void {
-  const current = parseSemverTriplet(version);
-  const minimum = parseSemverTriplet(minimumVersion);
-  const maximum = parseSemverTriplet(maximumExclusiveVersion);
-  if (
-    !current || !minimum || !maximum ||
-    !versionAtLeast(current, minimum) || !versionLessThan(current, maximum)
-  ) {
+function observeCodexNativeCliVersion(
+  result: Awaited<ReturnType<CodexCommandRunner>>,
+): string {
+  if (result.exitCode !== 0) {
     throw new CodexNativeDaemonProbeError(
-      "native_daemon_version_incompatible",
-      `Codex native app-server 版本不在已审核窗口 [${minimumVersion}, ${maximumExclusiveVersion})`,
+      "native_daemon_report_incompatible",
+      `Codex native CLI 版本探针失败（exit ${result.exitCode}）`,
     );
   }
+  const match = result.stdout.trim().match(/^codex-cli\s+(\S+)$/);
+  if (!match) {
+    throw new CodexNativeDaemonProbeError(
+      "native_daemon_report_incompatible",
+      "Codex native CLI 版本输出格式不兼容",
+    );
+  }
+  return observedVersion(match[1], "Codex native CLI 版本");
 }
 
 export function parseCodexNativeDaemonVersionReport(
@@ -334,8 +329,6 @@ export function parseCodexNativeDaemonVersionReport(
   options: {
     cliVersion: string;
     socketPath: string;
-    minimumVersion: string;
-    maximumExclusiveVersion: string;
   },
 ): NativeDaemonVersionReport {
   if (result.exitCode !== 0 || result.stderr.trim() !== "") {
@@ -376,21 +369,16 @@ export function parseCodexNativeDaemonVersionReport(
       "Codex native daemon 报告的 socket 与操作者显式配置不一致",
     );
   }
-  const cliVersion = exactVersion(report.cliVersion, "Codex native daemon cliVersion");
+  const cliVersion = observedVersion(report.cliVersion, "Codex native daemon cliVersion");
   if (cliVersion !== options.cliVersion) {
     throw new CodexNativeDaemonProbeError(
-      "native_daemon_version_incompatible",
-      "Codex native daemon 管理 CLI 与已固定 CLI 版本不一致",
+      "native_daemon_report_incompatible",
+      "Codex native daemon report 与已固定管理 CLI 版本不一致",
     );
   }
-  const appServerVersion = exactVersion(
+  const appServerVersion = observedVersion(
     report.appServerVersion,
     "Codex native daemon appServerVersion",
-  );
-  assertVersionWindow(
-    appServerVersion,
-    options.minimumVersion,
-    options.maximumExclusiveVersion,
   );
   return { status: "running", socketPath, cliVersion, appServerVersion };
 }
@@ -433,7 +421,7 @@ async function validateCodexNativeDaemonTarget(
   const sourceEnv = options.sourceEnv ?? process.env;
 
   await commandPinAsserter(options.command);
-  const cliVersion = validateCodexVersion(await commandRunner(
+  const cliVersion = observeCodexNativeCliVersion(await commandRunner(
     [options.command.path, "--version"],
     {
       cwd: options.cwd,
@@ -452,8 +440,6 @@ async function validateCodexNativeDaemonTarget(
   ), {
     cliVersion,
     socketPath: options.socketPath,
-    minimumVersion: options.minimumVersion,
-    maximumExclusiveVersion: options.maximumExclusiveVersion,
   });
   await commandPinAsserter(options.command);
   const socketPin = await socketPinResolver(daemonVersion.socketPath);
@@ -467,6 +453,7 @@ async function validateCodexNativeDaemonTarget(
   return {
     cliVersion,
     appServerVersion: daemonVersion.appServerVersion,
+    versionRelation: cliVersion === daemonVersion.appServerVersion ? "same" : "different",
     socketPin,
   };
 }
@@ -574,6 +561,8 @@ export async function attachCodexNativeDaemon(
   return {
     client,
     transport: "app-server-daemon-proxy",
+    compatibilityBasis: "protocol-handshake",
+    versionRelation: target.versionRelation,
     cliVersion: target.cliVersion,
     appServerVersion: target.appServerVersion,
     startedNativeDaemon: false,
@@ -637,6 +626,8 @@ export async function probeCodexNativeDaemon(
     probeCompleted: true,
     readiness: "ready",
     transport: "app-server-daemon-proxy",
+    compatibilityBasis: "protocol-handshake",
+    versionRelation: target.versionRelation,
     cliVersion: target.cliVersion,
     appServerVersion: target.appServerVersion,
     startedNativeDaemon: false,

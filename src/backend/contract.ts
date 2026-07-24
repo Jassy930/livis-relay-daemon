@@ -39,6 +39,16 @@ export const LOCAL_BACKEND_AUTH_POLICY = {
   backendErrorsFlowThroughExecution: true,
 } as const;
 
+// 原生后端更新频繁；版本用于诊断和漂移审计，readiness 由实际能力/协议握手决定。
+// 若已证明某个精确版本存在不可安全兼容的行为，可在具体 adapter 增加带证据的定向拒绝，
+// 但不能用“版本不同”本身替代协议验证。
+export const LOCAL_BACKEND_COMPATIBILITY_POLICY = {
+  readinessBasis: "capability-probe",
+  versionsAreObservational: true,
+  rejectVersionDifferenceAlone: false,
+  targetedVersionDenialsRequireEvidence: true,
+} as const;
+
 export type LocalBackendReadiness =
   | "ready"
   | "offline"

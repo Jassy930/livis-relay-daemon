@@ -70,6 +70,9 @@ daemon 和 backend adapter 必须遵守以下规则：
 6. readiness 只描述 transport：`ready`、`offline` 或 `incompatible`。`ready` 不代表本地执行一定成功。
 7. 本地 backend 返回的错误按普通 failed 结算，不识别“认证不可用”，不据此阻止后续调用或隔离 session。
 8. 后端切换不得删除、覆盖或迁移任何后端的现有本地状态。
+9. 原生 adapter 记录 backend/transport 版本用于观测和漂移审计，但不能只因版本不同就判定不可用；
+   readiness 应由实际 capability/协议握手裁决。只有已经证明某个精确版本存在不可安全兼容的行为时，
+   才能增加带测试与证据的定向拒绝规则。
 
 当前代码通过静态声明和源码扫描建立第一层门禁：
 [`src/backend/contract.ts`](../src/backend/contract.ts) 公开实现状态、认证集成状态和无凭据的
@@ -149,19 +152,21 @@ adapter 还必须提供断连事件通道；在这些字段和映射测试落地
 目标是调用本机已经存在的 Codex runtime，同时让账号、登录方式、凭据和 provider 状态对 relay
 完全不透明。relay 不做“认证复用”逻辑；本地是什么状态就按什么状态调用。
 
-首个只读切片已实现：[`codex probe-native-daemon`](./CODEX-NATIVE-AUTH.md) 固定 CLI、核验原生
-daemon/app-server 版本与私有 Unix socket，并通过官方 proxy 只完成 initialize。它不读取账号状态，
+首个只读切片已实现：[`codex probe-native-daemon`](./CODEX-NATIVE-AUTH.md) 固定 CLI、观测原生
+daemon/app-server 版本并核验私有 Unix socket，通过官方 proxy 只完成 initialize。它不读取账号状态，
 不会启动或重启原生 daemon，也不会创建 thread；报告始终保持 `productionReady=false`。
 该 CLI 现在支持显式 `--command + --state-dir`，只做 Codex transport 检查时不加载 Relay/Hermes
 配置、SecretStore 或数据库。
 
-2026-07-24 获授权的真实 Gate 1 再次确认 CLI `0.145.0` 与 app-server `0.144.1` 不一致；独立 probe
-在启动 proxy 前返回 `native_daemon_version_incompatible`。前后官方 daemon report 与原生进程身份
-一致，没有 initialize、thread、turn 或生命周期操作。因此当前真实端点仍为 `incompatible`，不能
-进入并发执行 canary，也不能通过升级/重启 Desktop 或放宽未经审核的版本窗绕过。
+native transport 采用协议优先兼容策略：CLI 与 app-server 版本只要求是有界 semver 并写入报告，
+版本不同本身不阻断；socket 身份、proxy/initialize 和响应结构才裁决 readiness。2026-07-24 的真实
+`0.145.0 → 0.144.1` Gate 已按新策略越过版本观测并尝试 initialize，随后因 proxy 无法完成
+initialize 返回 `native_proxy_unavailable`/`offline`。前后 daemon report 与 PID `72289` 不变，
+relay 自有 proxy 已收口，没有 thread、turn、账号读取或生命周期操作。当前仍不能进入并发执行
+canary，但阻塞证据来自真实协议握手，不再来自静态版本窗。
 
 当前 Codex Desktop 及其原生 daemon 是用户拥有的外部系统。relay 只允许 attach 操作者显式配置、
-已经存在且版本兼容的 socket；不得启动、停止、重启、替换或升级 Desktop daemon，不得启用或关闭
+已经存在且通过协议握手的 socket；不得启动、停止、重启、替换或升级 Desktop daemon，不得启用或关闭
 remote control，也不得修改 `~/.codex`、默认配置或 Desktop session。不兼容时不能自动回退到
 私有 API-key 路径。自动化开发只能使用测试拥有的 fake 端点。
 
@@ -212,9 +217,9 @@ proxy，仍未连接真实 Desktop，也未进入生产入口。
 4. fake 端点已覆盖成功、普通 backend failed、超时、取消、proxy 退出、resume 和旧 epoch 迟到
    事件；daemon 被动重启、真实 Desktop/CLI 并发与逐 thread 不干扰只在另行授权的非生产 canary
    中验证。
-5. 当前真实 Gate 1 被 app-server `0.144.1` 与审核窗口 `[0.145.0, 0.146.0)` 的不兼容阻塞；本地
-   账号状态无论正确或错误都不是该阻塞的判定输入。只有端点自然进入已审核窗口，或先独立完成
-   `0.144.1` 协议/隔离审计并形成新的兼容证据，才能继续 initialize 与并发 canary。
+5. 当前真实 Gate 已证明版本差异不会短路，但 `0.145.0` proxy 尚不能与运行中的 `0.144.1`
+   app-server 完成 initialize；本地账号状态无论正确或错误都不是该阻塞的判定输入。只有 initialize
+   真实变为 `ready`，才能继续并发与执行 canary。
 
 完成定义：另行授权的非生产 canary 证明 daemon 未产生第二份后端凭据、未读取账号状态、未改变
 Codex Desktop 生命周期或状态、日常 Codex 仍可用、job/lease/checkpoint 全闭合，才考虑把
@@ -227,11 +232,13 @@ Codex Desktop 生命周期或状态、日常 Codex 仍可用、job/lease/checkpo
 
 工作包：
 
-1. 固定版本窗和 transport，定义 initialize/readiness、invoke、唯一 final、session ref、cancel、timeout 与进程收口语义。
+1. 固定 transport identity 并记录版本，通过 capability/协议握手定义 initialize/readiness、invoke、
+   唯一 final、session ref、cancel、timeout 与进程收口语义；不设置仅凭版本差异失败的静态窗口。
 2. Claude 本地状态对 daemon 完全不透明：不执行登录、不接收 API key、不解析凭据文件、不调用账号状态接口。
 3. 为 Claude 子进程建立独立 runtime layout 和 spawn 环境白名单；禁止整体继承 daemon 的 `process.env`，显式清除 API key、OAuth token 和其他未审核凭据变量，只透传固定的非敏感 locale/terminal 与经审核路径。
 4. 将 Claude 事件映射到现有 job、lease、run generation、提交可证明性、append-only attempt ledger 与 disconnect/ambiguous execution 隔离，不识别账号错误，也不伪装成 Codex JSON-RPC。
-5. 覆盖成功、普通 backend failed、环境变量污染、超时、取消、崩溃、迟到事件、resume 和版本漂移，再完成受控本机 canary。
+5. 覆盖成功、普通 backend failed、环境变量污染、超时、取消、崩溃、迟到事件、resume 和版本漂移；
+   版本漂移只有在 capability/协议行为实际不兼容时才失败，再完成受控本机 canary。
 
 完成定义：transport、状态不透明边界和 session 恢复分别有证据后，才将 `claude_execution` 从 `unsupported` 提升；任一缺失都不能因“命令能返回文本”而标为已实现。
 

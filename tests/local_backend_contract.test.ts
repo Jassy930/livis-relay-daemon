@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   LOCAL_BACKEND_AUTH_POLICY,
   LOCAL_BACKEND_AUTH_INTEGRATION,
+  LOCAL_BACKEND_COMPATIBILITY_POLICY,
   LOCAL_BACKEND_CONTRACT_VERSION,
   LOCAL_BACKEND_IMPLEMENTATION_STATE,
   TARGET_LOCAL_BACKENDS,
@@ -113,6 +114,15 @@ describe("本地后端中立契约", () => {
       daemonRefreshesCredentials: false,
       daemonBlocksInvocationOnAuthenticationState: false,
       backendErrorsFlowThroughExecution: true,
+    });
+  });
+
+  test("版本只用于观测，readiness 由 capability/协议握手裁决", () => {
+    expect(LOCAL_BACKEND_COMPATIBILITY_POLICY).toEqual({
+      readinessBasis: "capability-probe",
+      versionsAreObservational: true,
+      rejectVersionDifferenceAlone: false,
+      targetedVersionDenialsRequireEvidence: true,
     });
   });
 });

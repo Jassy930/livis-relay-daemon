@@ -181,6 +181,8 @@ export class CodexNativeSessionHarness {
       ready: this.ready,
       executionId: this.executionId,
       transport: this.attachment.transport,
+      compatibilityBasis: this.attachment.compatibilityBasis,
+      versionRelation: this.attachment.versionRelation,
       cliVersion: this.attachment.cliVersion,
       appServerVersion: this.attachment.appServerVersion,
       startedNativeDaemon: this.attachment.startedNativeDaemon,

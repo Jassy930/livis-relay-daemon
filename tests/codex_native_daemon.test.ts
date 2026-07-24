@@ -8,7 +8,6 @@ import {
   assertPinnedCodexNativeDaemonSocket,
   buildCodexNativeManagementEnvironment,
   buildCodexNativeProxyEnvironment,
-  CodexNativeDaemonProbeError,
   parseCodexNativeDaemonVersionReport,
   pinCodexNativeDaemonSocket,
   probeCodexNativeDaemon,
@@ -42,12 +41,12 @@ const SOCKET_PIN: PinnedCodexNativeSocket = {
   parent: { dev: 1, ino: 4, mode: 0o40700, nlink: 2, uid: 501, gid: 20 },
 };
 
-function commandRunnerFor(appServerVersion = "0.145.0") {
+function commandRunnerFor(appServerVersion = "0.145.0", cliVersion = "0.145.0") {
   const calls: Array<{ command: readonly string[]; env: Record<string, string> }> = [];
   const runner: CodexCommandRunner = async (command, options) => {
     calls.push({ command, env: options.env });
     if (command.length === 2 && command[1] === "--version") {
-      return { exitCode: 0, stdout: "codex-cli 0.145.0\n", stderr: "" };
+      return { exitCode: 0, stdout: `codex-cli ${cliVersion}\n`, stderr: "" };
     }
     return {
       exitCode: 0,
@@ -56,7 +55,7 @@ function commandRunnerFor(appServerVersion = "0.145.0") {
         managedCodexPath: "/opt/codex/bin/codex",
         managedCodexVersion: null,
         socketPath: SOCKET_PIN.path,
-        cliVersion: "0.145.0",
+        cliVersion,
         appServerVersion,
       })}\n`,
       stderr: "",
@@ -79,8 +78,6 @@ function probeOptions() {
       LIVIS_RELAY_CONFIG: "must-not-reach-child",
       UNRELATED_SECRET: "must-not-reach-child",
     },
-    minimumVersion: "0.145.0",
-    maximumExclusiveVersion: "0.146.0",
     requestTimeoutMs: 1_000,
     shutdownTimeoutMs: 1_000,
     clientVersion: "0.1.1",
@@ -100,12 +97,10 @@ describe("Codex 原生 daemon 只读兼容性探针", () => {
     });
   });
 
-  test("daemon version 必须运行中、socket 精确匹配且 app-server 位于审核窗口", () => {
+  test("daemon version 必须运行中、socket 精确匹配，版本只观测不裁决兼容性", () => {
     const base = {
       cliVersion: "0.145.0",
       socketPath: SOCKET_PIN.path,
-      minimumVersion: "0.145.0",
-      maximumExclusiveVersion: "0.146.0",
     };
     expect(parseCodexNativeDaemonVersionReport({
       exitCode: 0,
@@ -118,7 +113,7 @@ describe("Codex 原生 daemon 只读兼容性探针", () => {
       stderr: "",
     }, base)).toMatchObject({ appServerVersion: "0.145.0" });
 
-    expect(() => parseCodexNativeDaemonVersionReport({
+    expect(parseCodexNativeDaemonVersionReport({
       exitCode: 0,
       stdout: JSON.stringify({
         status: "running",
@@ -127,7 +122,27 @@ describe("Codex 原生 daemon 只读兼容性探针", () => {
         appServerVersion: "0.144.1",
       }),
       stderr: "",
-    }, base)).toThrow("不在已审核窗口");
+    }, base)).toMatchObject({ appServerVersion: "0.144.1" });
+    expect(parseCodexNativeDaemonVersionReport({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        status: "running",
+        socketPath: SOCKET_PIN.path,
+        cliVersion: "0.145.0",
+        appServerVersion: "0.146.0-alpha.3.1",
+      }),
+      stderr: "",
+    }, base)).toMatchObject({ appServerVersion: "0.146.0-alpha.3.1" });
+    expect(() => parseCodexNativeDaemonVersionReport({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        status: "running",
+        socketPath: SOCKET_PIN.path,
+        cliVersion: "0.145.0",
+        appServerVersion: "unknown",
+      }),
+      stderr: "",
+    }, base)).toThrow("有界 semver");
     expect(() => parseCodexNativeDaemonVersionReport({
       exitCode: 0,
       stdout: JSON.stringify({
@@ -195,6 +210,8 @@ describe("Codex 原生 daemon 只读兼容性探针", () => {
       probeCompleted: true,
       readiness: "ready",
       transport: "app-server-daemon-proxy",
+      compatibilityBasis: "protocol-handshake",
+      versionRelation: "same",
       cliVersion: "0.145.0",
       appServerVersion: "0.145.0",
       startedNativeDaemon: false,
@@ -226,30 +243,65 @@ describe("Codex 原生 daemon 只读兼容性探针", () => {
     });
   });
 
-  test("运行中 app-server 版本漂移时在连接 proxy 前失败关闭", async () => {
-    const { runner } = commandRunnerFor("0.144.1");
+  test("运行中 app-server 版本不同仍继续 proxy，并由 initialize 协议裁决", async () => {
+    const { runner } = commandRunnerFor("0.144.1", "0.146.0-alpha.3.1");
     let started = false;
-    let error: unknown;
-    try {
-      await probeCodexNativeDaemon(probeOptions(), {
-        commandRunner: runner,
-        commandPinAsserter: async () => undefined,
-        socketPinResolver: async () => SOCKET_PIN,
-        socketPinAsserter: async () => undefined,
-        clientStart: async () => {
-          started = true;
-          throw new Error("不得调用");
-        },
-      });
-    } catch (caught) {
-      error = caught;
-    }
-    expect(error).toBeInstanceOf(CodexNativeDaemonProbeError);
-    expect(error).toMatchObject({ code: "native_daemon_version_incompatible" });
-    expect(started).toBeFalse();
+    let closed = false;
+    const report = await probeCodexNativeDaemon(probeOptions(), {
+      commandRunner: runner,
+      commandPinAsserter: async () => undefined,
+      socketPinResolver: async () => SOCKET_PIN,
+      socketPinAsserter: async () => undefined,
+      clientStart: async () => {
+        started = true;
+        return {
+          initializeResult: {
+            codexHome: "/Users/test/.codex",
+            userAgent: "livis-relay-native-probe/0.1.1 (test)",
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+          close: async () => {
+            closed = true;
+          },
+        };
+      },
+    });
+    expect(report).toMatchObject({
+      readiness: "ready",
+      compatibilityBasis: "protocol-handshake",
+      versionRelation: "different",
+      cliVersion: "0.146.0-alpha.3.1",
+      appServerVersion: "0.144.1",
+    });
+    expect(started).toBeTrue();
+    expect(closed).toBeTrue();
   });
 
-  test("CLI 对运行中旧版 app-server 输出结构化 incompatible 且不连接 socket", async () => {
+  test("版本不同不会削弱 initialize 响应结构门禁，失败后仍关闭自有 proxy", async () => {
+    const { runner } = commandRunnerFor("0.144.1");
+    let closed = false;
+    await expect(probeCodexNativeDaemon(probeOptions(), {
+      commandRunner: runner,
+      commandPinAsserter: async () => undefined,
+      socketPinResolver: async () => SOCKET_PIN,
+      socketPinAsserter: async () => undefined,
+      clientStart: async () => ({
+        initializeResult: {
+          codexHome: probeOptions().stateDir,
+          userAgent: "livis-relay-native-probe/0.1.1 (test)",
+          platformFamily: "unix",
+          platformOs: "macos",
+        },
+        close: async () => {
+          closed = true;
+        },
+      }),
+    })).rejects.toMatchObject({ code: "native_initialize_incompatible" });
+    expect(closed).toBeTrue();
+  });
+
+  test("CLI 不因 app-server 版本不同短路，仍执行 socket 身份门禁", async () => {
     const state = await temporaryDirectory("livis-codex-native-cli-state-");
     const external = await temporaryDirectory("livis-codex-native-cli-command-");
     try {
@@ -308,7 +360,8 @@ describe("Codex 原生 daemon 只读兼容性探针", () => {
         ok: false,
         probeCompleted: false,
         readiness: "incompatible",
-        reasonCode: "native_daemon_version_incompatible",
+        compatibilityBasis: "protocol-handshake",
+        reasonCode: "native_daemon_socket_insecure",
         startedNativeDaemon: false,
         sentModelTurn: false,
         productionReady: false,
@@ -375,7 +428,8 @@ describe("Codex 原生 daemon 只读兼容性探针", () => {
         ok: false,
         probeCompleted: false,
         readiness: "incompatible",
-        reasonCode: "native_daemon_version_incompatible",
+        compatibilityBasis: "protocol-handshake",
+        reasonCode: "native_daemon_socket_insecure",
         startedNativeDaemon: false,
         sentModelTurn: false,
         productionReady: false,

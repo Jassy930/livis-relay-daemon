@@ -217,8 +217,6 @@ function harnessOptions(
         OPENAI_API_KEY: "must-not-reach-proxy",
         CLAUDE_CODE_OAUTH_TOKEN: "must-not-reach-proxy",
       },
-      minimumVersion: "0.145.0",
-      maximumExclusiveVersion: "0.146.0",
       requestTimeoutMs: 100,
       shutdownTimeoutMs: 100,
       clientVersion: "0.1.1",
@@ -392,6 +390,8 @@ describe("Codex native transport + coordinator 受控组合 harness", () => {
     expect(harness.status()).toMatchObject({
       ready: true,
       transport: "app-server-daemon-proxy",
+      compatibilityBasis: "protocol-handshake",
+      versionRelation: "same",
       startedNativeDaemon: false,
       notificationBinding: {
         bound: true,
