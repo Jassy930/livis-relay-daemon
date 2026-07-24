@@ -170,13 +170,25 @@ final、credential-rejected、cancel、timeout、disconnect 与 ambiguous execut
 原生 daemon 生命周期。该类没有被生产入口导入，`productionReady` 固定为 `false`，不代表
 安全 attach、认证复用、thread sandbox 或 session checkpoint 已闭合。
 
+第三个纯离线切片新增
+[`native thread policy`](../src/backends/codex/native-thread-policy.ts)：创建/恢复 thread 前先回读
+固定 permission profile 与全量 feature 快照，随后拒绝继承 instruction、开放网络、额外写根、
+profile 继承和 model/provider 漂移，关闭 memory，并为 fresh/resume 建立精确历史 checkpoint。
+[`离线测试`](../tests/codex_native_thread_policy.test.ts) 已覆盖安全漂移与创建/恢复 ambiguous
+quarantine。它仍未被生产入口导入，且不会使 capability 升级。
+
+这里存在一个明确的架构门槛：permission profile 与 feature 集合由原生 daemon 持有。relay
+不得通过修改用户默认配置、重启 Desktop daemon 或关闭用户 feature 来满足门禁；兼容端点必须
+原生提供不影响 Desktop 的逐客户端/逐 thread 隔离。若上游没有这一能力，原生认证复用保持
+`unsupported`，不能削弱门禁来换取接线。
+
 工作包：
 
-1. fake proxy 的基础 turn 生命周期与失败语义已经闭合；下一步继续覆盖认证状态漂移、resume、
-   checkpoint 和旧事件 fencing。等 Desktop/原生 daemon 自然进入审核窗口，或操作者提供另一个
-   不影响 Desktop 的兼容端点后，再验证官方 daemon/proxy 能否在认证由原生 daemon 持有时，为
-   LiViS thread 提供不依赖用户默认 config 的 workspace、权限、工具和网络隔离。只读
-   transport/auth 探针已落地，真实 Desktop/CLI 并发仍未验证。
+1. fake proxy 的基础 turn 生命周期、thread 安全回读和 fresh/resume checkpoint 已经闭合；
+   下一步继续覆盖认证状态漂移和旧事件 fencing。等 Desktop/原生 daemon 自然进入审核窗口，
+   或操作者提供另一个不影响 Desktop 的兼容端点后，再验证官方 daemon/proxy 能否在认证由原生
+   daemon 持有时，通过同一门禁提供不依赖用户默认 config 的 workspace、权限、工具和网络隔离。
+   只读 transport/auth 探针已落地，真实 Desktop/CLI 并发仍未验证。
 2. 给 Codex adapter 增加显式认证模式，保留现有 `private-api-key` 兼容路径；新模式只能请求原生 runtime 执行，不能读取、复制、链接或导出默认 `~/.codex`、Keychain 或 `auth.json`，也不能用继承整个真实 HOME 代替受支持的认证复用接口。
 3. readiness 只返回标准状态和稳定错误分类；账号、token、scope、cookie、原始 provider 错误不进入 daemon 状态、SQLite 或日志。
 4. 用 fake 端点覆盖未认证、已认证、运行中注销/切换、超时、取消、proxy 退出、被动观察到的

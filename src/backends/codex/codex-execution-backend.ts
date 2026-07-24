@@ -574,26 +574,36 @@ export interface CodexThreadBindingInspection {
   modelProvider: string;
 }
 
-export function inspectThreadResponse(
+export interface CodexThreadPolicyExpectation {
+  workspace: string;
+  expectedThreadId: string | null;
+  expectedModelProvider: string;
+  permissionProfile: string;
+}
+
+/** 私有 app-server 与 native proxy 共用的逐 thread 安全回读。 */
+export function inspectCodexThreadPolicyResponse(
   value: unknown,
-  layout: CodexRuntimeLayout,
-  expectedThreadId: string | null,
+  expectation: CodexThreadPolicyExpectation,
 ): CodexThreadBindingInspection {
   const response = requireRecord(value, "Codex thread response");
   const thread = requireRecord(response.thread, "Codex thread response.thread");
   const threadId = nonEmptyString(thread.id, "Codex thread.id");
-  if (expectedThreadId !== null && threadId !== expectedThreadId) {
+  if (expectation.expectedThreadId !== null && threadId !== expectation.expectedThreadId) {
     throw new Error("Codex thread/resume 返回了不同 threadId");
   }
-  if (response.cwd !== layout.workspace || thread.cwd !== layout.workspace) {
+  if (response.cwd !== expectation.workspace || thread.cwd !== expectation.workspace) {
     throw new Error("Codex thread cwd 回读未固定到 daemon workspace");
   }
   if (
     !Array.isArray(response.runtimeWorkspaceRoots) ||
     response.runtimeWorkspaceRoots.length !== 1 ||
-    response.runtimeWorkspaceRoots[0] !== layout.workspace
+    response.runtimeWorkspaceRoots[0] !== expectation.workspace
   ) {
     throw new Error("Codex runtimeWorkspaceRoots 回读与 daemon workspace 不一致");
+  }
+  if (!Array.isArray(response.instructionSources) || response.instructionSources.length !== 0) {
+    throw new Error("Codex thread 回读包含继承的 instruction source");
   }
   if (response.approvalPolicy !== "never") {
     throw new Error("Codex approvalPolicy 回读不是 never");
@@ -605,7 +615,7 @@ export function inspectThreadResponse(
     response.activePermissionProfile,
     "Codex activePermissionProfile",
   );
-  if (activeProfile.id !== CODEX_REMOTE_PERMISSION_PROFILE) {
+  if (activeProfile.id !== expectation.permissionProfile) {
     throw new Error("Codex active permission profile 回读不一致");
   }
   if (activeProfile.extends !== null) {
@@ -630,9 +640,9 @@ export function inspectThreadResponse(
     response.modelProvider,
     "Codex thread response.modelProvider",
   );
-  if (modelProvider !== layout.expectedModelProvider) {
+  if (modelProvider !== expectation.expectedModelProvider) {
     throw new Error(
-      `Codex thread 实际 provider ${modelProvider} 与固定 provider ${layout.expectedModelProvider} 不一致`,
+      `Codex thread 实际 provider ${modelProvider} 与固定 provider ${expectation.expectedModelProvider} 不一致`,
     );
   }
   return {
@@ -640,6 +650,19 @@ export function inspectThreadResponse(
     effectiveModel: nonEmptyString(response.model, "Codex thread response.model"),
     modelProvider,
   };
+}
+
+export function inspectThreadResponse(
+  value: unknown,
+  layout: CodexRuntimeLayout,
+  expectedThreadId: string | null,
+): CodexThreadBindingInspection {
+  return inspectCodexThreadPolicyResponse(value, {
+    workspace: layout.workspace,
+    expectedThreadId,
+    expectedModelProvider: layout.expectedModelProvider,
+    permissionProfile: CODEX_REMOTE_PERMISSION_PROFILE,
+  });
 }
 
 export function validateThreadResponse(

@@ -101,15 +101,38 @@ proxy initialize 尝试在 5 秒内未得到响应，没有创建 thread、调�
 该原型的 `status.productionReady` 固定为 `false`。它没有验证安全 attach、原生认证、thread
 创建/恢复、server config/sandbox 回读或 session checkpoint，不能单独构成生产 backend。
 
-## 8. 下一实现门禁
+## 8. 离线 thread 安全与 checkpoint 原型
+
+第三个切片新增
+[`prepareCodexNativeThread`](../src/backends/codex/native-thread-policy.ts)，继续只接收测试或上层
+已经建立的 client，不连接真实 socket，也没有进入 `serve`。它在 fake client 上按以下顺序
+失败关闭：
+
+1. 创建或恢复 thread 前，回读固定 `livis-remote` permission profile 和完整 feature 快照；
+2. 固定 workspace、runtime root、`approvalPolicy=never`、reviewer、model/provider；
+3. 拒绝继承的 instruction source、开放网络、额外 writable root、profile 继承或 sandbox 漂移；
+4. 显式设置 `thread/memoryMode=disabled`；
+5. fresh thread 必须是空历史，resume 必须与持久 thread/model/provider/checkpoint 精确一致；
+6. thread 请求可证明未写入才返回可重试分类，其余创建/恢复不确定性要求 quarantine。
+
+[`codex_native_thread_policy.test.ts`](../tests/codex_native_thread_policy.test.ts) 覆盖 fresh、resume、
+全局 feature/profile 不兼容、thread 安全漂移、提交不确定、memory 失败和 checkpoint 漂移。
+现有私有 app-server backend 也复用了“拒绝继承 instruction source”的同一回读函数。
+
+这一步同时确认了当前架构阻塞：permission profile 与 feature 集合由原生 daemon 提供。relay
+不能通过修改用户默认配置、重启 Desktop daemon 或关闭用户 feature 来制造安全前提。真实端点
+必须已经提供不影响 Desktop 的逐客户端/逐 thread 隔离，或由上游增加该能力；否则这里的离线
+原型不能接线，`codex_native_auth_reuse` 必须保持 `unsupported`。
+
+## 9. 下一实现门禁
 
 在生产接线前还必须独立闭合：
 
 1. 等待 Desktop/原生 daemon 自然进入同一审核窗口，或连接另一个不影响 Desktop 的兼容端点，
    并得到 `ready` 探针；relay 不执行任何对齐、升级或重启动作；
-2. 证明共享原生 daemon 时，LiViS thread 能以逐 thread 的固定审批、sandbox、工具和网络策略
-   隔离，不依赖或改写用户默认 config；
-3. 把已离线验证的 lifecycle 与安全 attach、持久 session/checkpoint 和 daemon handler 组合，
-   继续用 fake 端点覆盖运行中注销/切换、被动观察到的 daemon 重启、resume 和旧事件 fencing；
+2. 在不修改 Desktop 配置或生命周期的前提下，让兼容端点通过已离线实现的 permission、feature、
+   instruction、sandbox、memory 和 checkpoint 门禁；若做不到则记录为上游能力阻塞；
+3. 把已离线验证的 lifecycle/thread policy 与安全 attach、持久 session 和 daemon handler 组合，
+   继续用 fake 端点覆盖运行中注销/切换、被动观察到的 daemon 重启和旧事件 fencing；
 4. 真实 Desktop/CLI 并发只能在另行授权的非生产 canary 中验证；完成不复制凭据且不影响 Desktop
    的 canary 后，才允许修改机器可读 capability 状态。
