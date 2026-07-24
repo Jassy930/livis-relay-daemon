@@ -16,8 +16,8 @@ import type {
 import type { StoredJob } from "../../types.ts";
 
 /**
- * 只描述一个已经建立的 native proxy 连接；连接、版本、socket 和认证门禁仍由
- * native-daemon attach 层负责。本接口刻意不暴露登录或凭据方法。
+ * 只描述一个已经建立的 native app-server client；进程、版本、runtime 选择器和认证边界仍由
+ * native stdio transport 层负责。本接口刻意不暴露登录或凭据方法。
  */
 export interface CodexNativeExecutionClient {
   readonly running: boolean;
@@ -125,9 +125,9 @@ function isRelevantNotification(notification: CodexAppServerNotification): boole
 }
 
 /**
- * native daemon 执行路径的离线生命周期原型。
+ * native stdio 执行路径的离线生命周期原型。
  *
- * 它只把一个测试或上层已经安全 attach 的 proxy 连接映射成 ExecutionBackend 的提交、
+ * 它只把一个测试或上层已经安全 attach 的 app-server client 映射成 ExecutionBackend 的提交、
  * accepted、terminal、cancel 和 disconnect 语义；不负责连接真实 Desktop、不声明
  * server config/thread sandbox 已安全，也没有接入 `serve`。
  */
@@ -179,8 +179,8 @@ export class CodexNativeExecutionLifecycle {
     }
 
     void this.client.exited.then(
-      () => this.disconnectIfCurrent("Codex native proxy 意外退出"),
-      () => this.disconnectIfCurrent("Codex native proxy 退出状态不可读"),
+      () => this.disconnectIfCurrent("Codex native app-server 意外退出"),
+      () => this.disconnectIfCurrent("Codex native app-server 退出状态不可读"),
     ).catch(() => undefined);
   }
 
@@ -213,8 +213,8 @@ export class CodexNativeExecutionLifecycle {
       .then(() => this.processNotification(notification, clientEpoch))
       .catch((error: unknown) => this.disconnectIfCurrent(
         error instanceof Error
-          ? "Codex native proxy 返回未经审核的执行事件"
-          : "Codex native proxy 执行事件处理失败",
+          ? "Codex native app-server 返回未经审核的执行事件"
+          : "Codex native app-server 执行事件处理失败",
       ));
   }
 
@@ -255,7 +255,7 @@ export class CodexNativeExecutionLifecycle {
         attempt.accepted.resolve(false);
         if (this.activeAttempt === attempt) this.activeAttempt = null;
         if (error instanceof CodexAppServerRequestTransportError) {
-          await this.disconnectIfCurrent("Codex native proxy 在 turn/start 写入前断开");
+          await this.disconnectIfCurrent("Codex native app-server 在 turn/start 写入前断开");
         }
         return "not_sent";
       }

@@ -68,14 +68,12 @@ function job(jobId = "native-job-1"): StoredJob {
   };
 }
 
-class FakeNativeProxy {
+class FakeNativeAppServer {
   readonly messages: Array<Record<string, unknown>> = [];
   readonly spawn: CodexAppServerSpawn;
   readonly process: CodexAppServerProcess;
-  readonly proxyKillSignals: Array<number | NodeJS.Signals | undefined> = [];
+  readonly appServerKillSignals: Array<number | NodeJS.Signals | undefined> = [];
   spawnOptions: CodexAppServerSpawnOptions | null = null;
-  nativeDaemonRunning = true;
-  nativeDaemonStopCalls = 0;
   holdTurnStart = false;
   sendCompletedAfterStart = false;
   sendBackendFailureAfterStart = false;
@@ -116,8 +114,8 @@ class FakeNativeProxy {
       stderr: this.stderr.readable,
       exited: this.exit.promise,
       kill: (signal) => {
-        this.proxyKillSignals.push(signal);
-        void this.stopProxy(0);
+        this.appServerKillSignals.push(signal);
+        void this.stopAppServer(0);
       },
     };
     this.spawn = (_command, options) => {
@@ -130,7 +128,7 @@ class FakeNativeProxy {
     if (typeof message.id !== "number" || typeof message.method !== "string") return;
     if (message.method === "initialize") {
       await this.respond(message.id, {
-        userAgent: "fake-native-proxy/0.145.0",
+        userAgent: "fake-native-app-server/0.145.0",
         codexHome: "/Users/test/.codex",
         platformFamily: "unix",
         platformOs: "test",
@@ -200,11 +198,11 @@ class FakeNativeProxy {
     });
   }
 
-  async exitProxy(exitCode: number): Promise<void> {
-    await this.stopProxy(exitCode);
+  async exitAppServer(exitCode: number): Promise<void> {
+    await this.stopAppServer(exitCode);
   }
 
-  async stopProxy(exitCode: number): Promise<void> {
+  async stopAppServer(exitCode: number): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
     await Promise.allSettled([this.stdoutWriter.close(), this.stderrWriter.close()]);
@@ -221,7 +219,7 @@ class FakeNativeProxy {
 }
 
 interface Harness {
-  fake: FakeNativeProxy;
+  fake: FakeNativeAppServer;
   client: CodexNativeExecutionClient;
   clientEpochFence: CodexNativeClientEpochFence;
   clientEpochReceipt: CodexNativeClientEpochReceipt;
@@ -237,13 +235,13 @@ interface Harness {
 }
 
 async function createHarness(options: {
-  fake?: FakeNativeProxy;
+  fake?: FakeNativeAppServer;
   requestTimeoutMs?: number;
   turnTimeoutMs?: number;
   gateAccepted?: boolean;
   clientEpochFence?: CodexNativeClientEpochFence;
 } = {}): Promise<Harness> {
-  const fake = options.fake ?? new FakeNativeProxy();
+  const fake = options.fake ?? new FakeNativeAppServer();
   const events: string[] = [];
   const results: string[] = [];
   const failures: ExecutionFailedEvent[] = [];
@@ -279,7 +277,7 @@ async function createHarness(options: {
   let lifecycle: CodexNativeExecutionLifecycle | null = null;
   const pendingNotifications: CodexAppServerNotification[] = [];
   const client = await CodexAppServerClient.start({
-    command: ["/test/codex", "app-server", "proxy", "--sock", "/test/native.sock"],
+    command: ["/test/codex", "app-server", "--stdio"],
     cwd: "/test/native-workspace",
     env: { LANG: "zh_CN.UTF-8" },
     spawn: fake.spawn,
@@ -327,9 +325,9 @@ async function createHarness(options: {
   };
 }
 
-describe("Codex native proxy 离线执行生命周期", () => {
+describe("Codex native stdio 离线执行生命周期", () => {
   test("accepted 持久化完成后才交付唯一 final，重复 terminal 不会重复结算", async () => {
-    const fake = new FakeNativeProxy();
+    const fake = new FakeNativeAppServer();
     fake.sendCompletedAfterStart = true;
     const harness = await createHarness({ fake, gateAccepted: true });
     try {
@@ -357,7 +355,7 @@ describe("Codex native proxy 离线执行生命周期", () => {
   });
 
   test("turn/start 已写入后超时必须返回 submitted 并进入 ambiguous disconnect", async () => {
-    const fake = new FakeNativeProxy();
+    const fake = new FakeNativeAppServer();
     fake.holdTurnStart = true;
     const harness = await createHarness({ fake, requestTimeoutMs: 15 });
     try {
@@ -420,7 +418,7 @@ describe("Codex native proxy 离线执行生命周期", () => {
   });
 
   test("本地后端错误按普通 failed 结算，不识别账号状态或隔离 session", async () => {
-    const fake = new FakeNativeProxy();
+    const fake = new FakeNativeAppServer();
     fake.sendBackendFailureAfterStart = true;
     const harness = await createHarness({ fake });
     try {
@@ -444,7 +442,7 @@ describe("Codex native proxy 离线执行生命周期", () => {
   });
 
   test("权威 interrupted terminal 在本地 cancel 后只结算一次 cancelled", async () => {
-    const fake = new FakeNativeProxy();
+    const fake = new FakeNativeAppServer();
     fake.sendInterruptedAfterCancel = true;
     const harness = await createHarness({ fake });
     const current = job("cancelled");
@@ -475,22 +473,18 @@ describe("Codex native proxy 离线执行生命周期", () => {
     }
   });
 
-  test("proxy 退出或本地 stop 只关闭 relay attach，不管理原生 daemon", async () => {
+  test("app-server 退出或本地 stop 只关闭 Relay 自有进程", async () => {
     const first = await createHarness();
     try {
-      await first.fake.exitProxy(17);
-      await waitFor(() => first.disconnects.length === 1, "proxy exit disconnect");
-      expect(first.fake.nativeDaemonRunning).toBeTrue();
-      expect(first.fake.nativeDaemonStopCalls).toBe(0);
+      await first.fake.exitAppServer(17);
+      await waitFor(() => first.disconnects.length === 1, "app-server exit disconnect");
     } finally {
       await first.cleanup();
     }
 
     const second = await createHarness();
     await second.lifecycle.stop();
-    expect(second.fake.proxyKillSignals).toEqual(["SIGTERM"]);
-    expect(second.fake.nativeDaemonRunning).toBeTrue();
-    expect(second.fake.nativeDaemonStopCalls).toBe(0);
+    expect(second.fake.appServerKillSignals).toEqual(["SIGTERM"]);
     expect(second.disconnects).toEqual([]);
   });
 
@@ -499,7 +493,7 @@ describe("Codex native proxy 离线执行生命周期", () => {
     const old = await createHarness({ clientEpochFence, turnTimeoutMs: 25 });
     expect(await old.lifecycle.dispatch(job("old-epoch"))).toBe("submitted");
 
-    const currentFake = new FakeNativeProxy();
+    const currentFake = new FakeNativeAppServer();
     currentFake.sendCompletedAfterStart = true;
     const current = await createHarness({ fake: currentFake, clientEpochFence });
     try {
@@ -508,7 +502,7 @@ describe("Codex native proxy 离线执行生命周期", () => {
       expect(old.lifecycle.ready).toBeFalse();
 
       await old.fake.sendCompleted();
-      await old.fake.exitProxy(19);
+      await old.fake.exitAppServer(19);
       await Bun.sleep(35);
       expect(old.results).toEqual([]);
       expect(old.failures).toEqual([]);

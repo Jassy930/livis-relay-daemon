@@ -581,7 +581,7 @@ export interface CodexThreadPolicyExpectation {
   permissionProfile: string;
 }
 
-/** 私有 app-server 与 native proxy 共用的逐 thread 安全回读。 */
+/** 私有 app-server 与 native stdio client 共用的逐 thread 安全回读。 */
 export function inspectCodexThreadPolicyResponse(
   value: unknown,
   expectation: CodexThreadPolicyExpectation,

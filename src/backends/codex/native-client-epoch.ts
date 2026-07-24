@@ -9,9 +9,9 @@ interface ActiveClientEpoch {
 }
 
 /**
- * 只对 relay 自己的 proxy client 做进程内代际 fencing。
+ * 只对 Relay 自己的 stdio app-server client 做进程内代际 fencing。
  *
- * 本类不发 RPC、不读取本地账号或凭据状态，也不管理原生 daemon。daemon 重启后的持久 fencing
+ * 本类不发 RPC、不读取本地账号或凭据状态，也不连接 Desktop daemon。Relay 重启后的持久 fencing
  * 仍由 job lease、run generation、attempt ledger 与 thread checkpoint 负责。
  */
 export class CodexNativeClientEpochFence {

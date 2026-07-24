@@ -60,7 +60,7 @@ describe("本地后端中立契约", () => {
     });
     expect(LOCAL_BACKEND_AUTH_INTEGRATION).toEqual({
       hermes: "native-profile-owned",
-      codex: "daemon-private-native-store",
+      codex: "native-current-state-opaque",
       claude: "not-implemented",
     });
     expect(isLocalBackendKind("hermes")).toBeTrue();

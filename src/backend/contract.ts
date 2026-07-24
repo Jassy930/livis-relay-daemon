@@ -18,13 +18,15 @@ export const LOCAL_BACKEND_IMPLEMENTATION_STATE = {
 export type LocalBackendAuthenticationIntegration =
   | "native-profile-owned"
   | "daemon-private-native-store"
+  | "native-current-state-opaque"
   | "not-implemented";
 
-// 认证集成状态必须与实现状态分开：Codex transport 已实现，但仍使用 daemon
-// state directory 下的私有 CODEX_HOME，并未复用用户日常 Codex 登录态。
+// 认证集成状态必须与实现状态分开：Codex 的原生 stdio 实验路径只把 HOME/CODEX_HOME
+// 作为 runtime 选择器交给 Codex，本身不读取或解释用户当前认证状态。生产 serve 在真实执行
+// canary 完成前仍保持既有私有 backend，不由这个枚举宣称上线。
 export const LOCAL_BACKEND_AUTH_INTEGRATION = {
   hermes: "native-profile-owned",
-  codex: "daemon-private-native-store",
+  codex: "native-current-state-opaque",
   claude: "not-implemented",
 } as const satisfies Record<LocalBackendKind, LocalBackendAuthenticationIntegration>;
 

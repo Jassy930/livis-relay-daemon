@@ -76,7 +76,7 @@ async function closeClientAfterFailure(
   } catch (closeError) {
     throw new AggregateError(
       [primaryError, closeError],
-      "Codex native coordinator 失败后 proxy client 收口未确认",
+      "Codex native coordinator 失败后 app-server client 收口未确认",
     );
   }
   throw primaryError;
@@ -153,7 +153,7 @@ function sameReceiptMetadata(
 /**
  * 组合持久 session、client epoch、thread policy/checkpoint 与执行生命周期的离线原型。
  *
- * 本类只接收上层已经建立的 proxy client，不连接真实 Desktop、不管理原生 daemon，
+ * 本类只接收上层已经建立的 stdio app-server client，不连接真实 Desktop daemon，
  * 也不读取或分类本地 backend 状态。生产 serve 仍不得导入本文件。
  */
 export class CodexNativeSessionCoordinator {
@@ -312,7 +312,7 @@ export class CodexNativeSessionCoordinator {
       } catch (stopError) {
         throw new AggregateError(
           [error, stopError],
-          "Codex native ready handler 与 proxy client 收口同时失败",
+          "Codex native ready handler 与 app-server client 收口同时失败",
         );
       }
       throw error;

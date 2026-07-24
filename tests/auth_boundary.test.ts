@@ -55,7 +55,7 @@ describe("本地后端认证所有权边界", () => {
 
   test("native 当前状态路径不读取或分类账号状态", async () => {
     for (const path of [
-      "src/backends/codex/native-daemon.ts",
+      "src/backends/codex/native-stdio.ts",
       "src/backends/codex/native-client-epoch.ts",
       "src/backends/codex/native-execution-lifecycle.ts",
       "src/backends/codex/native-thread-policy.ts",

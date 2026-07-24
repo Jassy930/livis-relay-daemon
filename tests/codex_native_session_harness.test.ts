@@ -56,14 +56,14 @@ function featureSnapshot(): Array<Record<string, unknown>> {
   return [...features.values()];
 }
 
-class FakeAttachedProxyClient {
+class FakeAttachedStdioClient {
   readonly requests: Array<{ method: string; params: unknown }> = [];
   readonly turns: Array<{ id: string; status: "completed" | "failed" | "interrupted" }> = [];
   readonly exit = deferred<number>();
   readonly exited = this.exit.promise;
   initializeResult: unknown = {
     codexHome: "/Users/test/.codex",
-    userAgent: "livis-relay-native-attach/0.1.1 (fake)",
+    userAgent: "livis-relay-native-stdio-attach/0.145.0 (fake)",
     platformFamily: "unix",
     platformOs: "macos",
   };
@@ -71,8 +71,6 @@ class FakeAttachedProxyClient {
   running = true;
   closeCalls = 0;
   interruptCalls = 0;
-  nativeDaemonRunning = true;
-  nativeDaemonStopCalls = 0;
   failPreflight = false;
   failClose = false;
   nextTurn = 1;
@@ -127,7 +125,7 @@ class FakeAttachedProxyClient {
       this.interruptCalls += 1;
       return {} as T;
     }
-    throw new Error(`fake attached proxy 未覆盖 ${method}`);
+    throw new Error(`fake attached stdio client 未覆盖 ${method}`);
   }
 
   async emit(notification: CodexAppServerNotification): Promise<void> {
@@ -162,7 +160,7 @@ class FakeAttachedProxyClient {
     });
   }
 
-  exitProxy(code: number): void {
+  exitAppServer(code: number): void {
     if (!this.running) return;
     this.running = false;
     this.exit.resolve(code);
@@ -171,7 +169,7 @@ class FakeAttachedProxyClient {
   async close(): Promise<void> {
     if (!this.running) return;
     this.closeCalls += 1;
-    if (this.failClose) throw new Error("fake proxy close unconfirmed");
+    if (this.failClose) throw new Error("fake stdio close unconfirmed");
     this.running = false;
     this.exit.resolve(0);
   }
@@ -192,13 +190,6 @@ const COMMAND_PIN = {
   identitySha256: "b".repeat(64),
 } as const;
 
-const SOCKET_PIN = {
-  path: "/Users/test/.codex/app-server-control/app-server-control.sock",
-  parentPath: "/Users/test/.codex/app-server-control",
-  socket: { dev: 1, ino: 3, mode: 0o140600, nlink: 1, uid: 501, gid: 20 },
-  parent: { dev: 1, ino: 4, mode: 0o40700, nlink: 2, uid: 501, gid: 20 },
-} as const;
-
 function harnessOptions(
   sessionKey = "livis:native-harness",
   sessionHash = "a".repeat(64),
@@ -207,15 +198,13 @@ function harnessOptions(
   return {
     transport: {
       command: COMMAND_PIN,
-      socketPath: SOCKET_PIN.path,
       stateDir: "/private/livis-state",
       cwd: "/test/native-workspace",
       sourceEnv: {
         HOME: "/Users/test",
         CODEX_HOME: "/Users/test/.codex",
         LANG: "zh_CN.UTF-8",
-        OPENAI_API_KEY: "must-not-reach-proxy",
-        CLAUDE_CODE_OAUTH_TOKEN: "must-not-reach-proxy",
+        UNLISTED_SECRET: "must-not-reach-app-server",
       },
       requestTimeoutMs: 100,
       shutdownTimeoutMs: 100,
@@ -236,25 +225,12 @@ function harnessOptions(
 }
 
 function attachDependencies(
-  fake: FakeAttachedProxyClient,
+  fake: FakeAttachedStdioClient,
   observedOptions: CodexAppServerClientOptions[] = [],
 ) {
   return {
-    commandRunner: async (command: readonly string[]) => command[1] === "--version"
-      ? { exitCode: 0, stdout: "codex-cli 0.145.0\n", stderr: "" }
-      : {
-          exitCode: 0,
-          stdout: `${JSON.stringify({
-            status: "running",
-            socketPath: SOCKET_PIN.path,
-            cliVersion: "0.145.0",
-            appServerVersion: "0.145.0",
-          })}\n`,
-          stderr: "",
-        },
+    commandRunner: async () => ({ exitCode: 0, stdout: "codex-cli 0.145.0\n", stderr: "" }),
     commandPinAsserter: async () => undefined,
-    socketPinResolver: async () => SOCKET_PIN,
-    socketPinAsserter: async () => undefined,
     clientStart: async (options: CodexAppServerClientOptions) => {
       observedOptions.push(options);
       fake.notificationHandler = options.onNotification;
@@ -371,12 +347,12 @@ afterEach(async () => {
   await Promise.allSettled(cleanups.splice(0).map((cleanup) => cleanup()));
 });
 
-describe("Codex native transport + coordinator 受控组合 harness", () => {
+describe("Codex native stdio + coordinator 受控组合 harness", () => {
   test("initialize 后 notification 固定绑定 coordinator epoch，成功执行仍不透传凭据环境", async () => {
     const directory = await temporaryDirectory("livis-native-harness-success-");
     cleanups.push(directory.cleanup);
     const store = new JobStore(join(directory.path, "relay.db"), "scope-native-harness");
-    const fake = new FakeAttachedProxyClient("native-thread-success");
+    const fake = new FakeAttachedStdioClient("native-thread-success");
     const observedClientOptions: CodexAppServerClientOptions[] = [];
     const observed: HandlerObservations = { ready: 0, disconnectReasons: [] };
     const options = harnessOptions();
@@ -389,10 +365,11 @@ describe("Codex native transport + coordinator 受控组合 harness", () => {
 
     expect(harness.status()).toMatchObject({
       ready: true,
-      transport: "app-server-daemon-proxy",
+      transport: "app-server-stdio",
       compatibilityBasis: "protocol-handshake",
       versionRelation: "same",
-      startedNativeDaemon: false,
+      ownsAppServerProcess: true,
+      touchedDesktopDaemon: false,
       notificationBinding: {
         bound: true,
         clientEpoch: 1,
@@ -401,7 +378,11 @@ describe("Codex native transport + coordinator 受控组合 harness", () => {
       productionReady: false,
     });
     expect(observed.ready).toBe(1);
-    expect(observedClientOptions[0]?.env).toEqual({ LANG: "zh_CN.UTF-8" });
+    expect(observedClientOptions[0]?.env).toEqual({
+      HOME: "/Users/test",
+      CODEX_HOME: "/Users/test/.codex",
+      LANG: "zh_CN.UTF-8",
+    });
     expect(JSON.stringify(observedClientOptions[0]?.env)).not.toContain("API_KEY");
     expect(JSON.stringify(observedClientOptions[0]?.env)).not.toContain("OAUTH_TOKEN");
 
@@ -419,16 +400,14 @@ describe("Codex native transport + coordinator 受控组合 harness", () => {
 
     await harness.stop();
     expect(fake.closeCalls).toBe(1);
-    expect(fake.nativeDaemonRunning).toBeTrue();
-    expect(fake.nativeDaemonStopCalls).toBe(0);
     store.close();
   });
 
-  test("attach 校验失败与 coordinator preflight 失败都确认关闭已取得所有权的 proxy", async () => {
+  test("attach 校验失败与 coordinator preflight 失败都确认关闭自有 stdio app-server", async () => {
     const firstDirectory = await temporaryDirectory("livis-native-harness-attach-fail-");
     cleanups.push(firstDirectory.cleanup);
     const firstStore = new JobStore(join(firstDirectory.path, "relay.db"), "scope-attach-fail");
-    const invalid = new FakeAttachedProxyClient("native-thread-invalid");
+    const invalid = new FakeAttachedStdioClient("native-thread-invalid");
     invalid.initializeResult = { codexHome: "/private/livis-state/nested" };
     await expect(CodexNativeSessionHarness.start(harnessOptions(), {
       store: firstStore,
@@ -437,9 +416,8 @@ describe("Codex native transport + coordinator 受控组合 harness", () => {
       attachDependencies: attachDependencies(invalid),
     })).rejects.toMatchObject({ code: "native_initialize_incompatible" });
     expect(invalid.closeCalls).toBe(1);
-    expect(invalid.nativeDaemonStopCalls).toBe(0);
 
-    const unconfirmed = new FakeAttachedProxyClient("native-thread-unconfirmed");
+    const unconfirmed = new FakeAttachedStdioClient("native-thread-unconfirmed");
     await expect(CodexNativeSessionHarness.start(harnessOptions(), {
       store: firstStore,
       handlers: handlers(firstStore, { ready: 0, disconnectReasons: [] }),
@@ -453,13 +431,13 @@ describe("Codex native transport + coordinator 受控组合 harness", () => {
           );
         },
       },
-    })).rejects.toMatchObject({ code: "native_proxy_close_unconfirmed" });
+    })).rejects.toMatchObject({ code: "native_app_server_close_unconfirmed" });
     firstStore.close();
 
     const secondDirectory = await temporaryDirectory("livis-native-harness-start-fail-");
     cleanups.push(secondDirectory.cleanup);
     const secondStore = new JobStore(join(secondDirectory.path, "relay.db"), "scope-start-fail");
-    const incompatible = new FakeAttachedProxyClient("native-thread-preflight");
+    const incompatible = new FakeAttachedStdioClient("native-thread-preflight");
     incompatible.failPreflight = true;
     await expect(CodexNativeSessionHarness.start(harnessOptions(), {
       store: secondStore,
@@ -468,16 +446,15 @@ describe("Codex native transport + coordinator 受控组合 harness", () => {
       attachDependencies: attachDependencies(incompatible),
     })).rejects.toMatchObject({ code: "native_thread_preflight_incompatible" });
     expect(incompatible.closeCalls).toBe(1);
-    expect(incompatible.nativeDaemonStopCalls).toBe(0);
     secondStore.close();
   });
 
-  test("active attempt 的 proxy exit 与 terminal timeout 都进入持久 recovery/quarantine", async () => {
+  test("active attempt 的 app-server exit 与 terminal timeout 都进入持久 recovery/quarantine", async () => {
     for (const mode of ["exit", "timeout"] as const) {
       const directory = await temporaryDirectory(`livis-native-harness-${mode}-`);
       cleanups.push(directory.cleanup);
       const store = new JobStore(join(directory.path, "relay.db"), `scope-${mode}`);
-      const fake = new FakeAttachedProxyClient(`native-thread-${mode}`);
+      const fake = new FakeAttachedStdioClient(`native-thread-${mode}`);
       const observed: HandlerObservations = { ready: 0, disconnectReasons: [] };
       const options = harnessOptions(
         `livis:native-${mode}`,
@@ -492,7 +469,7 @@ describe("Codex native transport + coordinator 受控组合 harness", () => {
       });
       const job = claim(store, harness, options.session.sessionKey, `active-${mode}`);
       expect(await harness.dispatch(job)).toBe("submitted");
-      if (mode === "exit") fake.exitProxy(17);
+      if (mode === "exit") fake.exitAppServer(17);
       await waitFor(() => store.require(job.jobId).status === "Interrupted", `${mode} recovery`);
 
       expect(store.getBackendSession("codex", options.session.sessionKey)).toMatchObject({
@@ -502,17 +479,16 @@ describe("Codex native transport + coordinator 受控组合 harness", () => {
       expect(store.getSessionQuarantine(options.session.sessionKey)).not.toBeNull();
       expect(observed.disconnectReasons).toHaveLength(1);
       expect(fake.interruptCalls).toBe(mode === "timeout" ? 1 : 0);
-      expect(fake.nativeDaemonStopCalls).toBe(0);
       await harness.stop();
       store.close();
     }
   });
 
-  test("idle proxy 断开只降低 transport readiness，不错误隔离 session", async () => {
+  test("idle app-server 断开只降低 transport readiness，不错误隔离 session", async () => {
     const directory = await temporaryDirectory("livis-native-harness-idle-exit-");
     cleanups.push(directory.cleanup);
     const store = new JobStore(join(directory.path, "relay.db"), "scope-idle-exit");
-    const fake = new FakeAttachedProxyClient("native-thread-idle");
+    const fake = new FakeAttachedStdioClient("native-thread-idle");
     const observed: HandlerObservations = { ready: 0, disconnectReasons: [] };
     const options = harnessOptions("livis:native-idle", "d".repeat(64));
     const harness = await CodexNativeSessionHarness.start(options, {
@@ -522,7 +498,7 @@ describe("Codex native transport + coordinator 受控组合 harness", () => {
       attachDependencies: attachDependencies(fake),
     });
 
-    fake.exitProxy(23);
+    fake.exitAppServer(23);
     await waitFor(() => observed.disconnectReasons.length === 1, "idle disconnect");
     expect(harness.ready).toBeFalse();
     expect(store.getBackendSession("codex", options.session.sessionKey)).toMatchObject({
@@ -530,13 +506,11 @@ describe("Codex native transport + coordinator 受控组合 harness", () => {
       recoveryRequired: false,
     });
     expect(store.getSessionQuarantine(options.session.sessionKey)).toBeNull();
-    expect(fake.nativeDaemonRunning).toBeTrue();
-    expect(fake.nativeDaemonStopCalls).toBe(0);
     await harness.stop();
     store.close();
   });
 
-  test("旧 proxy 的 exit、超时和迟到 notification 不影响新 epoch", async () => {
+  test("旧 app-server 的 exit、超时和迟到 notification 不影响新 epoch", async () => {
     const oldDirectory = await temporaryDirectory("livis-native-harness-old-epoch-");
     const currentDirectory = await temporaryDirectory("livis-native-harness-current-epoch-");
     cleanups.push(oldDirectory.cleanup, currentDirectory.cleanup);
@@ -548,7 +522,7 @@ describe("Codex native transport + coordinator 受控组合 harness", () => {
     const fence = new CodexNativeClientEpochFence();
 
     const oldOptions = harnessOptions("livis:native-old", "e".repeat(64), { turnTimeoutMs: 30 });
-    const oldFake = new FakeAttachedProxyClient("native-thread-old");
+    const oldFake = new FakeAttachedStdioClient("native-thread-old");
     const oldObserved: HandlerObservations = { ready: 0, disconnectReasons: [] };
     const old = await CodexNativeSessionHarness.start(oldOptions, {
       store: oldStore,
@@ -560,7 +534,7 @@ describe("Codex native transport + coordinator 受控组合 harness", () => {
     expect(await old.dispatch(oldJob)).toBe("submitted");
 
     const currentOptions = harnessOptions("livis:native-current", "f".repeat(64));
-    const currentFake = new FakeAttachedProxyClient("native-thread-current");
+    const currentFake = new FakeAttachedStdioClient("native-thread-current");
     const currentObserved: HandlerObservations = { ready: 0, disconnectReasons: [] };
     const current = await CodexNativeSessionHarness.start(currentOptions, {
       store: currentStore,
@@ -573,7 +547,7 @@ describe("Codex native transport + coordinator 受控组合 harness", () => {
     expect(old.ready).toBeFalse();
 
     await oldFake.complete("native-turn-1", "不得结算的旧 final");
-    oldFake.exitProxy(19);
+    oldFake.exitAppServer(19);
     await Bun.sleep(45);
     expect(oldStore.require(oldJob.jobId).status).toBe("Running");
     expect(oldObserved.disconnectReasons).toEqual([]);
@@ -595,8 +569,6 @@ describe("Codex native transport + coordinator 受控组合 harness", () => {
 
     await old.stop();
     await current.stop();
-    expect(oldFake.nativeDaemonStopCalls).toBe(0);
-    expect(currentFake.nativeDaemonStopCalls).toBe(0);
     oldStore.close();
     currentStore.close();
   });

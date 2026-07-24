@@ -104,8 +104,8 @@
       "direction": "local",
       "status": "unsupported",
       "evidenceRefs": ["docs/LOCAL-BACKENDS.md", "docs/CODEX-NATIVE-AUTH.md"],
-      "testRefs": ["tests/auth_boundary.test.ts", "tests/local_backend_contract.test.ts", "tests/codex_native_daemon.test.ts", "tests/codex_native_client_epoch.test.ts", "tests/codex_native_execution_lifecycle.test.ts", "tests/codex_native_thread_policy.test.ts", "tests/codex_native_session_coordinator.test.ts", "tests/codex_native_session_harness.test.ts"],
-      "notes": "已实现不启动 daemon、不读取账号状态的独立 transport-only native 探针，以及仅对 fake daemon/socket/proxy 验证的安全 attach、client epoch fencing、执行 lifecycle、thread policy/checkpoint、持久 session coordinator 与受控组合 harness；本地账号与凭据状态对 relay 完全不透明。native transport 以真实协议握手而非静态版本窗裁决兼容性，版本仅观测。2026-07-24 的 CLI 0.145.0 → app-server 0.144.1 真实 Gate 已进入 proxy/initialize，因 initialize 未完成返回 offline，前后原生 daemon 未改变且 relay 自有 proxy 已收口。原型未接入 serve，真实 initialize ready、daemon 被动重启、并发和 Desktop 不干扰仍未闭合，因此保持 unsupported。"
+      "testRefs": ["tests/auth_boundary.test.ts", "tests/local_backend_contract.test.ts", "tests/codex_native_stdio.test.ts", "tests/codex_native_client_epoch.test.ts", "tests/codex_native_execution_lifecycle.test.ts", "tests/codex_native_thread_policy.test.ts", "tests/codex_native_session_coordinator.test.ts", "tests/codex_native_session_harness.test.ts"],
+      "notes": "原生当前状态主路径已改为 Relay 自管的 codex app-server --stdio 子进程：只透传 HOME/CODEX_HOME 等 runtime 选择器，不读取、复制、分类或刷新账号凭据，也不连接 Desktop control socket。2026-07-24 真实 transport-only Gate 已在 CLI/app-server 0.145.0 完成 initialize 并确认自有进程收口；前后 Desktop app-server 仍为 PID 72289 / 0.144.1。client epoch fencing、执行 lifecycle、thread policy/checkpoint、持久 session coordinator 与组合 harness 已切到 stdio fake transport。已知 framing 错误的 daemon proxy attach 实现和 CLI 已移除，只在文档保留迁移记录。原型尚未接入 serve，真实 thread/turn、session resume 与 Desktop 并发 canary 未闭合，因此保持 unsupported。"
     },
     {
       "id": "claude_execution",
@@ -172,8 +172,7 @@
       "capabilities",
       "status",
       "doctor",
-      "version",
-      "codex probe-native-daemon"
+      "version"
     ],
     "localStateMutation": [
       "init",
@@ -184,6 +183,7 @@
       "profile rollback-migration",
       "session release",
       "codex smoke-app-server",
+      "codex probe-native-app-server",
       "install-hermes-plugin install",
       "install-hermes-plugin rollback"
     ],
