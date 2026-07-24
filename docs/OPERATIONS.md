@@ -1609,3 +1609,45 @@ release 后必须再运行 `doctor --online`，确认无 quarantine，再启动 
 4. 监控 `relay.db`、WAL/SHM、进程 RSS 与消息速率。
 
 该门禁只限制单帧、外部标识和临时 cancel intent。它没有实现 jobs/outbox 自动清理，也没有给大量合法小帧的处理队列增加流量整形；历史数据清理由安全手册中的停机流程负责。
+
+## 11. Codex Desktop 自动化治理边界
+
+若维护者在 Codex Desktop 中为本项目启用有限写入自动化，应保持以下职责分离；任务当前是否
+启用属于用户级运行态，必须通过自动化接口现场读回，不能由本仓库文档推断：
+
+- Issue/PR Triage 只读取状态并增删白名单内的分类、`decision:*` 和 `merge:human` 标签。
+- Approved Issue Worker 每轮最多处理一个已授权 Issue，只能创建 draft PR。
+- PR/CI Review Worker 先只读诊断 CI，取得针对当前 head 和诊断结果的一次性人工批准后，才能向同一 `codex/issue-*` 分支追加修复。
+- Daily Digest 只读汇总活动、自动化写入、门禁漂移和人工队列。
+- Automation Safety Watchdog 只审计前序任务；除暂停预先写死 ID 的异常任务外没有写权限。
+
+决策标签的语义必须保持稳定：
+
+- `decision:auto` 只用于低风险内部 Issue；`decision:approved` 还必须有维护者在最近一次实质修改后留下的独立 `/codex approve` 评论。
+- `decision:human` 表示不得自动实现；`codex:in-progress` 是并发认领，`codex:blocked` 表示失败关闭且移除前不重试。
+- `ci-fix:approved` 必须绑定当前 PR head 和新鲜 `/codex approve-ci-fix` 评论，并在一次修复尝试开始时消费。
+- 所有自动生成或自动修复的 PR 都使用 `merge:human`；自动任务不得把 PR 转为 ready、approve、merge、启用 Auto-merge 或操作 workflow。
+
+Issue Worker 每轮最多修改 5 个文件和 300 行，必须精确暂存后运行完整 `bun run check`。
+协议、认证、上游兼容、持久化、Hermes bridge、CI、发布、依赖与仓库治理路径始终升级人工。
+PR/CI Worker 只处理同仓库、由 Issue Worker 创建且仍为 draft 的 `codex/issue-*` PR，最多自动
+修复两轮；Dependabot、fork、外部或 bot 作者内容只读报告。
+
+远端安全前置为主分支 required checks 对管理员同样生效且仓库关闭 Auto-merge。自动任务不得
+修改这些门禁；发现漂移必须失败关闭。用户级 GitHub 身份不等同于独立最小权限机器身份；
+扩大允许路径、开放 ready/merge 或进入自动合并期之前，必须另行配置只安装到本仓库的低权限
+GitHub App 或机器账号并复核审计边界。
+
+Watchdog 固定核对业务任务 ID、prompt 哈希、排期、项目绑定、执行环境、运行记忆、GitHub
+身份、仓库保护和治理标签。确定性全局漂移时暂停全部写任务；局部配置漂移、越权行为或连续
+失败只暂停受影响任务。临时读取失败必须连续两轮出现，运行结束保留 10 分钟宽限，不能把主
+worktree 的用户改动、没有合格 Issue 或外部 PR 的 CI 失败当成机制故障。
+
+Watchdog 只能通过 Codex 自动化接口把任务置为 `PAUSED`，不得直接改配置文件，也不得自动
+恢复、改 prompt/排期、修改 GitHub、取消运行中任务或清理 worktree。恢复流程固定为：人工
+核对熔断证据并修复根因，必要时人工处理 GitHub 产物，执行一次只读 dry-run，等待 Watchdog
+连续两轮全绿，最后由人工逐个重新启用。人工与自动化共用 GitHub 身份时，缺少稳定 run marker
+的行为变化只能告警，不能据此自动暂停。
+
+任务配置由 Codex Desktop 保存在用户级自动化目录，不属于仓库配置，禁止把该目录、token、
+认证状态或 `.claude/settings.local.json`、`.claude/worktrees/` 复制进项目。

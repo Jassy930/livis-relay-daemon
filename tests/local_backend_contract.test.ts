@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   LOCAL_BACKEND_AUTH_POLICY,
+  LOCAL_BACKEND_AUTH_INTEGRATION,
   LOCAL_BACKEND_CONTRACT_VERSION,
   LOCAL_BACKEND_IMPLEMENTATION_STATE,
   LocalBackendAuthenticationUnavailableError,
@@ -50,12 +51,17 @@ const cancellationHasNoCredentials: HasNoForbiddenKey<LocalBackendCancellation, 
 const adapterHasNoAuthMethods: HasNoForbiddenKey<LocalBackendAdapter, ForbiddenAuthMethod> = true;
 
 describe("本地后端中立契约", () => {
-  test("目标后端与当前实现状态分离，不能把 contract-only 误报为已接入", () => {
+  test("实现状态与认证集成状态分离，Codex 不能再误报为 contract-only", () => {
     expect(TARGET_LOCAL_BACKENDS).toEqual(["hermes", "codex", "claude"]);
     expect(LOCAL_BACKEND_IMPLEMENTATION_STATE).toEqual({
-      hermes: "phase1-existing",
-      codex: "contract-only",
+      hermes: "implemented",
+      codex: "implemented-experimental",
       claude: "contract-only",
+    });
+    expect(LOCAL_BACKEND_AUTH_INTEGRATION).toEqual({
+      hermes: "native-profile-owned",
+      codex: "daemon-private-native-store",
+      claude: "not-implemented",
     });
     expect(isLocalBackendKind("hermes")).toBeTrue();
     expect(isLocalBackendKind("codex")).toBeTrue();
@@ -100,6 +106,7 @@ describe("本地后端中立契约", () => {
 
   test("认证不可用只返回稳定错误，不在 daemon 内发起登录", () => {
     expect(LOCAL_BACKEND_AUTH_POLICY).toEqual({
+      targetMode: "native-current-state",
       credentialOwner: "native-backend",
       daemonReadsCredentialStores: false,
       daemonStartsAuthentication: false,

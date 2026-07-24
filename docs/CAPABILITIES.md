@@ -2,6 +2,10 @@
 
 根目录 [`capabilities.json`](../capabilities.json) 是当前公开能力、证据等级、安全默认值、命令权限和发布产物的机器可读事实源；[`schemas/capabilities.schema.json`](../schemas/capabilities.schema.json) 使用 JSON Schema Draft 2020-12 严格约束结构和枚举值。
 
+当前契约明确区分 Codex app-server transport 的受控 canary 与原生认证复用：前者已有证据，
+后者仍为 `unsupported`。Claude 和同一 daemon 在线多后端路由也保持 `unsupported`，不能因
+类型契约或配置枚举存在而提升状态。
+
 ## 证据等级
 
 - `live-canary-verified`：已在隔离 profile 和真实非生产链路完成 canary；仍只证明证据文档明确记录的版本、账号和路径。

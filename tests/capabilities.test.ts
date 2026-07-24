@@ -7,9 +7,11 @@ const root = resolve(import.meta.dir, "..");
 describe("机器可读能力契约", () => {
   test("当前 manifest 通过严格 schema 和引用检查", async () => {
     const result = await validateCapabilityManifest(root);
-    expect(result.manifest.package.version).toBe("0.1.0");
+    expect(result.manifest.package.version).toBe("0.1.1");
+    expect(result.manifest.package.phase).toBe("phase1-multi-backend");
     expect(result.manifest.topology.relayStateOwner).toBe("livis-relayd");
     expect(result.referencedPaths).toContain("docs/HERMES-CANARY.md");
+    expect(result.referencedPaths).toContain("docs/CODEX-E2E-CANARY.md");
   });
 
   test("拒绝 schema 之外的字段", async () => {

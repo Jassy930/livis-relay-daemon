@@ -17,7 +17,7 @@ export interface CapabilityManifest {
     version: string;
     license: "MIT";
     language: "zh-CN";
-    phase: "phase1-hermes";
+    phase: "phase1-multi-backend";
     officialEndorsement: false;
   };
   compatibility: Record<string, string>;

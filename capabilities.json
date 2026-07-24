@@ -3,20 +3,21 @@
   "schemaVersion": 1,
   "package": {
     "name": "livis-relay-daemon",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "license": "MIT",
     "language": "zh-CN",
-    "phase": "phase1-hermes",
+    "phase": "phase1-multi-backend",
     "officialEndorsement": false
   },
   "compatibility": {
     "bun": ">=1.3.14",
     "python": ">=3.11,<3.14",
     "hermesRuntime": ">=0.15.1,<0.15.2",
-    "hermesBridge": ">=0.1.0,<0.2.0",
+    "hermesBridge": ">=0.1.1,<0.2.0",
+    "codexCli": ">=0.145.0,<0.146.0",
     "livisReferenceClient": "2.0.0",
     "livisProtocolStatus": "observed-not-publicly-versioned",
-    "lastReviewed": "2026-07-22"
+    "lastReviewed": "2026-07-24"
   },
   "topology": {
     "relayStateOwner": "livis-relayd",
@@ -91,6 +92,38 @@
       "notes": "只在操作者提供明确专用 HERMES_HOME 后原子安装；不会启动或重启 Gateway。"
     },
     {
+      "id": "codex_app_server_execution",
+      "direction": "bidirectional",
+      "status": "live-canary-verified",
+      "evidenceRefs": ["docs/CODEX-APPSERVER.md", "docs/CODEX-E2E-CANARY.md"],
+      "testRefs": ["tests/codex_execution_backend.test.ts", "tests/codex_app_server_client.test.ts"],
+      "notes": "实验性 Codex app-server backend 已完成受控执行 canary；当前使用 daemon 私有 CODEX_HOME 与专用 API key，不代表复用用户当前 Codex 登录态或生产可用。"
+    },
+    {
+      "id": "codex_native_auth_reuse",
+      "direction": "local",
+      "status": "unsupported",
+      "evidenceRefs": ["docs/LOCAL-BACKENDS.md"],
+      "testRefs": ["tests/auth_boundary.test.ts", "tests/local_backend_contract.test.ts"],
+      "notes": "目标契约已定义，但尚未证明可在不共享 Codex config/thread/rollout 的前提下复用用户当前认证。"
+    },
+    {
+      "id": "claude_execution",
+      "direction": "bidirectional",
+      "status": "unsupported",
+      "evidenceRefs": ["docs/LOCAL-BACKENDS.md"],
+      "testRefs": ["tests/local_backend_contract.test.ts"],
+      "notes": "Claude 目前只有中立调用与认证边界契约，没有 transport、session 恢复或 canary。"
+    },
+    {
+      "id": "online_multi_backend_routing",
+      "direction": "local",
+      "status": "unsupported",
+      "evidenceRefs": ["docs/LOCAL-BACKENDS.md"],
+      "testRefs": [],
+      "notes": "当前一套 daemon 只选择一个 execution backend；在线同时连接并按 session 切换尚未实现。"
+    },
+    {
       "id": "document_delivery",
       "direction": "hermes-to-livis",
       "status": "unsupported",
@@ -130,6 +163,8 @@
     "toolProgress": false,
     "remoteApproval": false,
     "remoteAdmin": false,
+    "nativeBackendCredentialReuse": false,
+    "onlineBackendRouting": false,
     "unknownProtocol": "fail-closed"
   },
   "commands": {
@@ -144,7 +179,10 @@
       "upstream check",
       "upstream activate",
       "upstream rollback",
+      "profile migrate-v2",
+      "profile rollback-migration",
       "session release",
+      "codex smoke-app-server",
       "install-hermes-plugin install",
       "install-hermes-plugin rollback"
     ],
@@ -189,6 +227,12 @@
       "path": "<stateDir>/",
       "mode": "0700",
       "contains": ["protocol profile", "supported proof", "upstream audit artifact"],
+      "retention": "operator-managed"
+    },
+    {
+      "path": "<stateDir>/backends/codex/home",
+      "mode": "0700",
+      "contains": ["Codex API key authentication state", "Codex thread and rollout state"],
       "retention": "operator-managed"
     }
   ],

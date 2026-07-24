@@ -49,7 +49,7 @@
         "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?$" },
         "license": { "const": "MIT" },
         "language": { "const": "zh-CN" },
-        "phase": { "const": "phase1-hermes" },
+        "phase": { "const": "phase1-multi-backend" },
         "officialEndorsement": { "const": false }
       }
     },
@@ -61,6 +61,7 @@
         "python",
         "hermesRuntime",
         "hermesBridge",
+        "codexCli",
         "livisReferenceClient",
         "livisProtocolStatus",
         "lastReviewed"
@@ -70,6 +71,7 @@
         "python": { "type": "string", "minLength": 1 },
         "hermesRuntime": { "type": "string", "minLength": 1 },
         "hermesBridge": { "type": "string", "minLength": 1 },
+        "codexCli": { "type": "string", "minLength": 1 },
         "livisReferenceClient": { "type": "string", "minLength": 1 },
         "livisProtocolStatus": { "const": "observed-not-publicly-versioned" },
         "lastReviewed": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" }
@@ -132,6 +134,8 @@
         "toolProgress",
         "remoteApproval",
         "remoteAdmin",
+        "nativeBackendCredentialReuse",
+        "onlineBackendRouting",
         "unknownProtocol"
       ],
       "properties": {
@@ -141,6 +145,8 @@
         "toolProgress": { "const": false },
         "remoteApproval": { "const": false },
         "remoteAdmin": { "const": false },
+        "nativeBackendCredentialReuse": { "const": false },
+        "onlineBackendRouting": { "const": false },
         "unknownProtocol": { "const": "fail-closed" }
       }
     },

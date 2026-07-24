@@ -4,6 +4,8 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+.claude/settings.local.json
+.claude/worktrees/
 *.swp
 *.swo
 .env*

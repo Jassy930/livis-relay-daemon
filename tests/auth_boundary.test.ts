@@ -8,9 +8,11 @@ async function backendRuntimeFiles(): Promise<string[]> {
     resolve(PROJECT_ROOT, "src/daemon.ts"),
     resolve(PROJECT_ROOT, "src/connector/server.ts"),
   ];
-  const glob = new Bun.Glob("src/backend/**/*.ts");
-  for await (const path of glob.scan({ cwd: PROJECT_ROOT, absolute: true, onlyFiles: true })) {
-    if (!path.endsWith("/contract.ts")) files.push(path);
+  for (const pattern of ["src/backend/**/*.ts", "src/backends/**/*.ts"]) {
+    const glob = new Bun.Glob(pattern);
+    for await (const path of glob.scan({ cwd: PROJECT_ROOT, absolute: true, onlyFiles: true })) {
+      files.push(path);
+    }
   }
   return [...new Set(files)].sort();
 }
@@ -28,7 +30,9 @@ describe("本地后端认证所有权边界", () => {
       { label: "macOS Keychain 读取", pattern: /find-generic-password/i },
     ];
 
-    for (const path of await backendRuntimeFiles()) {
+    const files = await backendRuntimeFiles();
+    expect(files.length).toBeGreaterThan(4);
+    for (const path of files) {
       const source = await Bun.file(path).text();
       for (const rule of forbidden) {
         expect(source, `${relative(PROJECT_ROOT, path)} 不得包含 ${rule.label}`).not.toMatch(rule.pattern);
@@ -38,12 +42,13 @@ describe("本地后端认证所有权边界", () => {
 
   test("backend adapter 不能复用 LiViS OAuth 或 daemon SecretStore", async () => {
     const forbiddenImports = [/auth[/\\]idaas\.ts/, /from\s+["'][^"']*secrets\.ts["']/];
-    const glob = new Bun.Glob("src/backend/**/*.ts");
-    for await (const path of glob.scan({ cwd: PROJECT_ROOT, absolute: true, onlyFiles: true })) {
-      if (path.endsWith("/contract.ts")) continue;
-      const source = await Bun.file(path).text();
-      for (const pattern of forbiddenImports) {
-        expect(source, `${relative(PROJECT_ROOT, path)} 不得跨越 LiViS 认证边界`).not.toMatch(pattern);
+    for (const globPattern of ["src/backend/**/*.ts", "src/backends/**/*.ts"]) {
+      const glob = new Bun.Glob(globPattern);
+      for await (const path of glob.scan({ cwd: PROJECT_ROOT, absolute: true, onlyFiles: true })) {
+        const source = await Bun.file(path).text();
+        for (const pattern of forbiddenImports) {
+          expect(source, `${relative(PROJECT_ROOT, path)} 不得跨越 LiViS 认证边界`).not.toMatch(pattern);
+        }
       }
     }
   });
