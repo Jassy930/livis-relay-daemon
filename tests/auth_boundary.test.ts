@@ -53,11 +53,25 @@ describe("本地后端认证所有权边界", () => {
     }
   });
 
+  test("native 当前状态路径不读取或分类账号状态", async () => {
+    for (const path of [
+      "src/backends/codex/native-daemon.ts",
+      "src/backends/codex/native-client-epoch.ts",
+      "src/backends/codex/native-execution-lifecycle.ts",
+      "src/backends/codex/native-thread-policy.ts",
+    ]) {
+      const source = await Bun.file(resolve(PROJECT_ROOT, path)).text();
+      expect(source, `${path} 不得读取或绑定账号状态`).not.toMatch(
+        /account\/read|inspectCodexAccountResponse|accountSubject|identityStrength|credential_rejected/,
+      );
+    }
+  });
+
   test("native 执行原型在能力 unsupported 期间不得进入生产 serve", async () => {
     for (const path of ["src/daemon.ts", "src/index.ts", "src/config.ts"]) {
       const source = await Bun.file(resolve(PROJECT_ROOT, path)).text();
       expect(source, `${path} 不得导入 native 执行原型`).not.toMatch(
-        /native-(?:auth-session|execution-lifecycle|thread-policy)/,
+        /native-(?:client-epoch|execution-lifecycle|thread-policy)/,
       );
     }
     const manifest = await Bun.file(resolve(PROJECT_ROOT, "capabilities.json")).json() as {

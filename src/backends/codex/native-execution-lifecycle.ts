@@ -5,11 +5,9 @@ import {
   type CodexAppServerNotification,
 } from "./app-server-client.ts";
 import {
-  CodexNativeAuthSessionError,
-  type CodexNativeAuthSessionErrorCode,
   type CodexNativeClientEpochFence,
   type CodexNativeClientEpochReceipt,
-} from "./native-auth-session.ts";
+} from "./native-client-epoch.ts";
 import type {
   ExecutionBackendHandlers,
   ExecutionJobEvent,
@@ -42,7 +40,7 @@ export interface CodexNativeExecutionLifecycleDependencies {
   handlers: ExecutionBackendHandlers;
   clientEpochFence: CodexNativeClientEpochFence;
   clientEpochReceipt: CodexNativeClientEpochReceipt;
-  onSessionQuarantine(code: CodexNativeAuthSessionErrorCode): Promise<void>;
+  onSessionQuarantine(code: "native_client_epoch_superseded"): Promise<void>;
 }
 
 interface Deferred<T> {
@@ -121,35 +119,6 @@ function notificationTurnId(notification: CodexAppServerNotification): string | 
     : null;
 }
 
-function safeFailure(value: unknown): {
-  error: string;
-  credentialRejected: boolean;
-} {
-  if (!isRecord(value)) {
-    return { error: "Codex turn 执行失败", credentialRejected: false };
-  }
-  const message = typeof value.message === "string" ? value.message : "";
-  if (/\binvalid_api_key\b/i.test(message) || /Incorrect API key provided/i.test(message)) {
-    return {
-      error: "Codex provider 认证失败（401 invalid_api_key）",
-      credentialRejected: true,
-    };
-  }
-  if (value.codexErrorInfo === "unauthorized") {
-    return { error: "Codex provider 认证失败", credentialRejected: true };
-  }
-  if (isRecord(value.codexErrorInfo)) {
-    for (const detail of Object.values(value.codexErrorInfo)) {
-      if (
-        isRecord(detail) && detail.httpStatusCode === 401
-      ) {
-        return { error: "Codex provider 连接失败（HTTP 401）", credentialRejected: true };
-      }
-    }
-  }
-  return { error: "Codex turn 执行失败", credentialRejected: false };
-}
-
 function isRelevantNotification(notification: CodexAppServerNotification): boolean {
   return notification.method === "item/completed" ||
     notification.method === "turn/completed" || notification.method === "error";
@@ -171,7 +140,7 @@ export class CodexNativeExecutionLifecycle {
   private readonly clientEpochFence: CodexNativeClientEpochFence;
   private readonly clientEpochReceipt: CodexNativeClientEpochReceipt;
   private readonly onSessionQuarantine: (
-    code: CodexNativeAuthSessionErrorCode,
+    code: "native_client_epoch_superseded",
   ) => Promise<void>;
   private readonly threadId: string;
   private readonly workspace: string;
@@ -183,7 +152,6 @@ export class CodexNativeExecutionLifecycle {
   private notificationTail: Promise<void> = Promise.resolve();
   private disconnectPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
-  private lastAuthFailureCode: CodexNativeAuthSessionErrorCode | null = null;
 
   constructor(
     options: CodexNativeExecutionLifecycleOptions,
@@ -228,7 +196,6 @@ export class CodexNativeExecutionLifecycle {
       ready: this.ready,
       active: this.activeAttempt !== null,
       clientEpoch: this.clientEpochReceipt.clientEpoch,
-      authFailureCode: this.lastAuthFailureCode,
       productionReady: false,
     };
   }
@@ -259,18 +226,6 @@ export class CodexNativeExecutionLifecycle {
     ) {
       return "not_sent";
     }
-
-    try {
-      await this.clientEpochFence.revalidate(
-        this.clientEpochReceipt,
-        this.client,
-        this.requestTimeoutMs,
-      );
-    } catch (error) {
-      await this.failAuthBeforeSubmission(error);
-      return "not_sent";
-    }
-    if (!this.ready || this.activeAttempt !== null) return "not_sent";
 
     const attempt: NativeAttempt = {
       job,
@@ -463,20 +418,13 @@ export class CodexNativeExecutionLifecycle {
       return;
     }
     if (status === "failed") {
-      const failure = safeFailure(turn.error);
       this.finishAttempt(attempt);
       await this.handlers.onFailed({
         ...this.jobEvent(attempt),
         turnId: attempt.turnId!,
-        error: failure.error,
+        error: "Codex native backend 执行失败",
         retryable: false,
-        ...(failure.credentialRejected
-          ? { sessionDisposition: "credential_rejected" as const }
-          : {}),
       });
-      if (failure.credentialRejected) {
-        await this.disconnectIfCurrent("Codex native provider 拒绝当前认证状态");
-      }
       return;
     }
     throw new Error("Codex native turn 未经 relay cancel 即被中断");
@@ -559,48 +507,6 @@ export class CodexNativeExecutionLifecycle {
     await this.interrupt(attempt);
     if (this.state === "running" && this.ready) {
       await this.disconnectIfCurrent("Codex native turn 超时，执行结果不确定");
-    }
-  }
-
-  private async failAuthBeforeSubmission(error: unknown): Promise<void> {
-    const authError = error instanceof CodexNativeAuthSessionError
-      ? error
-      : new CodexNativeAuthSessionError(
-          "native_account_response_incompatible",
-          "incompatible",
-          "quarantine_required",
-          "Codex 原生账号派发前回读失败",
-        );
-    this.lastAuthFailureCode = authError.code;
-    let quarantineError: unknown;
-    if (authError.sessionDisposition === "quarantine_required") {
-      try {
-        await this.onSessionQuarantine(authError.code);
-      } catch (caught) {
-        quarantineError = caught;
-      }
-    }
-
-    let disconnectError: unknown;
-    if (this.clientEpochFence.isCurrent(this.clientEpochReceipt, this.client)) {
-      try {
-        await this.disconnect(authError.code);
-      } catch (caught) {
-        disconnectError = caught;
-      }
-    } else {
-      this.state = "disconnected";
-      try {
-        await this.client.close();
-      } catch (caught) {
-        disconnectError = caught;
-      }
-    }
-    if (quarantineError !== undefined || disconnectError !== undefined) {
-      throw new AggregateError(
-        [quarantineError, disconnectError].filter((value) => value !== undefined),
-        "Codex native 认证失败关闭未完整收口",
-      );
     }
   }
 

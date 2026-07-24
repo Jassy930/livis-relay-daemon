@@ -165,9 +165,8 @@ describe("Codex 原生 daemon 只读兼容性探针", () => {
     }
   });
 
-  test("成功探针只调用 initialize/account-read，不启动 daemon、thread 或模型 turn", async () => {
+  test("成功探针只完成 initialize，不读取账号或启动 daemon、thread、模型 turn", async () => {
     const { runner, calls } = commandRunnerFor();
-    const clientCalls: string[] = [];
     const observedClientOptions: CodexAppServerClientOptions[] = [];
     let closed = false;
     const report = await probeCodexNativeDaemon(probeOptions(), {
@@ -183,17 +182,6 @@ describe("Codex 原生 daemon 只读兼容性探针", () => {
             userAgent: "livis-relay-native-probe/0.1.1 (test)",
             platformFamily: "unix",
             platformOs: "macos",
-          },
-          request: async <T>(method: string) => {
-            clientCalls.push(method);
-            return {
-              account: {
-                type: "chatgpt",
-                email: "sensitive-account@example.invalid",
-                planType: "sensitive-plan",
-              },
-              requiresOpenaiAuth: true,
-            } as T;
           },
           close: async () => {
             closed = true;
@@ -212,17 +200,15 @@ describe("Codex 原生 daemon 只读兼容性探针", () => {
       startedNativeDaemon: false,
       sentModelTurn: false,
       productionReady: false,
-      verified: ["native-daemon-transport", "native-authentication-state"],
+      verified: ["native-daemon-transport"],
       unverified: [
+        "native-backend-execution-state",
         "server-config-isolation",
         "thread-turn-lifecycle",
         "session-resume",
         "concurrent-desktop-cli",
       ],
     });
-    expect(JSON.stringify(report)).not.toContain("sensitive-account");
-    expect(JSON.stringify(report)).not.toContain("sensitive-plan");
-    expect(clientCalls).toEqual(["account/read"]);
     expect(closed).toBeTrue();
     expect(observedClientOptions[0]?.command).toEqual([
       COMMAND_PIN.path,

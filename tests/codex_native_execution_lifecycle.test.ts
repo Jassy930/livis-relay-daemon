@@ -8,11 +8,9 @@ import {
   type CodexAppServerSpawnOptions,
 } from "../src/backends/codex/app-server-client.ts";
 import {
-  CodexNativeAuthSessionError,
   CodexNativeClientEpochFence,
-  type CodexNativeAccountBinding,
   type CodexNativeClientEpochReceipt,
-} from "../src/backends/codex/native-auth-session.ts";
+} from "../src/backends/codex/native-client-epoch.ts";
 import {
   CodexNativeExecutionLifecycle,
   type CodexNativeExecutionClient,
@@ -70,13 +68,6 @@ function job(jobId = "native-job-1"): StoredJob {
   };
 }
 
-function authenticatedAccount(email = "native-user@example.test"): Record<string, unknown> {
-  return {
-    requiresOpenaiAuth: true,
-    account: { type: "chatgpt", email },
-  };
-}
-
 class FakeNativeProxy {
   readonly messages: Array<Record<string, unknown>> = [];
   readonly spawn: CodexAppServerSpawn;
@@ -87,10 +78,8 @@ class FakeNativeProxy {
   nativeDaemonStopCalls = 0;
   holdTurnStart = false;
   sendCompletedAfterStart = false;
-  sendCredentialFailureAfterStart = false;
+  sendBackendFailureAfterStart = false;
   sendInterruptedAfterCancel = false;
-  accountResponse: unknown = authenticatedAccount();
-  failAccountRead = false;
 
   private readonly stdout = new TransformStream<Uint8Array, Uint8Array>();
   private readonly stderr = new TransformStream<Uint8Array, Uint8Array>();
@@ -148,22 +137,11 @@ class FakeNativeProxy {
       });
       return;
     }
-    if (message.method === "account/read") {
-      if (this.failAccountRead) {
-        await this.send({
-          id: message.id,
-          error: { code: -32_000, message: "SENSITIVE_ACCOUNT_READ_FAILURE" },
-        });
-      } else {
-        await this.respond(message.id, this.accountResponse);
-      }
-      return;
-    }
     if (message.method === "turn/start") {
       if (this.holdTurnStart) return;
       await this.respond(message.id, { turn: { id: "native-turn-1", status: "inProgress" } });
       if (this.sendCompletedAfterStart) await this.sendCompleted();
-      if (this.sendCredentialFailureAfterStart) await this.sendCredentialFailure();
+      if (this.sendBackendFailureAfterStart) await this.sendBackendFailure();
       return;
     }
     if (message.method === "turn/interrupt") {
@@ -204,7 +182,7 @@ class FakeNativeProxy {
     await this.send(terminal);
   }
 
-  async sendCredentialFailure(): Promise<void> {
+  async sendBackendFailure(): Promise<void> {
     await this.send({
       method: "turn/completed",
       params: {
@@ -264,7 +242,6 @@ async function createHarness(options: {
   turnTimeoutMs?: number;
   gateAccepted?: boolean;
   clientEpochFence?: CodexNativeClientEpochFence;
-  expectedAccountBinding?: CodexNativeAccountBinding;
 } = {}): Promise<Harness> {
   const fake = options.fake ?? new FakeNativeProxy();
   const events: string[] = [];
@@ -314,12 +291,7 @@ async function createHarness(options: {
     },
   });
   const clientEpochFence = options.clientEpochFence ?? new CodexNativeClientEpochFence();
-  const clientEpochReceipt = await clientEpochFence.attach(client, {
-    requestTimeoutMs: options.requestTimeoutMs ?? 50,
-    ...(options.expectedAccountBinding
-      ? { expectedAccountBinding: options.expectedAccountBinding }
-      : {}),
-  });
+  const clientEpochReceipt = clientEpochFence.attach(client);
   lifecycle = new CodexNativeExecutionLifecycle({
     executionId: "native-execution-1",
     threadId: "native-thread-1",
@@ -405,8 +377,7 @@ describe("Codex native proxy 离线执行生命周期", () => {
     const client: CodexNativeExecutionClient = {
       running: true,
       exited: neverExit,
-      request: async <T = unknown>(method: string): Promise<T> => {
-        if (method === "account/read") return authenticatedAccount() as T;
+      request: async <T = unknown>(): Promise<T> => {
         throw new CodexAppServerTimeoutError("turn/start", 1, 10, false);
       },
       close: async () => {
@@ -414,7 +385,7 @@ describe("Codex native proxy 离线执行生命周期", () => {
       },
     };
     const clientEpochFence = new CodexNativeClientEpochFence();
-    const clientEpochReceipt = await clientEpochFence.attach(client, { requestTimeoutMs: 10 });
+    const clientEpochReceipt = clientEpochFence.attach(client);
     const disconnects: string[] = [];
     const handlers: ExecutionBackendHandlers = {
       onReady: async () => undefined,
@@ -448,17 +419,25 @@ describe("Codex native proxy 离线执行生命周期", () => {
     expect(closed).toBeTrue();
   });
 
-  test("provider 明确拒绝认证时只输出稳定分类并携带 credential_rejected", async () => {
+  test("本地后端错误按普通 failed 结算，不识别账号状态或隔离 session", async () => {
     const fake = new FakeNativeProxy();
-    fake.sendCredentialFailureAfterStart = true;
+    fake.sendBackendFailureAfterStart = true;
     const harness = await createHarness({ fake });
     try {
-      expect(await harness.lifecycle.dispatch(job("credential-rejected"))).toBe("submitted");
-      await waitFor(() => harness.failures.length === 1, "credential failed event");
-      await waitFor(() => harness.disconnects.length === 1, "credential disconnect");
-      expect(harness.failures[0]?.sessionDisposition).toBe("credential_rejected");
-      expect(harness.failures[0]?.error).toBe("Codex provider 认证失败");
+      expect(await harness.lifecycle.dispatch(job("local-backend-error"))).toBe("submitted");
+      await waitFor(() => harness.failures.length === 1, "backend failed event");
+      expect(harness.failures[0]?.sessionDisposition).toBeUndefined();
+      expect(harness.failures[0]?.error).toBe("Codex native backend 执行失败");
       expect(JSON.stringify(harness.failures)).not.toContain("SENSITIVE_PROVIDER_DETAIL");
+      expect(harness.quarantines).toEqual([]);
+      expect(harness.disconnects).toEqual([]);
+      expect(harness.lifecycle.ready).toBeTrue();
+
+      fake.sendBackendFailureAfterStart = false;
+      fake.sendCompletedAfterStart = true;
+      expect(await harness.lifecycle.dispatch(job("after-local-state-change"))).toBe("submitted");
+      await waitFor(() => harness.results.length === 1, "后续 job final");
+      expect(harness.results).toEqual(["这是唯一 final"]);
     } finally {
       await harness.cleanup();
     }
@@ -513,55 +492,6 @@ describe("Codex native proxy 离线执行生命周期", () => {
     expect(second.fake.nativeDaemonRunning).toBeTrue();
     expect(second.fake.nativeDaemonStopCalls).toBe(0);
     expect(second.disconnects).toEqual([]);
-  });
-
-  test("派发前注销映射稳定 backend_auth_unavailable，且不会发送 turn/start", async () => {
-    const harness = await createHarness();
-    harness.fake.accountResponse = { requiresOpenaiAuth: true, account: null };
-    try {
-      expect(await harness.lifecycle.dispatch(job("logged-out-before-dispatch"))).toBe("not_sent");
-      expect(harness.fake.messages.some((message) => message.method === "turn/start")).toBeFalse();
-      expect(harness.quarantines).toEqual(["backend_auth_unavailable"]);
-      expect(harness.disconnects).toEqual(["backend_auth_unavailable"]);
-      expect(harness.lifecycle.status()).toMatchObject({
-        ready: false,
-        authFailureCode: "backend_auth_unavailable",
-      });
-    } finally {
-      await harness.cleanup();
-    }
-  });
-
-  test("派发前主体切换要求 quarantine，账号明文不进入错误或状态", async () => {
-    const harness = await createHarness();
-    harness.fake.accountResponse = authenticatedAccount("another-user@example.test");
-    try {
-      expect(await harness.lifecycle.dispatch(job("account-drift"))).toBe("not_sent");
-      expect(harness.fake.messages.some((message) => message.method === "turn/start")).toBeFalse();
-      expect(harness.quarantines).toEqual(["native_account_binding_drift"]);
-      expect(harness.disconnects).toEqual(["native_account_binding_drift"]);
-      expect(JSON.stringify(harness.lifecycle.status())).not.toContain("another-user");
-    } finally {
-      await harness.cleanup();
-    }
-  });
-
-  test("account/read 失败保持 incompatible 并清理 provider 原始错误", async () => {
-    const harness = await createHarness();
-    harness.fake.failAccountRead = true;
-    try {
-      expect(await harness.lifecycle.dispatch(job("account-read-failure"))).toBe("not_sent");
-      expect(harness.fake.messages.some((message) => message.method === "turn/start")).toBeFalse();
-      expect(harness.quarantines).toEqual(["native_account_response_incompatible"]);
-      expect(harness.disconnects).toEqual(["native_account_response_incompatible"]);
-      expect(JSON.stringify({
-        status: harness.lifecycle.status(),
-        quarantines: harness.quarantines,
-        disconnects: harness.disconnects,
-      })).not.toContain("SENSITIVE_ACCOUNT_READ_FAILURE");
-    } finally {
-      await harness.cleanup();
-    }
   });
 
   test("旧 client epoch 的迟到 terminal、exit 和 timeout 不会影响新 epoch", async () => {

@@ -29,18 +29,19 @@ export const LOCAL_BACKEND_AUTH_INTEGRATION = {
 } as const satisfies Record<LocalBackendKind, LocalBackendAuthenticationIntegration>;
 
 export const LOCAL_BACKEND_AUTH_POLICY = {
-  targetMode: "native-current-state",
+  targetMode: "native-current-state-opaque",
   credentialOwner: "native-backend",
   daemonReadsCredentialStores: false,
+  daemonInspectsAuthenticationState: false,
   daemonStartsAuthentication: false,
   daemonRefreshesCredentials: false,
-  authenticationUnavailableCode: "backend_auth_unavailable",
+  daemonBlocksInvocationOnAuthenticationState: false,
+  backendErrorsFlowThroughExecution: true,
 } as const;
 
 export type LocalBackendReadiness =
   | "ready"
   | "offline"
-  | "authentication-required"
   | "incompatible";
 
 export interface LocalBackendProbe {
@@ -85,15 +86,6 @@ export interface LocalBackendAdapter {
   probe(): Promise<LocalBackendProbe>;
   invoke(request: LocalBackendInvocation, signal?: AbortSignal): Promise<LocalBackendResult>;
   cancel(request: LocalBackendCancellation, signal?: AbortSignal): Promise<void>;
-}
-
-export class LocalBackendAuthenticationUnavailableError extends Error {
-  readonly code = LOCAL_BACKEND_AUTH_POLICY.authenticationUnavailableCode;
-
-  constructor(readonly backend: LocalBackendKind) {
-    super(`本地 ${backend} 后端没有可用认证；请在其原生客户端完成认证后重试`);
-    this.name = "LocalBackendAuthenticationUnavailableError";
-  }
 }
 
 export function isLocalBackendKind(value: unknown): value is LocalBackendKind {

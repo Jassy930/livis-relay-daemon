@@ -1,13 +1,18 @@
-# Codex 原生当前认证复用探针
+# Codex 原生本地状态不透明边界
 
-本文记录阶段 B 的第一个实现切片：只读验证本机 Codex app-server daemon 是否能作为
-`livis-relayd` 的原生认证所有者。该探针不是生产 backend，也不会把
-`codex_native_auth_reuse` 提升为已支持。
+本文记录阶段 B 的原生 Codex 边界：`livis-relayd` 只连接本机已经存在的 Codex app-server
+daemon，并使用本地当前状态执行。relay 不读取、判断、绑定、刷新或修复账号与凭据状态。
 
-## 1. 使用方式
+本地未登录、账号切换、provider 拒绝或其他运行时错误都由 Codex 自己产生；relay 不在派发前
+拦截，也不把其中任何一种识别成特殊认证状态。只要 transport 可连接且协议兼容，就直接调用；
+执行失败按普通 backend failed 结算，不自动重试、不 fallback，也不隔离账号。
 
-先由操作者独立确认原生 Codex app-server daemon 已按官方方式运行，并取得它报告的绝对
-Unix socket 路径。探针不会启动、重启、停止 daemon，也不会替操作者启用 remote control。
+当前实现仍是离线原型，不会把 `codex_native_auth_reuse` 提升为已支持。
+
+## 1. Transport-only 探针
+
+先由操作者独立确认原生 Codex app-server daemon 已按官方方式运行，并取得它报告的绝对 Unix
+socket 路径。探针不会启动、重启、停止 daemon，也不会替操作者启用 remote control。
 
 ```bash
 bun run src/index.ts codex probe-native-daemon \
@@ -15,153 +20,113 @@ bun run src/index.ts codex probe-native-daemon \
   --socket /绝对路径/app-server-control.sock
 ```
 
-配置中的 `codex.command` 必须是 stateDir 外的绝对路径。该命令是只读诊断入口；成功只表示
-transport 与当前认证状态可被观察，输出中的 `productionReady` 仍固定为 `false`。
-
-## 2. 探针实际执行的动作
+配置中的 `codex.command` 必须是 stateDir 外的绝对路径。成功只证明 transport 可以安全握手，
+输出中的 `productionReady` 仍固定为 `false`。
 
 探针按以下顺序失败关闭：
 
 1. 解析并固定 Codex CLI 的 canonical 可执行文件及内容身份；
 2. 运行 `codex --version`，要求位于仓库审核窗口；
-3. 运行官方 `codex app-server daemon version`，要求 daemon 已运行、管理 CLI 版本一致，且
-   运行中 app-server 也位于同一审核窗口；
+3. 运行官方 `codex app-server daemon version`，要求 daemon 已运行、管理 CLI 版本一致，且运行中
+   app-server 位于同一审核窗口；
 4. 要求 daemon 报告的 socket 与操作者显式传入值完全一致；socket 必须是当前用户持有的
    `0600` Unix socket，直属父目录必须是同一用户持有的固定 `0700` 普通目录；
-5. 通过 `codex app-server proxy --sock ...` 连接该 socket，只发送 `initialize`、`initialized`
-   和 `account/read(refreshToken=false)`；
-6. 只输出标准化 `ready` 或 `authentication-required`，不输出账号、邮箱、套餐、token、scope、
-   cookie 或原始 provider 错误；随后只关闭本次 proxy 子进程，不停止原生 daemon。
+5. 通过 `codex app-server proxy --sock ...` 完成 `initialize` / `initialized`；
+6. 随后只关闭本次 proxy 子进程，不停止原生 daemon。
 
-整个路径不会创建 thread、发送 turn、调用模型、触发登录/注销或修改认证状态。
+探针不调用账号接口，不创建 thread、不发送 turn、不调用模型，也不触发登录、注销或任何认证
+状态变更。
 
-## 3. 环境与状态边界
+## 2. 环境与状态边界
 
 `daemon version` 是唯一允许看到原生 `HOME`/`CODEX_HOME` 选择器的官方只读管理命令；它只继承
 这两个选择器和固定 locale/terminal 白名单，不继承 API key、LiViS 或其他任意环境变量。
 
-`app-server proxy` 使用更窄的环境白名单：不包含 `HOME`、`CODEX_HOME`、`PATH` 或 daemon 的
-其他环境。它只能连接已固定的绝对 socket，因此 relay 进程无需读取、复制、链接或导出原生
-认证文件。
+`app-server proxy` 使用更窄的环境白名单：不包含 `HOME`、`CODEX_HOME`、`PATH` 或 daemon 的其他
+环境。它只能连接已固定的绝对 socket，因此 relay 进程无需读取、复制、链接或导出原生状态文件。
 
-initialize 还必须证明原生 runtime 的 `codexHome` 位于 relay stateDir 之外。返回路径只用于
-进程内比较，不进入报告。
+initialize 必须证明原生 runtime 的 `codexHome` 位于 relay stateDir 之外。返回路径只用于进程内
+比较，不进入报告。
 
-## 4. 结果语义
+## 3. 结果语义
 
-| 状态 | 含义 | 是否允许生产派发 |
+| 状态 | 含义 | 是否证明本地执行正常 |
 | --- | --- | --- |
-| `ready` | proxy 握手成功，`account/read` 返回已审核的非空认证形态 | 否 |
-| `authentication-required` | transport 正常，但原生 Codex 当前未认证 | 否 |
-| `offline` | daemon 未运行或 proxy 无法完成 initialize | 否 |
-| `incompatible` | CLI/app-server 版本、socket 身份或协议响应不满足门禁 | 否 |
+| `ready` | CLI、socket、proxy 与 initialize transport 兼容 | 否 |
+| `offline` | daemon 未运行或 proxy 无法 initialize | 否 |
+| `incompatible` | CLI/app-server 版本、socket 身份或 initialize 不满足门禁 | 否 |
 
-即使 `ready`，报告也只把 `native-daemon-transport` 和 `native-authentication-state` 列为已验证。
-server config 隔离、thread/turn 生命周期、session resume 和 Desktop/CLI 并发仍明确未验证。
+这里没有 `authentication-required`。本地 backend 即使处于未登录或 provider 错误状态，transport
+仍可为 `ready`；具体错误只有执行时由本地 backend 返回。relay 不提前判定。
 
-## 5. 2026-07-24 本机只读观察
+报告只把 `native-daemon-transport` 列为已验证。server config 隔离、thread/turn 生命周期、session
+resume、真实执行状态和 Desktop/CLI 并发仍明确未验证。
 
-固定 CLI 为 `0.145.0`，运行中的原生 app-server 为 `0.144.1`。因此当前探针在连接 proxy 前
-返回 `native_daemon_version_incompatible`；不会为了通过门禁而重启用户 daemon。此前一次只读
-proxy initialize 尝试在 5 秒内未得到响应，没有创建 thread、调用模型或改写认证状态。
+## 4. 2026-07-24 本机历史观察
 
-该观察是本机当时状态，不是协议长期结论。只能等待 Codex Desktop 与其原生 daemon 按用户
-正常使用流程自然升级到兼容版本后重新运行探针，或由操作者显式提供另一个与 Desktop 生命周期
-完全独立的兼容端点。relay 不得为了让探针通过而启动、停止、重启、替换或升级 Desktop 及其
-原生 daemon，也不得启用或关闭 remote control。
+当时固定 CLI 为 `0.145.0`，运行中的原生 app-server 为 `0.144.1`，因此探针在连接 proxy 前返回
+`native_daemon_version_incompatible`。该记录只是历史快照，本轮离线开发没有重新读取真实端点。
 
-## 6. Desktop 不干扰不变量
+relay 不会为了通过门禁而启动、停止、重启、替换或升级 Desktop 及其原生 daemon，也不会启用或
+关闭 remote control。
 
-后续实现与测试必须把当前 Codex Desktop 视为用户拥有的外部系统：
+## 5. Desktop 不干扰不变量
 
 - relay 只能连接操作者显式配置、已经存在且通过版本与文件身份门禁的 socket；
-- 版本不兼容、端点离线或协议不兼容时保持 `incompatible` / `offline`，不做修复性生命周期操作；
-- relay 关闭的只能是自己启动的 `app-server proxy` 子进程，不能向原生 daemon 发送停止、重启、
-  升级、remote-control 切换或认证变更请求；
-- 离线开发只能连接测试拥有的 fake proxy/daemon，不得把真实 Desktop socket 作为自动化测试夹具；
-- 不兼容时不能自动回退到现有私有 API-key 后端；认证模式和目标端点都必须来自操作者显式配置。
+- 版本不兼容、端点离线或协议不兼容时保持失败关闭，不执行修复性生命周期操作；
+- relay 关闭的只能是自己启动的 proxy 子进程，不能向原生 daemon 发送停止、重启、升级、
+  remote-control 切换或状态变更请求；
+- 离线测试只能连接测试拥有的 fake proxy/daemon，不得把真实 Desktop socket 作为夹具；
+- 不兼容时不能自动回退到现有私有 API-key backend；目标端点必须来自操作者显式配置。
 
-## 7. 离线执行生命周期原型
+## 6. 离线执行生命周期原型
 
-第二个实现切片新增
-[`CodexNativeExecutionLifecycle`](../src/backends/codex/native-execution-lifecycle.ts)。它接收一个
-已经由上层建立的 proxy client，只负责把 turn 事件映射为 `ExecutionBackend` 既有语义；它不
-连接 socket、不做认证、不管理原生 daemon，也没有被 `daemon.ts` 或 `serve` 导入。
+[`CodexNativeExecutionLifecycle`](../src/backends/codex/native-execution-lifecycle.ts) 接收已经由上层建立
+的 proxy client，只负责把 turn 事件映射为 `ExecutionBackend` 既有语义。它不连接 socket、不读取
+账号状态、不管理原生 daemon，也没有被 `daemon.ts` 或 `serve` 导入。
 
-[`codex_native_execution_lifecycle.test.ts`](../tests/codex_native_execution_lifecycle.test.ts) 只用
-测试拥有的 fake proxy 验证：
+[`codex_native_execution_lifecycle.test.ts`](../tests/codex_native_execution_lifecycle.test.ts) 使用 fake
+proxy 验证：
 
-- 只有 `turn/start` 可证明未写入时才返回 `not_sent`，已写入超时或未知错误返回 `submitted`
-  并进入 ambiguous disconnect；
-- `accepted` handler 完成后才允许交付 terminal，重复 terminal 只产生一个 final；
-- provider 明确拒绝认证时只输出稳定分类并携带 `credential_rejected`；
-- cancel、terminal timeout 和 proxy 意外退出都按现有 fencing/disconnect 语义收口；
+- 只有 `turn/start` 可证明未写入时才返回 `not_sent`，其余提交不确定性进入 ambiguous disconnect；
+- accepted handler 完成后才允许交付 terminal，重复 terminal 只产生一个 final；
+- 任意本地 backend failed 都按普通、脱敏、不可自动重试的 failed 结算，不识别账号类型，不设置
+  `credential_rejected`，也不因此断开或 quarantine session；
+- cancel、terminal timeout 和 proxy 意外退出按现有 fencing/disconnect 语义收口；
 - lifecycle stop 只关闭测试 proxy，fake 原生 daemon 保持运行且零生命周期调用。
 
-该原型的 `status.productionReady` 固定为 `false`。它没有验证安全 attach、原生认证、thread
-创建/恢复、server config/sandbox 回读或 session checkpoint，不能单独构成生产 backend。
+## 7. 离线 thread 安全与 checkpoint 原型
 
-## 8. 离线 thread 安全与 checkpoint 原型
+[`prepareCodexNativeThread`](../src/backends/codex/native-thread-policy.ts) 继续只接收测试或上层已经建立
+的 client。它在创建或恢复 thread 前回读 permission profile 与 feature 快照，固定 workspace、审批、
+model/provider 和 sandbox，关闭 memory，并验证 fresh/resume checkpoint。
 
-第三个切片新增
-[`prepareCodexNativeThread`](../src/backends/codex/native-thread-policy.ts)，继续只接收测试或上层
-已经建立的 client，不连接真实 socket，也没有进入 `serve`。它在 fake client 上按以下顺序
-失败关闭：
+这些是执行隔离与结果归属门禁，不是账号门禁。thread 无法创建或恢复时按 transport、协议、提交
+可证明性与 checkpoint 语义失败，不推断原因是否与本地认证有关。
 
-1. 创建或恢复 thread 前，回读固定 `livis-remote` permission profile 和完整 feature 快照；
-2. 固定 workspace、runtime root、`approvalPolicy=never`、reviewer、model/provider；
-3. 拒绝继承的 instruction source、开放网络、额外 writable root、profile 继承或 sandbox 漂移；
-4. 显式设置 `thread/memoryMode=disabled`；
-5. fresh thread 必须是空历史，resume 必须与持久 thread/model/provider/checkpoint 精确一致；
-6. thread 请求可证明未写入才返回可重试分类，其余创建/恢复不确定性要求 quarantine。
+## 8. 纯 client epoch fencing
 
-[`codex_native_thread_policy.test.ts`](../tests/codex_native_thread_policy.test.ts) 覆盖 fresh、resume、
-全局 feature/profile 不兼容、thread 安全漂移、提交不确定、memory 失败和 checkpoint 漂移。
-现有私有 app-server backend 也复用了“拒绝继承 instruction source”的同一回读函数。
+[`CodexNativeClientEpochFence`](../src/backends/codex/native-client-epoch.ts) 每次 proxy attach 只分配递增
+epoch。receipt 只包含 epoch 和 `productionReady=false`，不发 RPC，也不保存账号、主体哈希或认证
+状态。
 
-这一步同时确认了当前架构阻塞：permission profile 与 feature 集合由原生 daemon 提供。relay
-不能通过修改用户默认配置、重启 Desktop daemon 或关闭用户 feature 来制造安全前提。真实端点
-必须已经提供不影响 Desktop 的逐客户端/逐 thread 隔离，或由上游增加该能力；否则这里的离线
-原型不能接线，`codex_native_auth_reuse` 必须保持 `unsupported`。
+notification、proxy exit 和 turn timeout 都绑定产生它们的 epoch。新 attach 会 fence 旧 epoch；旧
+proxy 的迟到 terminal、exit 或 timer 不会结算、断开或 interrupt 新 proxy。每个新 epoch 使用新的
+lifecycle 实例，不复用旧 active attempt 或 accepted gate。
 
-## 9. 离线账号绑定与 client epoch fencing
+[`codex_native_client_epoch.test.ts`](../tests/codex_native_client_epoch.test.ts) 与 lifecycle fake 测试覆盖
+上述边界。epoch fence 不决定恢复时机；未来持久 coordinator 仍必须先结算或隔离旧 active attempt。
 
-第四个切片新增
-[`CodexNativeClientEpochFence`](../src/backends/codex/native-auth-session.ts)，并把它接入仍然只供
-fake client 使用的执行 lifecycle。它不连接 socket、不创建 thread，也没有进入 `serve`。
+## 9. 下一实现门禁
 
-每次 proxy attach 都分配严格递增的 client epoch，并先执行一次
-`account/read(refreshToken=false)`。内存 receipt 只保留 `accountType`、主体哈希、identity strength
-和 `requiresOpenaiAuth`；邮箱、账号明文、token、scope、cookie 和 provider 原始错误不会进入 receipt、
-状态或 quarantine reason。执行 lifecycle 在每次 `turn/start` 前再次做同样的只读回读：
+下一阶段只组合执行状态，不引入账号状态：
 
-- 当前未认证时使用稳定分类 `backend_auth_unavailable`，要求隔离已有 session，且不发送
-  `turn/start`；
-- account type、强主体哈希或认证要求漂移时使用 `native_account_binding_drift`，不允许新账号自动
-  继承旧 thread；
-- 畸形响应或读取失败使用 `native_account_response_incompatible` 并失败关闭，不透传原始错误；
-- 只有 `identityStrength=subject` 的账号可以建立执行绑定。`type-only` 无法证明同类型账号没有被
-  替换，因此保持 incompatible，不能用弱身份恢复持久 thread。
+1. 用持久 session coordinator 组合 epoch、thread policy、checkpoint 与 lifecycle；
+2. idle session 只有在 thread/checkpoint 精确一致时才能恢复；active 或提交不确定的 attempt 必须按
+   ambiguous execution 隔离，不能自动重发；
+3. 本地 backend failed 只结算当前 job，后续 job 仍可继续调用本地当前状态；
+4. coordinator 不读取或持久化 account type、主体、登录状态、token、scope 或 provider 认证分类；
+5. 真实 Desktop/CLI 并发只能在另行授权的非生产 canary 中验证。
 
-notification、proxy exit 和 turn timeout 都绑定产生它们的 epoch。新 attach 会立即 fence 旧 epoch；
-旧 proxy 的迟到 terminal、exit 或 timer 不会结算、断开或 interrupt 新 proxy。每个新 epoch 必须重新
-建立账号 receipt 和新的 lifecycle 实例，不复用旧 active attempt、accepted gate 或认证绑定。
-
-[`codex_native_auth_session.test.ts`](../tests/codex_native_auth_session.test.ts) 和
-[`codex_native_execution_lifecycle.test.ts`](../tests/codex_native_execution_lifecycle.test.ts) 完全使用
-fake client/proxy 覆盖上述边界。epoch fence 本身不决定何时允许恢复：未来持久 session coordinator
-仍必须先证明旧 active attempt 已结算或已按 ambiguous execution 隔离，再允许新 epoch 恢复 thread。
-这项持久化组合尚未实现，因此 capability 继续保持 `unsupported`。
-
-## 10. 下一实现门禁
-
-在生产接线前还必须独立闭合：
-
-1. 等待 Desktop/原生 daemon 自然进入同一审核窗口，或连接另一个不影响 Desktop 的兼容端点，
-   并得到 `ready` 探针；relay 不执行任何对齐、升级或重启动作；
-2. 在不修改 Desktop 配置或生命周期的前提下，让兼容端点通过已离线实现的 permission、feature、
-   instruction、sandbox、memory 和 checkpoint 门禁；若做不到则记录为上游能力阻塞；
-3. 把已离线验证的账号绑定、epoch fence、lifecycle/thread policy 与安全 attach、持久 session 和
-   daemon handler 组合，证明旧 active attempt 完成隔离后才允许新 epoch 恢复 thread；
-4. 真实 Desktop/CLI 并发只能在另行授权的非生产 canary 中验证；完成不复制凭据且不影响 Desktop
-   的 canary 后，才允许修改机器可读 capability 状态。
+即使上述离线组合完成，能力仍保持 `unsupported`，直到安全 attach、Desktop 不干扰和真实并发 canary
+分别闭合。

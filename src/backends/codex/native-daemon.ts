@@ -6,7 +6,6 @@ import type {
 } from "./app-server-client.ts";
 import { CodexAppServerClient } from "./app-server-client.ts";
 import {
-  inspectCodexAccountResponse,
   runCodexCommand,
   validateCodexVersion,
   type CodexCommandRunner,
@@ -29,7 +28,6 @@ export type CodexNativeDaemonProbeErrorCode =
   | "native_daemon_socket_insecure"
   | "native_proxy_unavailable"
   | "native_initialize_incompatible"
-  | "native_account_response_incompatible"
   | "native_proxy_close_unconfirmed";
 
 export class CodexNativeDaemonProbeError extends Error {
@@ -46,15 +44,16 @@ export class CodexNativeDaemonProbeError extends Error {
 export interface CodexNativeDaemonProbeReport {
   ok: boolean;
   probeCompleted: true;
-  readiness: "ready" | "authentication-required";
+  readiness: "ready";
   transport: "app-server-daemon-proxy";
   cliVersion: string;
   appServerVersion: string;
   startedNativeDaemon: false;
   sentModelTurn: false;
   productionReady: false;
-  verified: readonly ["native-daemon-transport", "native-authentication-state"];
+  verified: readonly ["native-daemon-transport"];
   unverified: readonly [
+    "native-backend-execution-state",
     "server-config-isolation",
     "thread-turn-lifecycle",
     "session-resume",
@@ -87,7 +86,6 @@ export interface PinnedCodexNativeSocket {
 
 interface CodexNativeProbeClient {
   readonly initializeResult: unknown;
-  request<T = unknown>(method: string, params?: unknown, timeoutMs?: number): Promise<T>;
   close(): Promise<void>;
 }
 
@@ -453,26 +451,10 @@ export async function probeCodexNativeDaemon(
     );
   }
 
-  let readiness: CodexNativeDaemonProbeReport["readiness"];
   let primaryError: unknown;
   let hasPrimaryError = false;
   try {
     validateNativeInitialize(client.initializeResult, options.stateDir);
-    await commandPinAsserter(options.command);
-    await socketPinAsserter(socketPin);
-    let account;
-    try {
-      account = inspectCodexAccountResponse(
-        await client.request("account/read", { refreshToken: false }),
-      );
-    } catch (error) {
-      throw new CodexNativeDaemonProbeError(
-        "native_account_response_incompatible",
-        "Codex native account/read 响应未经审核",
-        { cause: error },
-      );
-    }
-    readiness = account.accountType === null ? "authentication-required" : "ready";
     await commandPinAsserter(options.command);
     await socketPinAsserter(socketPin);
   } catch (error) {
@@ -496,17 +478,18 @@ export async function probeCodexNativeDaemon(
   }
 
   return {
-    ok: readiness === "ready",
+    ok: true,
     probeCompleted: true,
-    readiness,
+    readiness: "ready",
     transport: "app-server-daemon-proxy",
     cliVersion,
     appServerVersion: daemonVersion.appServerVersion,
     startedNativeDaemon: false,
     sentModelTurn: false,
     productionReady: false,
-    verified: ["native-daemon-transport", "native-authentication-state"],
+    verified: ["native-daemon-transport"],
     unverified: [
+      "native-backend-execution-state",
       "server-config-isolation",
       "thread-turn-lifecycle",
       "session-resume",

@@ -4,7 +4,6 @@ import {
   LOCAL_BACKEND_AUTH_INTEGRATION,
   LOCAL_BACKEND_CONTRACT_VERSION,
   LOCAL_BACKEND_IMPLEMENTATION_STATE,
-  LocalBackendAuthenticationUnavailableError,
   TARGET_LOCAL_BACKENDS,
   isLocalBackendKind,
   type LocalBackendAdapter,
@@ -104,19 +103,16 @@ describe("本地后端中立契约", () => {
     ]);
   });
 
-  test("认证不可用只返回稳定错误，不在 daemon 内发起登录", () => {
+  test("认证状态对 daemon 完全不透明，本地错误继续走执行结果", () => {
     expect(LOCAL_BACKEND_AUTH_POLICY).toEqual({
-      targetMode: "native-current-state",
+      targetMode: "native-current-state-opaque",
       credentialOwner: "native-backend",
       daemonReadsCredentialStores: false,
+      daemonInspectsAuthenticationState: false,
       daemonStartsAuthentication: false,
       daemonRefreshesCredentials: false,
-      authenticationUnavailableCode: "backend_auth_unavailable",
+      daemonBlocksInvocationOnAuthenticationState: false,
+      backendErrorsFlowThroughExecution: true,
     });
-
-    const error = new LocalBackendAuthenticationUnavailableError("claude");
-    expect(error.code).toBe("backend_auth_unavailable");
-    expect(error.backend).toBe("claude");
-    expect(error.message).toContain("原生客户端");
   });
 });
