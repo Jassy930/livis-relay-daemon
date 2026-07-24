@@ -105,7 +105,7 @@
       "status": "unsupported",
       "evidenceRefs": ["docs/LOCAL-BACKENDS.md", "docs/CODEX-NATIVE-AUTH.md"],
       "testRefs": ["tests/auth_boundary.test.ts", "tests/local_backend_contract.test.ts", "tests/codex_native_daemon.test.ts", "tests/codex_native_client_epoch.test.ts", "tests/codex_native_execution_lifecycle.test.ts", "tests/codex_native_thread_policy.test.ts", "tests/codex_native_session_coordinator.test.ts", "tests/codex_native_session_harness.test.ts"],
-      "notes": "已实现不启动 daemon、不读取账号状态的 transport-only native 探针，以及仅对 fake daemon/socket/proxy 验证的安全 attach、client epoch fencing、执行 lifecycle、thread policy/checkpoint、持久 session coordinator 与受控组合 harness；本地账号与凭据状态对 relay 完全不透明。原型未接入 serve，真实 server config、daemon 被动重启、并发和 Desktop 不干扰仍未闭合，因此保持 unsupported。"
+      "notes": "已实现不启动 daemon、不读取账号状态的独立 transport-only native 探针，以及仅对 fake daemon/socket/proxy 验证的安全 attach、client epoch fencing、执行 lifecycle、thread policy/checkpoint、持久 session coordinator 与受控组合 harness；本地账号与凭据状态对 relay 完全不透明。2026-07-24 真实 Gate 1 因 CLI 0.145.0 与 app-server 0.144.1 不兼容而在 proxy 前失败关闭，前后原生 daemon 未改变。原型未接入 serve，真实 initialize、daemon 被动重启、并发和 Desktop 不干扰仍未闭合，因此保持 unsupported。"
     },
     {
       "id": "claude_execution",

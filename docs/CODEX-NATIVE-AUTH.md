@@ -7,7 +7,8 @@ daemon，并使用本地当前状态执行。relay 不读取、判断、绑定�
 拦截，也不把其中任何一种识别成特殊认证状态。只要 transport 可连接且协议兼容，就直接调用；
 执行失败按普通 backend failed 结算，不自动重试、不 fallback，也不隔离账号。
 
-当前实现仍是离线原型，不会把 `codex_native_auth_reuse` 提升为已支持。
+transport probe 已完成一次真实 fail-closed Gate 1；attach 后的 thread/turn/session 仍只有离线原型，
+不会把 `codex_native_auth_reuse` 提升为已支持。
 
 ## 1. Transport-only 探针
 
@@ -22,6 +23,20 @@ bun run src/index.ts codex probe-native-daemon \
 
 配置中的 `codex.command` 必须是 stateDir 外的绝对路径。成功只证明 transport 可以安全握手，
 输出中的 `productionReady` 仍固定为 `false`。
+
+只检查本地 Codex transport 时，不应被 Relay、Hermes、SecretStore 或旧部署配置阻断。可以显式
+提供 command 与现有 state directory，完全跳过 `loadRelayConfig`：
+
+```bash
+bun run src/index.ts codex probe-native-daemon \
+  --socket /绝对路径/app-server-control.sock \
+  --command /绝对路径/codex \
+  --state-dir /绝对路径/现有私有状态目录
+```
+
+`--command` 与 `--state-dir` 必须同时提供，且不能与 `--config` 混用。这里的 state directory 只用于
+固定 CLI 位于其外部，并验证 initialize 报告的原生 runtime 也位于其外部；probe 不在其中创建
+runtime、不打开数据库，也不读取 SecretStore。显式模式使用仓库固定的 request/shutdown timeout。
 
 探针按以下顺序失败关闭：
 
@@ -62,10 +77,16 @@ initialize 必须证明原生 runtime 的 `codexHome` 位于 relay stateDir 之�
 报告只把 `native-daemon-transport` 列为已验证。server config 隔离、thread/turn 生命周期、session
 resume、真实执行状态和 Desktop/CLI 并发仍明确未验证。
 
-## 4. 2026-07-24 本机历史观察
+## 4. 2026-07-24 本机 Gate 1 观察
 
-当时固定 CLI 为 `0.145.0`，运行中的原生 app-server 为 `0.144.1`，因此探针在连接 proxy 前返回
-`native_daemon_version_incompatible`。该记录只是历史快照，本轮离线开发没有重新读取真实端点。
+本轮获授权后先用官方只读 `daemon version` 建立前置基线，再用显式 command/stateDir 模式运行
+真实 probe。固定 CLI 为 `0.145.0`，运行中的原生 app-server 为 `0.144.1`，因此探针在启动 proxy
+前返回 `native_daemon_version_incompatible`，并明确报告 `startedNativeDaemon=false`、
+`sentModelTurn=false`、`productionReady=false`。
+
+probe 后再次读取官方 daemon report 和精确原生 app-server 进程，版本、socket 与进程身份均未改变。
+本次没有 initialize、thread、turn、账号状态读取或 daemon 生命周期操作。它只证明真实 Gate 1
+失败关闭且未干扰 Desktop，不证明 transport initialize、并发或执行可用。
 
 relay 不会为了通过门禁而启动、停止、重启、替换或升级 Desktop 及其原生 daemon，也不会启用或
 关闭 remote control。
@@ -172,8 +193,8 @@ daemon report、socket pin 和 proxy，覆盖：
 
 离线 attach 与执行状态组合已经完成，下一阶段仍不引入账号处理：
 
-1. 在另行授权前不运行真实 Desktop/CLI canary；下一真实门禁是并发、逐 thread 隔离、被动 daemon
-   重启恢复与 Desktop 不干扰，不是账号状态探测；
+1. 当前真实 Gate 1 已在版本门禁前安全停止；在端点进入审核窗口或 `0.144.1` 获得独立兼容审计前，
+   不运行 initialize、并发、逐 thread 隔离或被动 daemon 重启 canary；
 2. canary 必须使用操作者显式配置的现有 socket，不启动、停止、重启、升级或修改 Desktop daemon；
 3. 保持 coordinator/harness 不读取或持久化 account type、主体、登录状态、token、scope 或 provider
    认证分类；本地错误继续按普通 execution failed；

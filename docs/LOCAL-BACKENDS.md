@@ -152,8 +152,13 @@ adapter 还必须提供断连事件通道；在这些字段和映射测试落地
 首个只读切片已实现：[`codex probe-native-daemon`](./CODEX-NATIVE-AUTH.md) 固定 CLI、核验原生
 daemon/app-server 版本与私有 Unix socket，并通过官方 proxy 只完成 initialize。它不读取账号状态，
 不会启动或重启原生 daemon，也不会创建 thread；报告始终保持 `productionReady=false`。
-2026-07-24 的历史观察中 CLI `0.145.0` 与 app-server `0.144.1` 不一致；本轮离线工作没有重新读取
-真实端点。
+该 CLI 现在支持显式 `--command + --state-dir`，只做 Codex transport 检查时不加载 Relay/Hermes
+配置、SecretStore 或数据库。
+
+2026-07-24 获授权的真实 Gate 1 再次确认 CLI `0.145.0` 与 app-server `0.144.1` 不一致；独立 probe
+在启动 proxy 前返回 `native_daemon_version_incompatible`。前后官方 daemon report 与原生进程身份
+一致，没有 initialize、thread、turn 或生命周期操作。因此当前真实端点仍为 `incompatible`，不能
+进入并发执行 canary，也不能通过升级/重启 Desktop 或放宽未经审核的版本窗绕过。
 
 当前 Codex Desktop 及其原生 daemon 是用户拥有的外部系统。relay 只允许 attach 操作者显式配置、
 已经存在且版本兼容的 socket；不得启动、停止、重启、替换或升级 Desktop daemon，不得启用或关闭
@@ -207,6 +212,9 @@ proxy，仍未连接真实 Desktop，也未进入生产入口。
 4. fake 端点已覆盖成功、普通 backend failed、超时、取消、proxy 退出、resume 和旧 epoch 迟到
    事件；daemon 被动重启、真实 Desktop/CLI 并发与逐 thread 不干扰只在另行授权的非生产 canary
    中验证。
+5. 当前真实 Gate 1 被 app-server `0.144.1` 与审核窗口 `[0.145.0, 0.146.0)` 的不兼容阻塞；本地
+   账号状态无论正确或错误都不是该阻塞的判定输入。只有端点自然进入已审核窗口，或先独立完成
+   `0.144.1` 协议/隔离审计并形成新的兼容证据，才能继续 initialize 与并发 canary。
 
 完成定义：另行授权的非生产 canary 证明 daemon 未产生第二份后端凭据、未读取账号状态、未改变
 Codex Desktop 生命周期或状态、日常 Codex 仍可用、job/lease/checkpoint 全闭合，才考虑把

@@ -317,4 +317,71 @@ describe("Codex 原生 daemon 只读兼容性探针", () => {
       await Promise.all([state.cleanup(), external.cleanup()]);
     }
   });
+
+  test("CLI 显式 command/stateDir 模式不加载 Relay/Hermes 配置", async () => {
+    const state = await temporaryDirectory("livis-codex-native-explicit-state-");
+    const external = await temporaryDirectory("livis-codex-native-explicit-command-");
+    try {
+      await chmod(state.path, 0o700);
+      const socketPath = join(external.path, "not-created.sock");
+      const command = join(external.path, "codex");
+      const daemonReport = JSON.stringify({
+        status: "running",
+        socketPath,
+        cliVersion: "0.145.0",
+        appServerVersion: "0.144.1",
+      });
+      await writeFile(command, [
+        "#!/bin/sh",
+        "if [ \"$1\" = \"--version\" ]; then",
+        "  printf 'codex-cli 0.145.0\\n'",
+        "else",
+        `  printf '%s\\n' ${JSON.stringify(daemonReport)}`,
+        "fi",
+        "",
+      ].join("\n"), { mode: 0o700 });
+
+      const child = Bun.spawn([
+        process.execPath,
+        "run",
+        "src/index.ts",
+        "codex",
+        "probe-native-daemon",
+        "--socket",
+        socketPath,
+        "--command",
+        command,
+        "--state-dir",
+        state.path,
+      ], {
+        cwd: PROJECT_ROOT,
+        env: {
+          ...process.env,
+          LIVIS_RELAY_CONFIG: join(external.path, "must-not-be-read.json"),
+          LIVIS_RELAY_STATE_DIR: join(external.path, "must-not-be-used"),
+        },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ]);
+      expect(exitCode).toBe(1);
+      expect(stderr).toBe("");
+      expect(JSON.parse(stdout)).toMatchObject({
+        ok: false,
+        probeCompleted: false,
+        readiness: "incompatible",
+        reasonCode: "native_daemon_version_incompatible",
+        startedNativeDaemon: false,
+        sentModelTurn: false,
+        productionReady: false,
+      });
+    } finally {
+      await Promise.all([state.cleanup(), external.cleanup()]);
+    }
+  });
 });

@@ -5,6 +5,8 @@ import { dirname, join, resolve } from "node:path";
 import {
   CODEX_MAXIMUM_EXCLUSIVE_VERSION,
   CODEX_MINIMUM_VERSION,
+  DEFAULT_CODEX_REQUEST_TIMEOUT_MS,
+  DEFAULT_CODEX_SHUTDOWN_TIMEOUT_MS,
   loadRelayConfig,
   initializeConfig,
   DEFAULT_CONFIG_PATH,
@@ -731,17 +733,36 @@ async function commandCodexProbeNativeDaemon(args: string[]): Promise<void> {
   const socket = optionValue(args, "--socket");
   if (!socket) {
     throw new Error(
-      "用法：codex probe-native-daemon --socket /绝对路径/app-server-control.sock [--config PATH]",
+      "用法：codex probe-native-daemon --socket /绝对路径/app-server-control.sock " +
+        "[--config PATH | --command /绝对路径/codex --state-dir /绝对路径]",
     );
   }
-  const loaded = await loadRelayConfig(optionValue(args, "--config"));
-  const canonicalStateDir = await realpath(loaded.config.stateDir);
+  const configPath = optionValue(args, "--config");
+  const explicitCommand = optionValue(args, "--command");
+  const explicitStateDir = optionValue(args, "--state-dir");
+  if ((explicitCommand === undefined) !== (explicitStateDir === undefined)) {
+    throw new Error("--command 与 --state-dir 必须同时提供");
+  }
+  if (configPath !== undefined && explicitCommand !== undefined) {
+    throw new Error("--config 不能与 --command/--state-dir 同时提供");
+  }
+  const loaded = explicitCommand === undefined
+    ? await loadRelayConfig(configPath)
+    : null;
+  const canonicalStateDir = await realpath(expandHome(
+    explicitStateDir ?? loaded!.config.stateDir,
+  ));
+  const configuredCommand = explicitCommand ?? loaded!.config.codex.command;
+  const requestTimeoutMs = loaded?.config.codex.requestTimeoutMs ??
+    DEFAULT_CODEX_REQUEST_TIMEOUT_MS;
+  const shutdownTimeoutMs = loaded?.config.codex.shutdownTimeoutMs ??
+    DEFAULT_CODEX_SHUTDOWN_TIMEOUT_MS;
   let report: unknown;
   let ok = false;
   try {
     const command = await pinCodexCommandForStateDir(
       canonicalStateDir,
-      loaded.config.codex.command,
+      expandHome(configuredCommand),
     );
     const nativeReport = await probeCodexNativeDaemon({
       command,
@@ -750,8 +771,8 @@ async function commandCodexProbeNativeDaemon(args: string[]): Promise<void> {
       cwd: PROJECT_ROOT,
       minimumVersion: CODEX_MINIMUM_VERSION,
       maximumExclusiveVersion: CODEX_MAXIMUM_EXCLUSIVE_VERSION,
-      requestTimeoutMs: loaded.config.codex.requestTimeoutMs,
-      shutdownTimeoutMs: loaded.config.codex.shutdownTimeoutMs,
+      requestTimeoutMs,
+      shutdownTimeoutMs,
       clientVersion: DAEMON_VERSION,
     });
     report = nativeReport;
@@ -799,7 +820,10 @@ function printHelp(): void {
   process.stdout.write("  connector-token [--config PATH]\n");
   process.stdout.write("  session release <sessionKey> [--config PATH]\n");
   process.stdout.write("  codex smoke-app-server --command PATH [--config PATH] [--state-dir PATH | --create-state-dir PATH] [--verify-read-isolation]\n");
-  process.stdout.write("  codex probe-native-daemon --socket PATH [--config PATH]\n");
+  process.stdout.write(
+    "  codex probe-native-daemon --socket PATH " +
+      "[--config PATH | --command PATH --state-dir PATH]\n",
+  );
 }
 
 async function main(): Promise<void> {
