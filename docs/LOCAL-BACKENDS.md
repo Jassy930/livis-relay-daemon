@@ -129,7 +129,7 @@ adapter 还必须提供断连事件通道；在这些字段和映射测试落地
 - 本地状态不透明的静态声明与离线扫描基线已经完成：概念 payload 不含凭据或账号字段，Codex 实现状态与现有私有认证路径分开，Claude 明确为 `contract-only`。生产 adapter 生命周期契约仍需补齐提交可证明性与断连，不能把声明层视为已完成接线。
 - 当前只有 `bun run src/index.ts ...` 和 package script，没有安装后可直接调用的稳定 `livis-relay` / `livis-relayd` bin 入口。
 - 当前 `main` 使用 `livis-relay-v1-access-only-r2`，本地 S2 门禁已闭合；最终组合 head 的真实 Relay access-only canary 仍是正式启用阻塞项。
-- 旧 `worktree-arch-refactor` 的多 connector/outbox pump 原型假设与当前 JobStore v7、ExecutionBackend 和单 backend 失败关闭边界不同，只能作为设计输入，不能直接 cherry-pick。旧 Hermes 0.18.2 / connector v2 / 远程 `/sethome` 路线同样不得进入当前基线。
+- 旧 `worktree-arch-refactor` 的多 connector/outbox pump 原型假设与当前 JobStore v8、ExecutionBackend 和单 backend 失败关闭边界不同，只能作为设计输入，不能直接 cherry-pick。旧 Hermes 0.18.2 / connector v2 / 远程 `/sethome` 路线同样不得进入当前基线。
 
 建议按下面顺序逐块开发，每块独立提交并在精确 staged tree 上运行 `bun run check`。
 
@@ -176,14 +176,22 @@ permission profile、feature、model/provider、sandbox、memory 和 fresh/resum
 [`epoch 测试`](../tests/codex_native_client_epoch.test.ts) 与
 [`生命周期测试`](../tests/codex_native_execution_lifecycle.test.ts) 仍全部使用 fake 端点。
 
+第五个切片 [`native session coordinator`](../src/backends/codex/native-session-coordinator.ts) 已把
+epoch、thread policy/checkpoint、JobStore job/lease/run generation 与 lifecycle 组合成纯离线持久
+状态机。JobStore schema v8 用 `local-state-opaque` 显式标识这类 session/attempt，相关账号列必须
+保持 `NULL`；fresh thread 与初始 checkpoint 在同一 SQLite 事务中绑定，idle 重启只允许精确
+resume，历史 active/recovery、metadata/checkpoint 漂移和提交不确定性都进入 ambiguous quarantine。
+普通本地 backend failed 只结算当前 job，后续 job 仍可继续调用同一 transport。该原型及测试没有
+连接真实 socket，也没有进入 `daemon.ts`、`index.ts`、`config.ts` 或生产 `serve`。
+
 这里仍有一个执行隔离门槛：permission profile 与 feature 集合由原生 daemon 持有。relay 不得通过
 修改用户默认配置、重启 Desktop daemon 或关闭用户 feature 来满足门禁；兼容端点必须原生提供不
 影响 Desktop 的逐客户端/逐 thread 隔离。做不到就保持 `unsupported`，不能削弱门禁换取接线。
 
 工作包：
 
-1. 实现持久 session coordinator，只组合 epoch、thread/checkpoint、job/lease 与 lifecycle；旧 active
-   attempt 必须先结算或进入 ambiguous quarantine，才允许新 epoch 恢复 thread。
+1. 持久 session coordinator 的离线组合已完成；后续真实 attach 仍必须保持旧 active attempt 先结算
+   或进入 ambiguous quarantine，才允许新 epoch 恢复 thread。
 2. 原生模式不读取或持久化 account type、主体、登录状态、token、scope 或 provider 认证分类；现有
    `private-api-key` 兼容路径只能由操作者显式选择，不能自动 fallback。
 3. readiness 只描述 transport 的 `ready | offline | incompatible`；本地执行错误不降低 transport

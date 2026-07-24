@@ -677,7 +677,7 @@ bun run check
 - active protocol profile 是当前支持的 schema v2，supported proof 未过期；
 - Hermes runtime 固定在 `[0.15.1, 0.15.2)`，bridge 固定在配置允许范围；未知版本保持失败关闭；
 - state directory 位于仓库外并为 `0700`，config、proof、token 与数据库文件不进入部署 checkout；
-- 若旧 `relay.db` 尚未由当前代码打开，先按第 8 节停服备份，再允许 JobStore v7 迁移；
+- 若旧 `relay.db` 尚未由当前代码打开，先按第 8 节停服备份，再允许 JobStore v8 迁移；
   v4 有待派发 job 时必须先声明其原始 backend。
 
 #### 7.2 安装 Relay 与 Hermes LaunchAgent
@@ -1426,7 +1426,7 @@ Hermes 的 stdout/stderr 路径以 runtime 生成的 plist 为准，先用 `plut
 升级必须在停服窗口完成：
 
 1. 按 Hermes → Relay 顺序停止两个 LaunchAgent，并确认 label 均不再运行。
-2. 完整备份 state directory；JobStore v7 场景必须包含 `relay.db`、WAL 和 SHM。备份前不要运行会打开数据库的新版 `serve`、`doctor` 或 `session release`。
+2. 完整备份 state directory；JobStore v8 场景必须包含 `relay.db`、WAL 和 SHM。备份前不要运行会打开数据库的新版 `serve`、`doctor` 或 `session release`。
 3. 在稳定 checkout 中获取并切换到精确已审阅提交，确认工作树干净，执行 `bun install --frozen-lockfile` 与 `bun run check`。
 4. 按第 6 节把当前提交中的 bridge 三个文件重新安装到隔离 Hermes profile；将私有 `config.json` 的 `hermes.bridgeMinimumVersion` 显式更新为 `"0.1.1"`（或已独立评审的更高安全版本），并读回确认该值仍小于 `bridgeMaximumExclusiveVersion`。daemon 0.1.1 会在打开数据库、连接 Relay 或接受 connector 前拒绝仍允许 0.1.0 的存量配置；不要只覆盖 plugin 文件，也不要从 LiViS 通道执行 `/update`。
 5. 若 active protocol profile 仍为 schema v1，只能按升级 runbook 在停服状态执行 `profile migrate-v2` 并重新生成 proof；普通 `upstream activate` 不能替代 schema migration，也不得由 launchd 自动猜测或旁路迁移。
@@ -1474,19 +1474,19 @@ bun run src/index.ts doctor --online --config "$CONFIG"
 
 普通回滚只恢复 `profile` 与 `profileSha256`，不会恢复 relay、security、Hermes、connector 或 stateDir 等其他字段；旧 profile 无法重新得到 current supported proof 时不得启动。schema v1→v2 migration 的回滚是另一套 `profile rollback-migration` 状态机，不能混用普通 activation 备份。
 
-回滚到不认识 JobStore v7 的旧 daemon 时，必须同时恢复升级前的完整数据库备份；只切回 checkout 或只回滚 protocol profile 都不安全。Hermes runtime 必须保持 `[0.15.1, 0.15.2)`，bridge 必须保持 `[0.1.1, 0.2.0)` 的 fail-closed 支持窗，除非独立升级评审已经修改代码、配置和 canary 证据。回滚到 bridge 0.1.0 会重新开放本次关闭的远程输入竞态和命令面，不属于受支持回滚。
+回滚到不认识 JobStore v8 的旧 daemon 时，必须同时恢复升级前的完整数据库备份；只切回 checkout 或只回滚 protocol profile 都不安全。Hermes runtime 必须保持 `[0.15.1, 0.15.2)`，bridge 必须保持 `[0.1.1, 0.2.0)` 的 fail-closed 支持窗，除非独立升级评审已经修改代码、配置和 canary 证据。回滚到 bridge 0.1.0 会重新开放本次关闭的远程输入竞态和命令面，不属于受支持回滚。
 
 #### 7.6 分层验收
 
 验收必须分层记录，不能用前一层替代后一层：
 
 1. **静态部署**：两个 plist 均通过 `plutil -lint`，绝对路径存在，无占位符或秘密，稳定 checkout 精确命中已审阅提交。
-2. **服务与连接就绪**：两个独立 label 正常；`bun run src/index.ts doctor --online` 和 `status` 显示当前 protocol profile v2、wire revision/mode、未过期 proof、Relay handshake、connector ready、JobStore v7 integrity、无异 backend 非终态积压及无意外 quarantine。
+2. **服务与连接就绪**：两个独立 label 正常；`bun run src/index.ts doctor --online` 和 `status` 显示当前 protocol profile v2、wire revision/mode、未过期 proof、Relay handshake、connector ready、JobStore v8 integrity、无异 backend 非终态积压及无意外 quarantine。
 3. **真实消息闭环**：从唯一获准设备发送带随机后缀的单条纯文本 canary，App 收到预期纯文本；同一 job 在 daemon 中为 `Succeeded`，outbox 为 `Delivered`，Hermes 日志存在对应 inbound/response，且没有第二 final、fallback send 或权限错误。
 
 “LaunchAgent 已加载”“服务在线”“Relay 已握手”或“connector ready”都不等于消息闭环。只有第 3 层在精确部署提交、profile、Hermes 0.15.1/bridge 版本和时间上留下脱敏记录后，才能写成 launchd canary 通过；未执行时必须明确写“未验证”。
 
-## 8. 结果 ACK 退避、JobStore v7 升级与 backend 切换
+## 8. 结果 ACK 退避、JobStore v8 升级与 backend 切换
 
 `status` 中的 `recentJobs[].outboxStatus=AckFailed` 表示结果在当前 ACK 快速重试
 周期耗尽后进入持久化退避；`outboxNextAttemptAt` 是下一次尝试的 Unix 毫秒时间。
@@ -1494,10 +1494,12 @@ bun run src/index.ts doctor --online --config "$CONFIG"
 直接收敛为 `Delivered`。
 
 本版本第一次由 `serve`、`doctor` 或 `session release` 打开旧 `relay.db` 时，会把
-JobStore schema v1-v6 自动升级为 v7；fresh 数据库直接创建为 v7。v3 的 outbox 退避
+JobStore schema v1-v7 自动升级为 v8；fresh 数据库直接创建为 v8。v3 的 outbox 退避
 语义保持不变，v4 新增可变的 `backend_sessions`，v5 新增 `jobs.target_backend`，v6 新增
 Codex 账号/模型/安全摘要和 thread-tail checkpoint；v7 以 trigger 强制
-`jobs.target_backend` 不可变，并新增 `execution_attempt_events` append-only 账本。新 job
+`jobs.target_backend` 不可变，并新增 `execution_attempt_events` append-only 账本；v8 为 session
+和 attempt 增加 `account-bound | local-state-opaque` 状态所有权，本地状态不透明行的账号字段
+必须保持 `NULL`。新 job
 在首次入库时绑定当前 backend；重复投递和以后切换配置都不能改写。迁移在同一个 SQLite
 `BEGIN IMMEDIATE` 事务中取得写锁后读取版本，并在提交前运行 integrity 与 foreign-key
 检查；失败会保留原版本，不允许半迁移状态继续运行。部署步骤固定为：
@@ -1510,11 +1512,11 @@ Codex 账号/模型/安全摘要和 thread-tail checkpoint；v7 以 trigger 强�
    存在 `Received/Acked` job，先查明这些积压实际入库时使用的唯一 backend，并在
    config 的 `execution` 段临时填写 `"legacyV4JobBackend": "hermes"` 或
    `"codex"`。不能填写准备切换到的目标 backend；无法确认或曾混用时停止迁移，保留
-   备份并人工处置。缺少该声明时新版会回滚全部 v4→v7 DDL 并拒绝打开数据库。
+   备份并人工处置。缺少该声明时新版会回滚全部 v4→v8 DDL 并拒绝打开数据库。
 4. 保持 `execution.backend` 指向积压实际所属的原 backend，使用新版本启动一次 daemon，
    再运行 `status` 与 `doctor --online`，确认 SQLite integrity、Relay、所选 execution
    backend 和 upstream proof 均正常。
-5. 确认 `PRAGMA user_version=7`；检查 `status.backendBacklog`、
+5. 确认 `PRAGMA user_version=8`；检查 `status.backendBacklog`、
    `recentJobs[].latestAttempt` 与 `doctor` 的 `execution_backend_backlog`。确认积压 job 的
    `targetBackend`/状态符合预期后，可从 config 删除一次性 `legacyV4JobBackend`；该字段
    不是 provider 切换命令。
@@ -1542,14 +1544,15 @@ feature、安全配置和 thread tail 后，才允许一次性补绑；否则启
 v6→v7 会把迁移时仍处于 `Dispatching/Running/Cancelling` 且字段完整的 active attempt
 作为 `legacy_active_imported` 写入账本。它只表示旧库中可证明的迁移快照，不重建更早
 事件，也不改变 ambiguous execution 不自动重跑的规则；重启恢复仍须按原状态失败关闭或
-进入隔离。
+进入隔离。v7→v8 只增加显式状态所有权；既有完整 Codex 行确定性标为 `account-bound`，
+不会据此读取或重分类任何本地状态。
 
-JobStore v7 与 protocol profile schema v1→v2 是两条独立迁移：profile 命令明确
+JobStore v8 与 protocol profile schema v1→v2 是两条独立迁移：profile 命令明确
 不打开 SQLite，也不会升级或回滚 `relay.db`。如果一次部署同时执行两者，应在两项
-操作之前统一停服并备份整个 state directory。任何不认识 JobStore v7 的旧版 daemon
+操作之前统一停服并备份整个 state directory。任何不认识 JobStore v8 的旧版 daemon
 都不能直接打开升级后的数据库；
 回滚程序或把 profile 回滚到 v1 时，仍必须同时恢复升级前的数据库备份，不能让旧版
-直接打开 v7 数据库。
+直接打开 v8 数据库。
 
 - 不要删除 `relay.db`，也不要重跑 Agent job；结果投递本来就是至少一次语义，手工
   重跑会扩大业务副作用。

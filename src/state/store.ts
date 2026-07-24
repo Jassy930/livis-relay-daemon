@@ -5,6 +5,7 @@ import type {
   BackendBacklogCount,
   BackendAccountIdentityStrength,
   BackendCheckpointTurnStatus,
+  BackendSessionStateOwnership,
   ExecutionBackendKind,
   ExecutionAttemptEventType,
   IncomingRelayJob,
@@ -74,6 +75,7 @@ interface BackendSessionRow {
   thread_id: string | null;
   cwd: string;
   cli_version: string;
+  state_ownership: BackendSessionStateOwnership | null;
   account_type: string | null;
   account_subject_sha256: string | null;
   account_identity_strength: BackendAccountIdentityStrength | null;
@@ -111,6 +113,7 @@ interface ExecutionAttemptEventRow {
   requested_model: string | null;
   effective_model: string | null;
   model_provider: string | null;
+  state_ownership: BackendSessionStateOwnership | null;
   account_type: string | null;
   account_subject_sha256: string | null;
   security_config_sha256: string | null;
@@ -131,6 +134,7 @@ interface AttemptAuditContextRow {
   requested_model: string | null;
   effective_model: string | null;
   model_provider: string | null;
+  state_ownership: BackendSessionStateOwnership | null;
   account_type: string | null;
   account_subject_sha256: string | null;
   security_config_sha256: string | null;
@@ -208,6 +212,7 @@ function rowToBackendSession(row: BackendSessionRow): StoredBackendSession {
     threadId: row.thread_id,
     cwd: row.cwd,
     cliVersion: row.cli_version,
+    stateOwnership: row.state_ownership,
     accountType: row.account_type,
     accountSubjectSha256: row.account_subject_sha256,
     accountIdentityStrength: row.account_identity_strength,
@@ -250,6 +255,7 @@ function rowToExecutionAttemptEvent(row: ExecutionAttemptEventRow): StoredExecut
     requestedModel: row.requested_model,
     effectiveModel: row.effective_model,
     modelProvider: row.model_provider,
+    stateOwnership: row.state_ownership,
     accountType: row.account_type,
     accountSubjectSha256: row.account_subject_sha256,
     securityConfigSha256: row.security_config_sha256,
@@ -281,6 +287,31 @@ export interface EnsureBackendSessionInput {
   accountType: string;
   accountSubjectSha256: string | null;
   accountIdentityStrength: BackendAccountIdentityStrength;
+  requestedModel: string | null;
+  effectiveModel: string;
+  modelProvider: string;
+  securityConfigSha256: string;
+  featureSnapshotSha256: string;
+  checkpointTurnId: string | null;
+  checkpointTurnStatus: BackendCheckpointTurnStatus | null;
+  checkpointTurnCount: number;
+  checkpointTurnsSha256: string;
+  checkpointedAt: number;
+}
+
+/**
+ * 为只调用本地 backend 当前状态的 adapter 原子创建 session + thread 绑定。
+ *
+ * 该输入刻意不提供账号或凭据字段；数据库会把这些字段保持为 NULL，并用
+ * `local-state-opaque` 显式区分于既有 daemon 私有 runtime。
+ */
+export interface CreateLocalOpaqueBackendSessionInput {
+  backend: string;
+  sessionKey: string;
+  sessionHash: string;
+  threadId: string;
+  cwd: string;
+  cliVersion: string;
   requestedModel: string | null;
   effectiveModel: string;
   modelProvider: string;
@@ -390,6 +421,25 @@ function validateEnsureBackendSessionInput(input: EnsureBackendSessionInput): vo
   ) {
     throw new BackendSessionConflictError("账号身份强度与 subject 摘要不一致");
   }
+  if (input.requestedModel !== null) {
+    requireNonEmptyMetadata(input.requestedModel, "requestedModel", 256);
+  }
+  requireNonEmptyMetadata(input.effectiveModel, "effectiveModel", 256);
+  requireNonEmptyMetadata(input.modelProvider, "modelProvider", 128);
+  validateSha256(input.securityConfigSha256, "securityConfigSha256");
+  validateSha256(input.featureSnapshotSha256, "featureSnapshotSha256");
+  validateCheckpointShape(input);
+}
+
+function validateLocalOpaqueBackendSessionInput(
+  input: CreateLocalOpaqueBackendSessionInput,
+): void {
+  requireNonEmptyMetadata(input.backend, "backend", 32);
+  requireNonEmptyMetadata(input.sessionKey, "sessionKey", 4096);
+  validateSha256(input.sessionHash, "sessionHash");
+  requireNonEmptyMetadata(input.threadId, "threadId", 256);
+  requireNonEmptyMetadata(input.cwd, "cwd", 4096);
+  requireNonEmptyMetadata(input.cliVersion, "cliVersion", 64);
   if (input.requestedModel !== null) {
     requireNonEmptyMetadata(input.requestedModel, "requestedModel", 256);
   }
@@ -580,12 +630,13 @@ export class JobStore {
       this.database
         .query(`INSERT INTO backend_sessions(
                   scope_key,backend,session_key,session_hash,cwd,cli_version,
+                  state_ownership,
                   account_type,account_subject_sha256,account_identity_strength,
                   requested_model,effective_model,model_provider,
                   security_config_sha256,feature_snapshot_sha256,
                   checkpoint_turn_id,checkpoint_turn_status,checkpoint_turn_count,
                   checkpoint_turns_sha256,checkpointed_at,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(scope_key,backend,session_key) DO NOTHING`)
         .run(
           this.scopeKey,
@@ -594,6 +645,7 @@ export class JobStore {
           input.sessionHash,
           input.cwd,
           input.cliVersion,
+          "account-bound",
           input.accountType,
           input.accountSubjectSha256,
           input.accountIdentityStrength,
@@ -619,18 +671,20 @@ export class JobStore {
       if (!row) {
         throw new BackendSessionConflictError("backend session 唯一目录或路径发生冲突");
       }
-      if (row.account_type === null) {
+      if (row.state_ownership === null) {
         // schema v5 旧行没有身份、模型、安全摘要和 tail checkpoint。只有没有
         // active/recovery 证据时才允许一次性补齐；一旦绑定，immutable trigger
         // 和下方严格比较都会拒绝漂移。
         const bound = this.database
           .query(`UPDATE backend_sessions
-                  SET account_type=?,account_subject_sha256=?,account_identity_strength=?,
+                  SET state_ownership='account-bound',
+                      account_type=?,account_subject_sha256=?,account_identity_strength=?,
                       requested_model=?,effective_model=?,model_provider=?,
                       security_config_sha256=?,feature_snapshot_sha256=?,
                       checkpoint_turn_id=?,checkpoint_turn_status=?,checkpoint_turn_count=?,
                       checkpoint_turns_sha256=?,checkpointed_at=?,updated_at=?
                   WHERE scope_key=? AND backend=? AND session_key=?
+                    AND state_ownership IS NULL
                     AND account_type IS NULL
                     AND account_subject_sha256 IS NULL
                     AND account_identity_strength IS NULL
@@ -680,6 +734,7 @@ export class JobStore {
         row.session_hash !== input.sessionHash ||
         row.cwd !== input.cwd ||
         row.cli_version !== input.cliVersion ||
+        row.state_ownership !== "account-bound" ||
         row.account_type !== input.accountType ||
         row.account_subject_sha256 !== input.accountSubjectSha256 ||
         row.account_identity_strength !== input.accountIdentityStrength ||
@@ -698,13 +753,70 @@ export class JobStore {
     return transaction.immediate();
   }
 
+  /**
+   * 原子创建本地状态不透明 session，并在同一事务内绑定已经安全回读的 thread/checkpoint。
+   * 已存在同键 session 时拒绝覆盖，调用方必须先走精确 resume 校验。
+   */
+  createLocalOpaqueBackendSession(
+    input: CreateLocalOpaqueBackendSessionInput,
+  ): StoredBackendSession {
+    validateLocalOpaqueBackendSessionInput(input);
+    const now = Date.now();
+    const transaction = this.database.transaction(() => {
+      if (this.getSessionQuarantine(input.sessionKey) !== null) {
+        throw new BackendSessionConflictError(
+          `本地状态不透明 backend session 已隔离：${input.backend}/${input.sessionKey}`,
+        );
+      }
+      const inserted = this.database
+        .query(`INSERT INTO backend_sessions(
+                  scope_key,backend,session_key,session_hash,thread_id,cwd,cli_version,
+                  state_ownership,
+                  account_type,account_subject_sha256,account_identity_strength,
+                  requested_model,effective_model,model_provider,
+                  security_config_sha256,feature_snapshot_sha256,
+                  checkpoint_turn_id,checkpoint_turn_status,checkpoint_turn_count,
+                  checkpoint_turns_sha256,checkpointed_at,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,'local-state-opaque',NULL,NULL,NULL,
+                         ?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(
+          this.scopeKey,
+          input.backend,
+          input.sessionKey,
+          input.sessionHash,
+          input.threadId,
+          input.cwd,
+          input.cliVersion,
+          input.requestedModel,
+          input.effectiveModel,
+          input.modelProvider,
+          input.securityConfigSha256,
+          input.featureSnapshotSha256,
+          input.checkpointTurnId,
+          input.checkpointTurnStatus,
+          input.checkpointTurnCount,
+          input.checkpointTurnsSha256,
+          input.checkpointedAt,
+          now,
+          now,
+        );
+      if (inserted.changes !== 1) {
+        throw new BackendSessionConflictError(
+          `本地状态不透明 backend session 已存在或目录冲突：${input.backend}/${input.sessionKey}`,
+        );
+      }
+      return this.getBackendSession(input.backend, input.sessionKey)!;
+    });
+    return transaction.immediate();
+  }
+
   bindBackendThread(backend: string, sessionKey: string, threadId: string): StoredBackendSession {
     const transaction = this.database.transaction(() => {
       const current = this.getBackendSession(backend, sessionKey);
       if (!current) {
         throw new Error(`backend session 不存在：${backend}/${sessionKey}`);
       }
-      if (current.accountType === null) {
+      if (current.stateOwnership === null) {
         throw new BackendSessionConflictError(
           `backend session 尚未绑定 v6 metadata：${backend}/${sessionKey}`,
         );
@@ -719,7 +831,7 @@ export class JobStore {
         .query(`UPDATE backend_sessions
                 SET thread_id=?, updated_at=?
                 WHERE scope_key=? AND backend=? AND session_key=?
-                  AND thread_id IS NULL AND account_type IS NOT NULL AND recovery_required=0
+                  AND thread_id IS NULL AND state_ownership IS NOT NULL AND recovery_required=0
                   AND NOT EXISTS (
                     SELECT 1 FROM session_quarantine quarantine
                     WHERE quarantine.scope_key=backend_sessions.scope_key
@@ -766,7 +878,7 @@ export class JobStore {
           `backend session 不存在：${input.backend}/${input.sessionKey}`,
         );
       }
-      if (current.threadId !== input.threadId || current.accountType === null) {
+      if (current.threadId !== input.threadId || current.stateOwnership === null) {
         throw new BackendSessionConflictError(
           `backend session thread 或 v6 metadata 未绑定：${input.backend}/${input.sessionKey}`,
         );
@@ -824,7 +936,7 @@ export class JobStore {
                 SET checkpoint_turn_id=?,checkpoint_turn_status=?,checkpoint_turn_count=?,
                     checkpoint_turns_sha256=?,checkpointed_at=?,updated_at=?
                 WHERE scope_key=? AND backend=? AND session_key=? AND thread_id=?
-                  AND account_type IS NOT NULL AND recovery_required=0
+                  AND state_ownership IS NOT NULL AND recovery_required=0
                   AND checkpoint_turn_count=?
                   AND checkpoint_turn_id IS ? AND checkpoint_turn_status IS ?
                   AND checkpoint_turns_sha256=?
@@ -892,7 +1004,7 @@ export class JobStore {
                       AND backend_session.backend=?
                       AND backend_session.session_key=target.session_key
                       AND backend_session.thread_id IS NOT NULL
-                      AND backend_session.account_type IS NOT NULL
+                      AND backend_session.state_ownership IS NOT NULL
                       AND backend_session.active_job_id IS NULL
                       AND backend_session.recovery_required=0
                   )
@@ -2133,6 +2245,7 @@ export class JobStore {
                backend_sessions.thread_id,backend_sessions.active_turn_id,
                backend_sessions.cli_version,backend_sessions.requested_model,
                backend_sessions.effective_model,backend_sessions.model_provider,
+               backend_sessions.state_ownership,
                backend_sessions.account_type,backend_sessions.account_subject_sha256,
                backend_sessions.security_config_sha256,
                backend_sessions.feature_snapshot_sha256
@@ -2167,8 +2280,11 @@ export class JobStore {
     if (
       context.target_backend === "codex" && !allowsLegacyMetadata &&
       (!context.thread_id || !context.cli_version || !context.effective_model ||
-        !context.model_provider || !context.account_type || !context.security_config_sha256 ||
-        !context.feature_snapshot_sha256)
+        !context.model_provider || !context.state_ownership ||
+        (context.state_ownership === "account-bound" && !context.account_type) ||
+        (context.state_ownership === "local-state-opaque" &&
+          (context.account_type !== null || context.account_subject_sha256 !== null)) ||
+        !context.security_config_sha256 || !context.feature_snapshot_sha256)
     ) {
       throw new Error(`Codex execution attempt 缺少 immutable session 元数据：${input.jobId}`);
     }
@@ -2186,9 +2302,9 @@ export class JobStore {
                 scope_key,job_id,run_generation,sequence,backend,session_key,
                 lease_id,backend_execution_id,provider_session_id,provider_operation_id,
                 runtime_version,requested_model,effective_model,model_provider,
-                account_type,account_subject_sha256,security_config_sha256,
+                state_ownership,account_type,account_subject_sha256,security_config_sha256,
                 feature_snapshot_sha256,event_type,reason,created_at
-              ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+              ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(
         this.scopeKey,
         input.jobId,
@@ -2204,6 +2320,7 @@ export class JobStore {
         context.requested_model,
         context.effective_model,
         context.model_provider,
+        context.state_ownership,
         context.account_type,
         context.account_subject_sha256,
         context.security_config_sha256,
@@ -2555,20 +2672,30 @@ export class JobStore {
       const version = row?.user_version ?? 0;
       if (
         version !== 0 && version !== 1 && version !== 2 && version !== 3 &&
-        version !== 4 && version !== 5 && version !== 6 && version !== 7
+        version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8
       ) {
         throw new Error(`不支持的数据库 schema 版本：${version}`);
       }
+      if (version === 8) {
+        this.assertMigratedSchemaV8();
+        this.assertLegacyV4MigrationDecision();
+        return;
+      }
       if (version === 7) {
         this.assertMigratedSchemaV7();
+        this.createBackendSessionStateOwnershipSchemaV8();
+        this.database.exec("PRAGMA user_version=8;");
+        this.assertMigratedSchemaV8();
         this.assertLegacyV4MigrationDecision();
         return;
       }
       if (version === 6) {
         this.assertMigratedSchemaV6();
         this.createExecutionAttemptLedgerSchemaV7();
-        this.database.exec("PRAGMA user_version=7;");
         this.assertMigratedSchemaV7();
+        this.createBackendSessionStateOwnershipSchemaV8();
+        this.database.exec("PRAGMA user_version=8;");
+        this.assertMigratedSchemaV8();
         this.assertLegacyV4MigrationDecision();
         return;
       }
@@ -2576,8 +2703,10 @@ export class JobStore {
         this.assertMigratedSchemaV5();
         this.createBackendSessionMetadataSchemaV6();
         this.createExecutionAttemptLedgerSchemaV7();
-        this.database.exec("PRAGMA user_version=7;");
         this.assertMigratedSchemaV7();
+        this.createBackendSessionStateOwnershipSchemaV8();
+        this.database.exec("PRAGMA user_version=8;");
+        this.assertMigratedSchemaV8();
         this.assertLegacyV4MigrationDecision();
         return;
       }
@@ -2687,8 +2816,10 @@ export class JobStore {
       this.assertMigratedSchemaV5();
       this.createBackendSessionMetadataSchemaV6();
       this.createExecutionAttemptLedgerSchemaV7();
-      this.database.exec("PRAGMA user_version=7;");
       this.assertMigratedSchemaV7();
+      this.createBackendSessionStateOwnershipSchemaV8();
+      this.database.exec("PRAGMA user_version=8;");
+      this.assertMigratedSchemaV8();
       this.assertLegacyV4MigrationDecision();
     });
     // 先取得 RESERVED 写锁，再读取 user_version。两个 opener 因而不会
@@ -3112,6 +3243,157 @@ export class JobStore {
     `);
   }
 
+  private createBackendSessionStateOwnershipSchemaV8(): void {
+    this.database.exec(`
+      ALTER TABLE backend_sessions ADD COLUMN state_ownership TEXT
+        CHECK(state_ownership IS NULL OR state_ownership IN ('account-bound','local-state-opaque'));
+      UPDATE backend_sessions
+      SET state_ownership='account-bound'
+      WHERE account_type IS NOT NULL;
+
+      ALTER TABLE execution_attempt_events ADD COLUMN state_ownership TEXT
+        CHECK(state_ownership IS NULL OR state_ownership IN ('account-bound','local-state-opaque'));
+      DROP TRIGGER execution_attempt_events_no_update;
+      UPDATE execution_attempt_events
+      SET state_ownership='account-bound'
+      WHERE backend='codex' AND account_type IS NOT NULL;
+      CREATE TRIGGER execution_attempt_events_no_update
+      BEFORE UPDATE ON execution_attempt_events
+      BEGIN
+        SELECT RAISE(ABORT, 'execution_attempt_events is append-only');
+      END;
+
+      DROP TRIGGER backend_sessions_v6_metadata_insert_required;
+      DROP TRIGGER backend_sessions_v6_metadata_binding_complete;
+      DROP TRIGGER backend_sessions_v6_metadata_immutable;
+      DROP TRIGGER backend_sessions_v6_checkpoint_shape;
+      DROP TRIGGER backend_sessions_v6_checkpoint_monotonic;
+
+      CREATE TRIGGER backend_sessions_v8_metadata_insert_required
+      BEFORE INSERT ON backend_sessions
+      WHEN NEW.state_ownership IS NULL
+        OR NEW.effective_model IS NULL
+        OR NEW.model_provider IS NULL
+        OR NEW.security_config_sha256 IS NULL
+        OR NEW.feature_snapshot_sha256 IS NULL
+        OR NEW.checkpoint_turn_count IS NULL
+        OR NEW.checkpoint_turns_sha256 IS NULL
+        OR NEW.checkpointed_at IS NULL
+        OR (NEW.state_ownership='account-bound' AND (
+          NEW.account_type IS NULL
+          OR NEW.account_identity_strength IS NULL
+          OR (NEW.account_identity_strength='subject' AND NEW.account_subject_sha256 IS NULL)
+          OR (NEW.account_identity_strength='type-only' AND NEW.account_subject_sha256 IS NOT NULL)
+        ))
+        OR (NEW.state_ownership='local-state-opaque' AND (
+          NEW.account_type IS NOT NULL
+          OR NEW.account_subject_sha256 IS NOT NULL
+          OR NEW.account_identity_strength IS NOT NULL
+        ))
+        OR (NEW.checkpoint_turn_count=0 AND (
+          NEW.checkpoint_turn_id IS NOT NULL OR NEW.checkpoint_turn_status IS NOT NULL
+        ))
+        OR (NEW.checkpoint_turn_count>0 AND (
+          NEW.checkpoint_turn_id IS NULL OR NEW.checkpoint_turn_status IS NULL
+        ))
+      BEGIN
+        SELECT RAISE(ABORT, 'backend_sessions v8 metadata is required');
+      END;
+
+      CREATE TRIGGER backend_sessions_v8_metadata_binding_complete
+      BEFORE UPDATE OF state_ownership,account_type,account_subject_sha256,
+        account_identity_strength,requested_model,effective_model,model_provider,
+        security_config_sha256,feature_snapshot_sha256,checkpoint_turn_id,
+        checkpoint_turn_status,checkpoint_turn_count,checkpoint_turns_sha256,checkpointed_at
+      ON backend_sessions
+      WHEN OLD.state_ownership IS NULL AND (
+        NEW.state_ownership IS NULL
+        OR NEW.effective_model IS NULL
+        OR NEW.model_provider IS NULL
+        OR NEW.security_config_sha256 IS NULL
+        OR NEW.feature_snapshot_sha256 IS NULL
+        OR NEW.checkpoint_turn_count IS NULL
+        OR NEW.checkpoint_turns_sha256 IS NULL
+        OR NEW.checkpointed_at IS NULL
+        OR (NEW.state_ownership='account-bound' AND (
+          NEW.account_type IS NULL
+          OR NEW.account_identity_strength IS NULL
+          OR (NEW.account_identity_strength='subject' AND NEW.account_subject_sha256 IS NULL)
+          OR (NEW.account_identity_strength='type-only' AND NEW.account_subject_sha256 IS NOT NULL)
+        ))
+        OR (NEW.state_ownership='local-state-opaque' AND (
+          NEW.account_type IS NOT NULL
+          OR NEW.account_subject_sha256 IS NOT NULL
+          OR NEW.account_identity_strength IS NOT NULL
+        ))
+        OR (NEW.checkpoint_turn_count=0 AND (
+          NEW.checkpoint_turn_id IS NOT NULL OR NEW.checkpoint_turn_status IS NOT NULL
+        ))
+        OR (NEW.checkpoint_turn_count>0 AND (
+          NEW.checkpoint_turn_id IS NULL OR NEW.checkpoint_turn_status IS NULL
+        ))
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'backend_sessions v8 metadata binding must be complete');
+      END;
+
+      CREATE TRIGGER backend_sessions_v8_metadata_immutable
+      BEFORE UPDATE OF state_ownership,account_type,account_subject_sha256,
+        account_identity_strength,requested_model,effective_model,model_provider,
+        security_config_sha256,feature_snapshot_sha256
+      ON backend_sessions
+      WHEN OLD.state_ownership IS NOT NULL AND (
+        NEW.state_ownership IS NOT OLD.state_ownership
+        OR NEW.account_type IS NOT OLD.account_type
+        OR NEW.account_subject_sha256 IS NOT OLD.account_subject_sha256
+        OR NEW.account_identity_strength IS NOT OLD.account_identity_strength
+        OR NEW.requested_model IS NOT OLD.requested_model
+        OR NEW.effective_model IS NOT OLD.effective_model
+        OR NEW.model_provider IS NOT OLD.model_provider
+        OR NEW.security_config_sha256 IS NOT OLD.security_config_sha256
+        OR NEW.feature_snapshot_sha256 IS NOT OLD.feature_snapshot_sha256
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'backend_sessions v8 immutable metadata drift');
+      END;
+
+      CREATE TRIGGER backend_sessions_v8_checkpoint_shape
+      BEFORE UPDATE OF checkpoint_turn_id,checkpoint_turn_status,checkpoint_turn_count,
+        checkpoint_turns_sha256,checkpointed_at
+      ON backend_sessions
+      WHEN NEW.state_ownership IS NOT NULL AND (
+        NEW.checkpoint_turn_count IS NULL
+        OR NEW.checkpoint_turns_sha256 IS NULL
+        OR NEW.checkpointed_at IS NULL
+        OR (NEW.checkpoint_turn_count=0 AND (
+          NEW.checkpoint_turn_id IS NOT NULL OR NEW.checkpoint_turn_status IS NOT NULL
+        ))
+        OR (NEW.checkpoint_turn_count>0 AND (
+          NEW.checkpoint_turn_id IS NULL OR NEW.checkpoint_turn_status IS NULL
+        ))
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'backend_sessions v8 checkpoint shape invalid');
+      END;
+
+      CREATE TRIGGER backend_sessions_v8_checkpoint_monotonic
+      BEFORE UPDATE OF checkpoint_turn_id,checkpoint_turn_status,checkpoint_turn_count,
+        checkpoint_turns_sha256
+      ON backend_sessions
+      WHEN OLD.checkpoint_turn_count IS NOT NULL AND (
+        NEW.checkpoint_turn_count < OLD.checkpoint_turn_count
+        OR (NEW.checkpoint_turn_count=OLD.checkpoint_turn_count AND (
+          NEW.checkpoint_turn_id IS NOT OLD.checkpoint_turn_id
+          OR NEW.checkpoint_turn_status IS NOT OLD.checkpoint_turn_status
+          OR NEW.checkpoint_turns_sha256 IS NOT OLD.checkpoint_turns_sha256
+        ))
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'backend_sessions v8 checkpoint must be monotonic');
+      END;
+    `);
+  }
+
   private assertBackendSessionsSchemaV4(): void {
     const columns = this.database
       .query<{ name: string }, []>("PRAGMA table_info(backend_sessions)")
@@ -3420,6 +3702,172 @@ export class JobStore {
       .get()?.count ?? 0;
     if (sequenceGaps !== 0) {
       throw new Error(`SQLite v7 有 ${sequenceGaps} 个 execution attempt 事件序列不连续`);
+    }
+  }
+
+  private assertMigratedSchemaV8(): void {
+    const integrity = this.database.query<{ integrity_check: string }, []>("PRAGMA integrity_check").get();
+    if (integrity?.integrity_check !== "ok") {
+      throw new Error(`SQLite v8 迁移完整性检查失败：${integrity?.integrity_check ?? "unknown"}`);
+    }
+    const foreignKeyViolations = this.database
+      .query<Record<string, unknown>, []>("PRAGMA foreign_key_check")
+      .all();
+    if (foreignKeyViolations.length > 0) {
+      throw new Error(`SQLite v8 迁移外键检查失败：${JSON.stringify(foreignKeyViolations)}`);
+    }
+
+    const backendSessionColumns = this.database
+      .query<{ name: string }, []>("PRAGMA table_info(backend_sessions)")
+      .all()
+      .map((column) => column.name);
+    for (const expected of [
+      "scope_key", "backend", "session_key", "session_hash", "thread_id", "cwd",
+      "cli_version", "active_job_id", "active_lease_id", "active_run_generation",
+      "active_turn_id", "recovery_required", "created_at", "updated_at", "account_type",
+      "account_subject_sha256", "account_identity_strength", "requested_model",
+      "effective_model", "model_provider", "security_config_sha256",
+      "feature_snapshot_sha256", "checkpoint_turn_id", "checkpoint_turn_status",
+      "checkpoint_turn_count", "checkpoint_turns_sha256", "checkpointed_at", "state_ownership",
+    ]) {
+      if (!backendSessionColumns.includes(expected)) {
+        throw new Error(`SQLite v8 backend_sessions 列缺失：${expected}`);
+      }
+    }
+
+    const attemptColumns = this.database
+      .query<{ name: string }, []>("PRAGMA table_info(execution_attempt_events)")
+      .all()
+      .map((column) => column.name);
+    for (const expected of [
+      "scope_key", "job_id", "run_generation", "sequence", "backend", "session_key",
+      "lease_id", "backend_execution_id", "provider_session_id", "provider_operation_id",
+      "runtime_version", "requested_model", "effective_model", "model_provider",
+      "account_type", "account_subject_sha256", "security_config_sha256",
+      "feature_snapshot_sha256", "event_type", "reason", "created_at", "state_ownership",
+    ]) {
+      if (!attemptColumns.includes(expected)) {
+        throw new Error(`SQLite v8 execution_attempt_events 列缺失：${expected}`);
+      }
+    }
+
+    const triggers = this.database
+      .query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type='trigger'")
+      .all()
+      .map((item) => item.name);
+    for (const expected of [
+      "jobs_target_backend_insert_required",
+      "jobs_target_backend_update_required",
+      "jobs_target_backend_immutable",
+      "execution_attempt_events_no_update",
+      "execution_attempt_events_no_delete",
+      "backend_sessions_v8_metadata_insert_required",
+      "backend_sessions_v8_metadata_binding_complete",
+      "backend_sessions_v8_metadata_immutable",
+      "backend_sessions_v8_checkpoint_shape",
+      "backend_sessions_v8_checkpoint_monotonic",
+    ]) {
+      if (!triggers.includes(expected)) throw new Error(`SQLite v8 trigger 缺失：${expected}`);
+    }
+
+    const malformedSessions = this.database
+      .query<{ count: number }, []>(`
+        SELECT COUNT(*) AS count FROM backend_sessions
+        WHERE (
+          state_ownership IS NULL AND (
+            account_type IS NOT NULL OR account_subject_sha256 IS NOT NULL
+            OR account_identity_strength IS NOT NULL OR requested_model IS NOT NULL
+            OR effective_model IS NOT NULL OR model_provider IS NOT NULL
+            OR security_config_sha256 IS NOT NULL OR feature_snapshot_sha256 IS NOT NULL
+            OR checkpoint_turn_id IS NOT NULL OR checkpoint_turn_status IS NOT NULL
+            OR checkpoint_turn_count IS NOT NULL OR checkpoint_turns_sha256 IS NOT NULL
+            OR checkpointed_at IS NOT NULL
+          )
+        ) OR (
+          state_ownership IS NOT NULL AND (
+            effective_model IS NULL OR model_provider IS NULL
+            OR security_config_sha256 IS NULL OR feature_snapshot_sha256 IS NULL
+            OR checkpoint_turn_count IS NULL OR checkpoint_turns_sha256 IS NULL
+            OR checkpointed_at IS NULL
+            OR (state_ownership='account-bound' AND (
+              account_type IS NULL OR account_identity_strength IS NULL
+              OR (account_identity_strength='subject' AND account_subject_sha256 IS NULL)
+              OR (account_identity_strength='type-only' AND account_subject_sha256 IS NOT NULL)
+            ))
+            OR (state_ownership='local-state-opaque' AND (
+              account_type IS NOT NULL OR account_subject_sha256 IS NOT NULL
+              OR account_identity_strength IS NOT NULL
+            ))
+            OR (checkpoint_turn_count=0 AND (
+              checkpoint_turn_id IS NOT NULL OR checkpoint_turn_status IS NOT NULL
+            ))
+            OR (checkpoint_turn_count>0 AND (
+              checkpoint_turn_id IS NULL OR checkpoint_turn_status IS NULL
+            ))
+          )
+        )
+      `)
+      .get()?.count ?? 0;
+    if (malformedSessions !== 0) {
+      throw new Error(`SQLite v8 有 ${malformedSessions} 个状态所有权或 checkpoint 半绑定 session`);
+    }
+
+    const activeWithoutAudit = this.database
+      .query<{ count: number }, []>(`
+        SELECT COUNT(*) AS count FROM jobs
+        WHERE status IN ('Dispatching','Running','Cancelling')
+          AND NOT EXISTS (
+            SELECT 1 FROM execution_attempt_events events
+            WHERE events.scope_key=jobs.scope_key
+              AND events.job_id=jobs.job_id
+              AND events.run_generation=jobs.run_generation
+          )
+      `)
+      .get()?.count ?? 0;
+    if (activeWithoutAudit !== 0) {
+      throw new Error(`SQLite v8 有 ${activeWithoutAudit} 个 active attempt 缺少审计事件`);
+    }
+
+    const malformedCodexEvents = this.database
+      .query<{ count: number }, []>(`
+        SELECT COUNT(*) AS count FROM execution_attempt_events
+        WHERE backend='codex' AND (
+          provider_session_id IS NULL
+          OR ((
+            runtime_version IS NULL OR effective_model IS NULL OR model_provider IS NULL
+            OR security_config_sha256 IS NULL OR feature_snapshot_sha256 IS NULL
+            OR (state_ownership='account-bound' AND account_type IS NULL)
+            OR (state_ownership='local-state-opaque' AND (
+              account_type IS NOT NULL OR account_subject_sha256 IS NOT NULL
+            ))
+            OR state_ownership IS NULL
+          ) AND NOT EXISTS (
+            SELECT 1 FROM execution_attempt_events legacy
+            WHERE legacy.scope_key=execution_attempt_events.scope_key
+              AND legacy.job_id=execution_attempt_events.job_id
+              AND legacy.run_generation=execution_attempt_events.run_generation
+              AND legacy.event_type='legacy_active_imported'
+          ))
+        )
+      `)
+      .get()?.count ?? 0;
+    if (malformedCodexEvents !== 0) {
+      throw new Error(`SQLite v8 有 ${malformedCodexEvents} 个 Codex 审计事件缺少 session 锚点`);
+    }
+
+    const sequenceGaps = this.database
+      .query<{ count: number }, []>(`
+        SELECT COUNT(*) AS count FROM (
+          SELECT sequence,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY scope_key,job_id,run_generation ORDER BY sequence
+                 ) AS expected_sequence
+          FROM execution_attempt_events
+        ) WHERE sequence<>expected_sequence
+      `)
+      .get()?.count ?? 0;
+    if (sequenceGaps !== 0) {
+      throw new Error(`SQLite v8 有 ${sequenceGaps} 个 execution attempt 事件序列不连续`);
     }
   }
 

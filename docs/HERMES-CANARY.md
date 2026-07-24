@@ -47,7 +47,7 @@ Hermes 0.15.1 只在对应 `*_HOME_CHANNEL` 环境变量缺失时生成一次 ho
 
 ## 当前 launchd canary 记录要求
 
-先按[运行手册的 macOS LaunchAgent 章节](OPERATIONS.md#macos-launchagent)完成静态部署、双服务启动和 JobStore v7 备份/升级边界。随后记录：
+先按[运行手册的 macOS LaunchAgent 章节](OPERATIONS.md#macos-launchagent)完成静态部署、双服务启动和 JobStore v8 备份/升级边界。随后记录：
 
 1. daemon 精确 commit、protocol profile ID/SHA、wire revision/mode 与 supported proof 时间；
 2. Hermes runtime 0.15.1、bridge 版本、隔离 profile 与两个 LaunchAgent label；
@@ -67,6 +67,6 @@ bun run src/index.ts doctor --online
 bun run src/index.ts status
 ```
 
-当前 daemon 首次打开旧数据库时还可能执行 JobStore v7 迁移；因此升级前必须停掉 Relay/Hermes 并完整备份 state directory，不能把数据库迁移成功等同于消息验收。若 v4 仍有待派发 job，还必须先确认并显式声明其原始 backend，不能借迁移切换 provider；准备切换 backend 时还必须先排空原 backend 的全部非终态 job，并确认 `doctor.execution_backend_backlog` 通过。
+当前 daemon 首次打开旧数据库时还可能执行 JobStore v8 迁移；因此升级前必须停掉 Relay/Hermes 并完整备份 state directory，不能把数据库迁移成功等同于消息验收。若 v4 仍有待派发 job，还必须先确认并显式声明其原始 backend，不能借迁移切换 provider；准备切换 backend 时还必须先排空原 backend 的全部非终态 job，并确认 `doctor.execution_backend_backlog` 通过。
 
 只有 supported proof、Relay handshake、connector ready、普通文本 `Succeeded`、outbox `Delivered`、Hermes inbound/response 与 App 纯文本回显同时成立，才能把精确版本组合加入审核范围。未知版本、缺少最终 ACK、只完成服务级检查或没有当前 head 的脱敏记录时必须失败关闭。

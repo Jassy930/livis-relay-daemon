@@ -117,16 +117,39 @@ lifecycle 实例，不复用旧 active attempt 或 accepted gate。
 [`codex_native_client_epoch.test.ts`](../tests/codex_native_client_epoch.test.ts) 与 lifecycle fake 测试覆盖
 上述边界。epoch fence 不决定恢复时机；未来持久 coordinator 仍必须先结算或隔离旧 active attempt。
 
-## 9. 下一实现门禁
+## 9. 持久 session coordinator
 
-下一阶段只组合执行状态，不引入账号状态：
+[`CodexNativeSessionCoordinator`](../src/backends/codex/native-session-coordinator.ts) 已用纯离线 fake
+client 组合 epoch、thread policy/checkpoint、JobStore job/lease/run generation 与 lifecycle。它没有被
+`daemon.ts`、`index.ts`、`config.ts` 或生产 `serve` 导入。
 
-1. 用持久 session coordinator 组合 epoch、thread policy、checkpoint 与 lifecycle；
-2. idle session 只有在 thread/checkpoint 精确一致时才能恢复；active 或提交不确定的 attempt 必须按
-   ambiguous execution 隔离，不能自动重发；
-3. 本地 backend failed 只结算当前 job，后续 job 仍可继续调用本地当前状态；
-4. coordinator 不读取或持久化 account type、主体、登录状态、token、scope 或 provider 认证分类；
-5. 真实 Desktop/CLI 并发只能在另行授权的非生产 canary 中验证。
+JobStore schema v8 为 backend session 与 attempt ledger 增加显式状态所有权：
 
-即使上述离线组合完成，能力仍保持 `unsupported`，直到安全 attach、Desktop 不干扰和真实并发 canary
-分别闭合。
+- 既有 daemon 私有 runtime 为 `account-bound`，继续沿用原安全边界；
+- 本地当前状态路径为 `local-state-opaque`，账号类型、主体摘要和身份强度列必须保持 `NULL`；
+- fresh thread 与初始 checkpoint 在同一 SQLite 事务中创建，避免留下已知 thread 但未绑定 session
+  的中间状态；
+- idle 重开只允许同一 workspace、CLI、model/provider、policy/feature 摘要和 checkpoint 的精确
+  `thread/resume`；
+- 历史 active/recovery、持久 metadata 漂移、thread/checkpoint 漂移或提交不确定都进入 ambiguous
+  quarantine，不创建替代 thread，也不自动重发；
+- terminal 必须先用 job/lease/run generation/turn fence 原子 checkpoint，再交给既有 daemon handler
+  结算 job/outbox；普通 backend failed 不隔离 session，下一 job 仍可继续调用当前本地状态；
+- 新 epoch fence 旧 proxy 的迟到 exit/notification；`stop()` 只关闭 relay 自己的 proxy client。
+
+[`codex_native_session_coordinator.test.ts`](../tests/codex_native_session_coordinator.test.ts) 覆盖 fresh 原子
+绑定、跨 Store 重开的 idle resume、active ambiguous quarantine、普通 failed 后继续执行、attempt
+账本不保存本地状态详情和旧 epoch exit。测试没有连接真实 socket，也没有操作 Desktop 生命周期。
+
+## 10. 下一实现门禁
+
+离线执行状态组合已经完成，下一阶段仍不引入账号处理：
+
+1. 将 transport-only attach 与 coordinator 接到一个仍不进入生产 `serve` 的受控组合 harness，证明
+   notification 绑定、proxy 所有权和失败收口；
+2. 只在另行授权的非生产 canary 中验证真实 Desktop/CLI 并发、逐 thread 隔离与 Desktop 不干扰；
+3. 保持 coordinator 不读取或持久化 account type、主体、登录状态、token、scope 或 provider 认证分类；
+4. 在上述证据闭合前不修改 `codex_native_auth_reuse=unsupported`，也不接入自动 fallback。
+
+即使离线 coordinator 已完成，能力仍保持 `unsupported`，直到安全 attach、Desktop 不干扰和真实并发
+canary 分别闭合。

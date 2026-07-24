@@ -37,7 +37,7 @@ flowchart LR
 - cancel/final 使用 CAS 决定唯一赢家；ambiguous execution 不自动重跑。
 - Hermes connector 只开放权限 `0600` 的 Unix socket，不监听 TCP。
 - `execution.backend` 固定为 Hermes/Codex/Claude 三选一；Claude 尚未实现并在 `doctor`/`serve` 失败关闭，不会回退到其他 backend。
-- Codex 由 daemon 通过 stdio app-server 直接管理；当前 JobStore schema v7 以数据库 trigger 强制 `jobs.target_backend` 不可变，在 v6 的账号、模型、安全配置与 thread-tail checkpoint 之上新增 append-only execution attempt 账本。`jobs/outbox` 仍是业务状态真源，`backend_sessions` 只保存可变的当前 session 与恢复锚点。
+- Codex 由 daemon 通过 stdio app-server 直接管理；当前 JobStore schema v8 延续 v7 的不可变 `jobs.target_backend` 与 append-only execution attempt 账本，并为 backend session/attempt 增加显式状态所有权：既有私有 runtime 为 `account-bound`，调用本地当前状态的原型为 `local-state-opaque`。`jobs/outbox` 仍是业务状态真源，`backend_sessions` 只保存可变的当前 session 与恢复锚点。
 - Codex 生产启动、idle recovery 与 dispatch 只接受 `account.type=apiKey`；每次 dispatch 都会在 `turn/start` 前重新回读账号并与内存/SQLite 锚点核对。空账号、ChatGPT/OAuth、Bedrock、未知账号类型或运行中认证模式漂移都不能创建、恢复或执行生产 thread。无账号零模型 smoke 是不进入生产 backend 的协议诊断例外。
 - Codex model provider 与 API key 都属于 state directory 的不可变安全边界。同一 `stateDir` 不允许从 OpenAI 切到 custom、在 custom 端点之间切换或轮换 key；这些变化必须使用全新 `stateDir` 和全新专用 `CODEX_HOME`，`session release` 不是 provider/key 切换工具。
 - 切换 backend 前必须先用原 backend 排空其 `Received/Acked/Dispatching/Running/Cancelling` 积压；`serve` 会在启动 backend 或 Relay 前拒绝异 backend 非终态 job，`doctor` 的 `execution_backend_backlog` 与 `status.backendBacklog/recentJobs[].latestAttempt` 提供本地观测。终态历史不会阻止切换，未完成的 outbox 投递仍独立恢复。
@@ -95,7 +95,7 @@ git clone https://github.com/Jassy930/livis-relay-daemon.git && cd livis-relay-d
 
 验证结果必须绑定精确提交，不能沿用 README 中的固定测试数量或旧 canary 结论。当前候选应在精确 staged tree 上运行 `bun run check`；实际测试数量以该次输出为准。
 
-2026-07-18 曾在旧代码基线上留下 Hermes 0.15.1 前台纯文本闭环的高层人工摘要；同期 LaunchAgent 记录也只证明服务存活、online doctor、Relay handshake 与 connector ready。它们都早于后续 protocol profile v2、单设备边界、Relay 资源门禁和 JobStore v3，更早于当前 JobStore v7，且没有绑定当前最终提交的完整 receipt，因此只作历史参考，不能证明当前版本或 launchd 常驻消息闭环已经通过。证据边界和当前验收步骤见 [`docs/HERMES-CANARY.md`](docs/HERMES-CANARY.md)。
+2026-07-18 曾在旧代码基线上留下 Hermes 0.15.1 前台纯文本闭环的高层人工摘要；同期 LaunchAgent 记录也只证明服务存活、online doctor、Relay handshake 与 connector ready。它们都早于后续 protocol profile v2、单设备边界、Relay 资源门禁和 JobStore v3，更早于当前 JobStore v8，且没有绑定当前最终提交的完整 receipt，因此只作历史参考，不能证明当前版本或 launchd 常驻消息闭环已经通过。证据边界和当前验收步骤见 [`docs/HERMES-CANARY.md`](docs/HERMES-CANARY.md)。
 
 Codex 0.145.0 的真实非临时、零模型 turn canary 已在 macOS 命中 workspace-only、
 凭据/宿主 HOME 读写拒绝、workspace 外同卷牺牲文件 hardlink 拒绝、command identity、

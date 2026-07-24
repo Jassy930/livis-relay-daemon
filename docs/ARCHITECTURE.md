@@ -76,7 +76,7 @@ Pending → Delivering → Delivered
 
 `Succeeded` 只表示 Agent final 已持久化；远端完成还要求 outbox 收到 `ack_send_result`。重启时：
 
-- job 首次入库时会把所选 execution backend 写入 `jobs.target_backend`，schema v7 的 SQLite
+- job 首次入库时会把所选 execution backend 写入 `jobs.target_backend`，schema v8 的 SQLite
   trigger 会拒绝后续改写；重复投递或配置切换都不能重新绑定。未派发 job 只有在当前
   backend 与该绑定一致时才可继续派发。
 - `jobs.target_backend=codex` 当前没有继续绑定 OpenAI/custom 子 provider。Codex session 与
@@ -101,15 +101,16 @@ ACK。
 JobStore schema v3 曾为 outbox 增加 `next_attempt_at`，schema v4 新增可变的
 `backend_sessions`，schema v5 为每个 job 增加 `target_backend`，schema v6 为 Codex
 session 增加账号身份、请求/实际模型、安全配置与 feature 摘要，以及单调 thread-tail
-checkpoint。当前 schema v7 再以 trigger 强制 `jobs.target_backend` 不可变，并新增
-`execution_attempt_events` append-only 账本。三类状态职责必须分开理解：
+checkpoint。schema v7 再以 trigger 强制 `jobs.target_backend` 不可变，并新增
+`execution_attempt_events` append-only 账本；当前 schema v8 为 session 与 attempt 增加
+`account-bound | local-state-opaque` 状态所有权，后者的账号字段必须保持 `NULL`。三类状态职责必须分开理解：
 
 - `jobs` 与 `outbox` 是执行裁决和结果投递的业务真源；
 - `backend_sessions` 是可更新的当前 session、active attempt 与 recovery anchor，不能
   代替永久历史；
 - `execution_attempt_events` 永久记录 `reserved/accepted/not_sent/cancelled_not_sent/`
   `succeeded/failed/cancel_unknown/interrupted/legacy_active_imported`，并绑定 job、backend、
-  session、lease、execution、Codex thread/turn 以及可得的 runtime、model、account、
+  session、lease、execution、Codex thread/turn 以及可得的 runtime、model、状态所有权、account、
   安全配置与 feature 摘要；UPDATE/DELETE 均由 SQLite trigger 拒绝。
 
 对真实 Codex backend，`backend_sessions.security_config_sha256` 当前不是单独
@@ -128,7 +129,7 @@ backend 列表。旧 Codex 绑定会被退役；后续若成功到达 thread 物
 provider、endpoint 或 key 的合法变更必须使用全新 state/CODEX_HOME。`session release`
 只退役 session row，既不补足 job 级 provider fence，也不是凭据轮换机制。
 
-fresh 数据库直接创建为 v7，v1-v6 数据库都在同一个 `BEGIN IMMEDIATE` 事务内完成版本
+fresh 数据库直接创建为 v8，v1-v7 数据库都在同一个 `BEGIN IMMEDIATE` 事务内完成版本
 读取、DDL、旧 `AckFailed` 恢复为 `Pending`、完整性与外键检查以及最终版本提交。版本
 裁决发生在取得写锁之后，避免两个 opener 同时按旧版本迁移；任一步失败会回滚全部
 DDL/DML 和 `PRAGMA user_version`。v1-v3 数据只可能来自 Hermes，可确定性回填为
@@ -136,7 +137,8 @@ DDL/DML 和 `PRAGMA user_version`。v1-v3 数据只可能来自 Hermes，可确�
 操作者用 `execution.legacyV4JobBackend` 声明其原始 backend。v5 旧 session 只有在没有
 active attempt、recovery 或 quarantine 时，才允许在真实 app-server 安全回读后一次性
 补绑 v6 元数据；v6→v7 会把当时可证明的 active attempt 作为
-`legacy_active_imported` 导入，不猜测更早事件，也不把 ambiguous execution 变成可重试。
+`legacy_active_imported` 导入，不猜测更早事件，也不把 ambiguous execution 变成可重试；
+v7→v8 只增加状态所有权，既有完整 Codex session/attempt 确定性标为 `account-bound`。
 
 backend 切换只允许发生在其他 backend 没有 `Received/Acked/Dispatching/Running/`
 `Cancelling` job 时。`serve` 在启动 execution backend 和 Relay 前失败关闭；终态

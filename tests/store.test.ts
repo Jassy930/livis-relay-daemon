@@ -86,9 +86,9 @@ function databaseHealth(databasePath: string): DatabaseHealth {
   }
 }
 
-function expectHealthyV7(databasePath: string): void {
+function expectHealthyV8(databasePath: string): void {
   const health = databaseHealth(databasePath);
-  expect(health.version).toBe(7);
+  expect(health.version).toBe(8);
   expect(health.integrity).toBe("ok");
   expect(health.foreignKeyViolations).toEqual([]);
   expect(health.outboxColumns).toContain("next_attempt_at");
@@ -98,11 +98,129 @@ function expectHealthyV7(databasePath: string): void {
   expect(health.backendSessionColumns).toContain("feature_snapshot_sha256");
   expect(health.backendSessionColumns).toContain("checkpoint_turn_count");
   expect(health.backendSessionColumns).toContain("checkpoint_turns_sha256");
+  expect(health.backendSessionColumns).toContain("state_ownership");
   expect(health.jobColumns).toContain("target_backend");
   expect(health.executionAttemptEventColumns).toContain("provider_session_id");
   expect(health.executionAttemptEventColumns).toContain("provider_operation_id");
   expect(health.executionAttemptEventColumns).toContain("event_type");
+  expect(health.executionAttemptEventColumns).toContain("state_ownership");
 }
+
+const DROP_V8_STATE_OWNERSHIP = `
+  DROP TRIGGER backend_sessions_v8_metadata_insert_required;
+  DROP TRIGGER backend_sessions_v8_metadata_binding_complete;
+  DROP TRIGGER backend_sessions_v8_metadata_immutable;
+  DROP TRIGGER backend_sessions_v8_checkpoint_shape;
+  DROP TRIGGER backend_sessions_v8_checkpoint_monotonic;
+  ALTER TABLE execution_attempt_events DROP COLUMN state_ownership;
+  ALTER TABLE backend_sessions DROP COLUMN state_ownership;
+
+  CREATE TRIGGER backend_sessions_v6_metadata_insert_required
+  BEFORE INSERT ON backend_sessions
+  WHEN NEW.account_type IS NULL
+    OR NEW.account_identity_strength IS NULL
+    OR NEW.effective_model IS NULL
+    OR NEW.model_provider IS NULL
+    OR NEW.security_config_sha256 IS NULL
+    OR NEW.feature_snapshot_sha256 IS NULL
+    OR NEW.checkpoint_turn_count IS NULL
+    OR NEW.checkpoint_turns_sha256 IS NULL
+    OR NEW.checkpointed_at IS NULL
+    OR (NEW.account_identity_strength='subject' AND NEW.account_subject_sha256 IS NULL)
+    OR (NEW.account_identity_strength='type-only' AND NEW.account_subject_sha256 IS NOT NULL)
+    OR (NEW.checkpoint_turn_count=0 AND (
+      NEW.checkpoint_turn_id IS NOT NULL OR NEW.checkpoint_turn_status IS NOT NULL
+    ))
+    OR (NEW.checkpoint_turn_count>0 AND (
+      NEW.checkpoint_turn_id IS NULL OR NEW.checkpoint_turn_status IS NULL
+    ))
+  BEGIN
+    SELECT RAISE(ABORT, 'backend_sessions v6 metadata is required');
+  END;
+
+  CREATE TRIGGER backend_sessions_v6_metadata_binding_complete
+  BEFORE UPDATE OF account_type,account_subject_sha256,account_identity_strength,
+    requested_model,effective_model,model_provider,security_config_sha256,
+    feature_snapshot_sha256,checkpoint_turn_id,checkpoint_turn_status,
+    checkpoint_turn_count,checkpoint_turns_sha256,checkpointed_at
+  ON backend_sessions
+  WHEN OLD.account_type IS NULL AND (
+    NEW.account_type IS NULL
+    OR NEW.account_identity_strength IS NULL
+    OR NEW.effective_model IS NULL
+    OR NEW.model_provider IS NULL
+    OR NEW.security_config_sha256 IS NULL
+    OR NEW.feature_snapshot_sha256 IS NULL
+    OR NEW.checkpoint_turn_count IS NULL
+    OR NEW.checkpoint_turns_sha256 IS NULL
+    OR NEW.checkpointed_at IS NULL
+    OR (NEW.account_identity_strength='subject' AND NEW.account_subject_sha256 IS NULL)
+    OR (NEW.account_identity_strength='type-only' AND NEW.account_subject_sha256 IS NOT NULL)
+    OR (NEW.checkpoint_turn_count=0 AND (
+      NEW.checkpoint_turn_id IS NOT NULL OR NEW.checkpoint_turn_status IS NOT NULL
+    ))
+    OR (NEW.checkpoint_turn_count>0 AND (
+      NEW.checkpoint_turn_id IS NULL OR NEW.checkpoint_turn_status IS NULL
+    ))
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'backend_sessions v6 metadata binding must be complete');
+  END;
+
+  CREATE TRIGGER backend_sessions_v6_metadata_immutable
+  BEFORE UPDATE OF account_type,account_subject_sha256,account_identity_strength,
+    requested_model,effective_model,model_provider,security_config_sha256,
+    feature_snapshot_sha256
+  ON backend_sessions
+  WHEN OLD.account_type IS NOT NULL AND (
+    NEW.account_type IS NOT OLD.account_type
+    OR NEW.account_subject_sha256 IS NOT OLD.account_subject_sha256
+    OR NEW.account_identity_strength IS NOT OLD.account_identity_strength
+    OR NEW.requested_model IS NOT OLD.requested_model
+    OR NEW.effective_model IS NOT OLD.effective_model
+    OR NEW.model_provider IS NOT OLD.model_provider
+    OR NEW.security_config_sha256 IS NOT OLD.security_config_sha256
+    OR NEW.feature_snapshot_sha256 IS NOT OLD.feature_snapshot_sha256
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'backend_sessions v6 immutable metadata drift');
+  END;
+
+  CREATE TRIGGER backend_sessions_v6_checkpoint_shape
+  BEFORE UPDATE OF checkpoint_turn_id,checkpoint_turn_status,checkpoint_turn_count,
+    checkpoint_turns_sha256,checkpointed_at
+  ON backend_sessions
+  WHEN NEW.account_type IS NOT NULL AND (
+    NEW.checkpoint_turn_count IS NULL
+    OR NEW.checkpoint_turns_sha256 IS NULL
+    OR NEW.checkpointed_at IS NULL
+    OR (NEW.checkpoint_turn_count=0 AND (
+      NEW.checkpoint_turn_id IS NOT NULL OR NEW.checkpoint_turn_status IS NOT NULL
+    ))
+    OR (NEW.checkpoint_turn_count>0 AND (
+      NEW.checkpoint_turn_id IS NULL OR NEW.checkpoint_turn_status IS NULL
+    ))
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'backend_sessions v6 checkpoint shape invalid');
+  END;
+
+  CREATE TRIGGER backend_sessions_v6_checkpoint_monotonic
+  BEFORE UPDATE OF checkpoint_turn_id,checkpoint_turn_status,checkpoint_turn_count,
+    checkpoint_turns_sha256
+  ON backend_sessions
+  WHEN OLD.checkpoint_turn_count IS NOT NULL AND (
+    NEW.checkpoint_turn_count < OLD.checkpoint_turn_count
+    OR (NEW.checkpoint_turn_count=OLD.checkpoint_turn_count AND (
+      NEW.checkpoint_turn_id IS NOT OLD.checkpoint_turn_id
+      OR NEW.checkpoint_turn_status IS NOT OLD.checkpoint_turn_status
+      OR NEW.checkpoint_turns_sha256 IS NOT OLD.checkpoint_turns_sha256
+    ))
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'backend_sessions v6 checkpoint must be monotonic');
+  END;
+`;
 
 const DROP_V7_EXECUTION_ATTEMPTS = `
   DROP TRIGGER execution_attempt_events_no_update;
@@ -140,26 +258,36 @@ const DROP_V5_JOB_BACKEND = `
   CREATE INDEX idx_jobs_dispatch ON jobs(scope_key,status,cancel_requested,session_key,created_at);
 `;
 
+function downgradeV8ToV7(databasePath: string): void {
+  const database = new Database(databasePath, { strict: true });
+  database.exec(`${DROP_V8_STATE_OWNERSHIP} PRAGMA user_version=7;`);
+  database.close();
+}
+
 function downgradeV7ToV6(databasePath: string): void {
   const database = new Database(databasePath, { strict: true });
+  database.exec(DROP_V8_STATE_OWNERSHIP);
   database.exec(`${DROP_V7_EXECUTION_ATTEMPTS} PRAGMA user_version=6;`);
   database.close();
 }
 
 function downgradeV6ToV5(databasePath: string): void {
   const database = new Database(databasePath, { strict: true });
+  database.exec(DROP_V8_STATE_OWNERSHIP);
   database.exec(`${DROP_V7_EXECUTION_ATTEMPTS} ${DROP_V6_BACKEND_METADATA} PRAGMA user_version=5;`);
   database.close();
 }
 
 function downgradeV6ToV4(databasePath: string): void {
   const database = new Database(databasePath, { strict: true });
+  database.exec(DROP_V8_STATE_OWNERSHIP);
   database.exec(`${DROP_V7_EXECUTION_ATTEMPTS} ${DROP_V6_BACKEND_METADATA} ${DROP_V5_JOB_BACKEND} PRAGMA user_version=4;`);
   database.close();
 }
 
 function downgradeV4ToV2(databasePath: string): void {
   const database = new Database(databasePath, { strict: true });
+  database.exec(DROP_V8_STATE_OWNERSHIP);
   database.exec(`
     ${DROP_V7_EXECUTION_ATTEMPTS}
     ${DROP_V6_BACKEND_METADATA}
@@ -176,6 +304,7 @@ function downgradeV4ToV2(databasePath: string): void {
 
 function downgradeV4ToV1(databasePath: string): void {
   const database = new Database(databasePath, { strict: true });
+  database.exec(DROP_V8_STATE_OWNERSHIP);
   database.exec(`
     ${DROP_V7_EXECUTION_ATTEMPTS}
     ${DROP_V6_BACKEND_METADATA}
@@ -193,6 +322,7 @@ function downgradeV4ToV1(databasePath: string): void {
 
 function downgradeV4ToV3(databasePath: string): void {
   const database = new Database(databasePath, { strict: true });
+  database.exec(DROP_V8_STATE_OWNERSHIP);
   database.exec(`${DROP_V7_EXECUTION_ATTEMPTS} ${DROP_V6_BACKEND_METADATA} ${DROP_V5_JOB_BACKEND} DROP TABLE backend_sessions; PRAGMA user_version=3;`);
   database.close();
 }
@@ -363,7 +493,7 @@ describe("durable jobs + outbox", () => {
     expect(store.findJobIdByOutboxMessageId("legacy-result-msg")).toBe("job-migrated");
     expect(store.integrityCheck()).toBe("ok");
     store.close();
-    expectHealthyV7(databasePath);
+    expectHealthyV8(databasePath);
     store = new JobStore(databasePath, "account:agent");
   });
 
@@ -603,7 +733,7 @@ describe("durable jobs + outbox", () => {
     expect(pendingCancelCount(databasePath)).toBe(PENDING_CANCEL_MAX_ROWS);
   });
 
-  test("schema v2 迁移到 v7 时补 GC 索引，并在 daemon 恢复时清除历史 intent", () => {
+  test("schema v2 迁移到 v8 时补 GC 索引，并在 daemon 恢复时清除历史 intent", () => {
     const databasePath = join(directory.path, "relay.db");
     store.ingest(incomingJob("matched-job"), "session-1");
     store.close();
@@ -637,7 +767,7 @@ describe("durable jobs + outbox", () => {
       .all().map((row) => row.name);
     migrated.close();
     expect(indexes).toContain("idx_pending_cancels_gc");
-    expect(version?.user_version).toBe(7);
+    expect(version?.user_version).toBe(8);
     expect(outboxColumns).toContain("next_attempt_at");
   });
 
@@ -1767,18 +1897,62 @@ describe("backend session durability", () => {
   });
 });
 
-describe("SQLite schema v7 migration", () => {
-  test("fresh 数据库直接创建 v7，重复打开保持完整", async () => {
-    const directory = await temporaryDirectory("livis-store-fresh-v7-");
+describe("SQLite schema v8 migration", () => {
+  test("fresh 数据库直接创建 v8，重复打开保持完整", async () => {
+    const directory = await temporaryDirectory("livis-store-fresh-v8-");
     const databasePath = join(directory.path, "relay.db");
     try {
       const first = new JobStore(databasePath, "account:agent");
       first.close();
-      expectHealthyV7(databasePath);
+      expectHealthyV8(databasePath);
 
       const reopened = new JobStore(databasePath, "account:agent");
       reopened.close();
-      expectHealthyV7(databasePath);
+      expectHealthyV8(databasePath);
+    } finally {
+      await directory.cleanup();
+    }
+  });
+
+  test("v7 的 Codex session 与 attempt 确定性补绑 account-bound 所有权", async () => {
+    const directory = await temporaryDirectory("livis-store-v7-to-v8-");
+    const databasePath = join(directory.path, "relay.db");
+    try {
+      const seed = new JobStore(databasePath, "account:agent");
+      const sessionKey = "livis:v7-state-ownership";
+      seed.ensureBackendSession({
+        ...BACKEND_SESSION_METADATA,
+        backend: "codex",
+        sessionKey,
+        sessionHash: "a".repeat(64),
+        cwd: join(directory.path, "workspace"),
+        cliVersion: "0.145.0",
+      });
+      seed.bindBackendThread("codex", sessionKey, "v7-thread");
+      seed.ingest(incomingJob("v7-job"), sessionKey, "codex");
+      seed.markAcked("v7-job");
+      const claimed = seed.claimForBackendDispatch(
+        "v7-job",
+        "codex",
+        "codex:v7-thread",
+        "v7-lease",
+      )!;
+      seed.resetUnsentBackendDispatch(
+        claimed.jobId,
+        "codex",
+        "v7-lease",
+        claimed.runGeneration,
+      );
+      seed.close();
+      downgradeV8ToV7(databasePath);
+
+      const migrated = new JobStore(databasePath, "account:agent");
+      expect(migrated.getBackendSession("codex", sessionKey)?.stateOwnership)
+        .toBe("account-bound");
+      expect(migrated.listExecutionAttemptEvents("v7-job").map((event) => event.stateOwnership))
+        .toEqual(["account-bound", "account-bound"]);
+      migrated.close();
+      expectHealthyV8(databasePath);
     } finally {
       await directory.cleanup();
     }
@@ -1828,7 +2002,7 @@ describe("SQLite schema v7 migration", () => {
       expect(migrated.recoverAfterRestart()).toMatchObject({ interrupted: 1 });
       expect(migrated.listExecutionAttemptEvents("legacy-active-job").map((event) => event.eventType))
         .toEqual(["legacy_active_imported", "interrupted"]);
-      expectHealthyV7(databasePath);
+      expectHealthyV8(databasePath);
     } finally {
       migrated?.close();
       await directory.cleanup();
@@ -1964,7 +2138,7 @@ describe("SQLite schema v7 migration", () => {
         effectiveModel: "gpt-drift",
       })).toThrow("immutable metadata");
       migrated.close();
-      expectHealthyV7(databasePath);
+      expectHealthyV8(databasePath);
     } finally {
       await directory.cleanup();
     }
@@ -2023,14 +2197,14 @@ describe("SQLite schema v7 migration", () => {
       } finally {
         reopened.close();
       }
-      expectHealthyV7(databasePath);
+      expectHealthyV8(databasePath);
     } finally {
       await directory.cleanup();
     }
   });
 
-  test("schema v3 原地升级到 v7", async () => {
-    const directory = await temporaryDirectory("livis-store-v3-to-v7-");
+  test("schema v3 原地升级到 v8", async () => {
+    const directory = await temporaryDirectory("livis-store-v3-to-v8-");
     const databasePath = join(directory.path, "relay.db");
     try {
       const seed = new JobStore(databasePath, "account:agent");
@@ -2039,7 +2213,7 @@ describe("SQLite schema v7 migration", () => {
 
       const migrated = new JobStore(databasePath, "account:agent");
       migrated.close();
-      expectHealthyV7(databasePath);
+      expectHealthyV8(databasePath);
     } finally {
       await directory.cleanup();
     }
@@ -2083,7 +2257,7 @@ describe("SQLite schema v7 migration", () => {
       expect(migrated.listDispatchable("codex").map((job) => job.jobId))
         .toEqual(["legacy-pending"]);
       migrated.close();
-      expectHealthyV7(databasePath);
+      expectHealthyV8(databasePath);
       expect(() => new JobStore(databasePath, "account:agent", {
         legacyV4JobBackend: "hermes",
       })).toThrow("SQLite v5 已按 codex 绑定原 v4 积压");
@@ -2093,7 +2267,7 @@ describe("SQLite schema v7 migration", () => {
   });
 
   test("并发 opener 在取得 IMMEDIATE 写锁后才裁决版本", async () => {
-    const directory = await temporaryDirectory("livis-store-concurrent-v7-");
+    const directory = await temporaryDirectory("livis-store-concurrent-v8-");
     const databasePath = join(directory.path, "relay.db");
     const readyPath = join(directory.path, "child-ready");
     const proceedPath = join(directory.path, "child-proceed");
@@ -2126,7 +2300,7 @@ describe("SQLite schema v7 migration", () => {
             },
           });
           store.close();
-          process.stdout.write("opened-v7");
+          process.stdout.write("opened-v8");
         `,
       ], {
         cwd: join(import.meta.dir, ".."),
@@ -2163,9 +2337,9 @@ describe("SQLite schema v7 migration", () => {
 
       const [exitCode, childStdout, childStderr] = await Promise.all([child.exited, stdout, stderr]);
       expect(exitCode).toBe(0);
-      expect(childStdout).toBe("opened-v7");
+      expect(childStdout).toBe("opened-v8");
       expect(childStderr).toBe("");
-      expectHealthyV7(databasePath);
+      expectHealthyV8(databasePath);
     } finally {
       if (blocker) {
         if (!committed) {
@@ -2185,8 +2359,8 @@ describe("SQLite schema v7 migration", () => {
     }
   });
 
-  test("外键检查失败会回滚全部 v2→v7 DDL 与版本号", async () => {
-    const directory = await temporaryDirectory("livis-store-rollback-v7-");
+  test("外键检查失败会回滚全部 v2→v8 DDL 与版本号", async () => {
+    const directory = await temporaryDirectory("livis-store-rollback-v8-");
     const databasePath = join(directory.path, "relay.db");
     try {
       const seed = new JobStore(databasePath, "account:agent");

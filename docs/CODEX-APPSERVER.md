@@ -335,21 +335,24 @@ smoke 不再铺设 `.system` skills 或 `shell_snapshots`；但上游仍会在�
 JobStore schema v4 新增可变的 `backend_sessions`；schema v5 在 job 首次入库时持久化
 `target_backend`，schema v6 继续持久化 Codex 账号类型、账号 subject 摘要与身份强度、
 请求/实际 model、model provider、安全配置 SHA、feature 快照 SHA 和稳定 thread-tail
-checkpoint。当前 schema v7 以 SQLite trigger 强制 `jobs.target_backend` 不可变，并新增
-`execution_attempt_events` append-only 账本。状态职责为：
+checkpoint。schema v7 以 SQLite trigger 强制 `jobs.target_backend` 不可变，并新增
+`execution_attempt_events` append-only 账本；当前 schema v8 又增加显式状态所有权。既有
+私有 CODEX_HOME 路径为 `account-bound`，本地当前状态原型为 `local-state-opaque` 且账号字段
+保持 `NULL`。状态职责为：
 
 - `jobs/outbox` 是状态裁决与结果投递真源；
 - `backend_sessions` 是可变的当前 thread、active attempt 和 recovery anchor；terminal 或
   人工 release 后它可以更新，不能当作永久审计记录；
 - `execution_attempt_events` 是 job → backend session → provider operation 的永久历史。
   Codex 把 thread/turn 写入 provider session/operation，Hermes connector v1 没有等价的
-  provider-native ID 时允许为空。账本还保存 lease/execution、runtime、model、account、
+  provider-native ID 时允许为空。账本还保存 lease/execution、runtime、model、状态所有权、account、
   安全配置与 feature 摘要；UPDATE/DELETE 均由 trigger 拒绝。
 
 账本事件固定为 `reserved`、`accepted`、`not_sent`、`cancelled_not_sent`、`succeeded`、
 `failed`、`cancel_unknown`、`interrupted` 与 `legacy_active_imported`。事件只记录已在同一
 SQLite 事务中稳定提交的事实，不参与自动重放或替代 job 状态裁决。v6→v7 迁移会把当时
-可证明的 active attempt 作为 `legacy_active_imported` 导入，但不重建不存在的早期事件。
+可证明的 active attempt 作为 `legacy_active_imported` 导入，但不重建不存在的早期事件；
+v7→v8 只为既有完整 Codex 行确定性补充 `account-bound` 所有权。
 
 ```text
 LiViS message
@@ -630,7 +633,7 @@ token。固定 custom provider/model 的生产 backend 只 dispatch 一个固定
 - active 四字段清空、`recovery_required=false`、quarantine 为零；
 - rollout 只有一条 assistant、零工具、零未知 item、一个 `task_started/task_complete`，
   workspace 前后不变；
-- SQLite schema v7、integrity、foreign key 和通用敏感模式扫描通过，临时 API-key 文件删除后，
+- SQLite schema v8、integrity、foreign key 和通用敏感模式扫描通过，临时 API-key 文件删除后，
   其余普通文件对该 key 的精确扫描为零命中；
 - 默认生产 spawn 的独立进程组已确认关闭。报告瞬间 `lsof` 无法裁决，令 harness 顶层
   `ok=false`；事后相同参数确认零句柄，没有重发 turn，故业务功能结论为 GO、瞬时 lsof

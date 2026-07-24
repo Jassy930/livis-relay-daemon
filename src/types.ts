@@ -57,6 +57,14 @@ export type BackendCheckpointTurnStatus = "completed" | "failed" | "interrupted"
 /** 账号身份绑定能否区分同类型账号；当前生产支持的 API key 只能绑定账号类型。 */
 export type BackendAccountIdentityStrength = "subject" | "type-only";
 
+/**
+ * backend session 的本地状态所有权边界。
+ *
+ * `account-bound` 仅用于既有 daemon 私有 runtime；`local-state-opaque` 表示
+ * daemon 只调用本地 backend 当前状态，不读取、分类或持久化其账号状态。
+ */
+export type BackendSessionStateOwnership = "account-bound" | "local-state-opaque";
+
 export interface RelayMetadata {
   msg_id?: string;
   job_id?: string;
@@ -136,6 +144,7 @@ export interface StoredExecutionAttemptEvent {
   requestedModel: string | null;
   effectiveModel: string | null;
   modelProvider: string | null;
+  stateOwnership: BackendSessionStateOwnership | null;
   accountType: string | null;
   accountSubjectSha256: string | null;
   securityConfigSha256: string | null;
@@ -166,6 +175,8 @@ export interface StoredBackendSession {
   threadId: string | null;
   cwd: string;
   cliVersion: string;
+  /** v7 旧行在首次安全绑定前为 null；新建 v8 行始终完整。 */
+  stateOwnership: BackendSessionStateOwnership | null;
   /** v5 旧行在首次安全绑定前为 null；新建 v6 行始终完整。 */
   accountType: string | null;
   accountSubjectSha256: string | null;

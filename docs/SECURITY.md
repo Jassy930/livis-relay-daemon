@@ -45,17 +45,18 @@
   `jobs.target_backend` 只绑定 `codex`。同一 state directory 禁止 provider 切换、endpoint
   变更或 key 轮换；只能创建全新 state/CODEX_HOME。`session release` 不是切换工具。
 - 未知版本、哈希、wire protocol 或运行契约变化 fail closed。
-- job 在首次入库事务内持久绑定 `target_backend`；schema v7 的 SQLite trigger 会拒绝
+- job 在首次入库事务内持久绑定 `target_backend`；schema v8 的 SQLite trigger 会拒绝
   任何后续改写，积压 job 不会跟随后来配置切换。`serve` 在启动 backend 或 Relay 前
   拒绝异 backend 的 `Received/Acked/Dispatching/Running/Cancelling` 积压；终态历史与
   outbox 投递不触发 provider 重跑。
   schema v4 的待派发 job 没有该历史字段，只有操作者显式填写
   `execution.legacyV4JobBackend` 后才允许 v4→v5 迁移；该值必须描述原始入库 backend，
   不能填写准备切换到的目标 backend。
-- 当前 JobStore schema v7 延续 v6 的 Codex 账号身份强度、请求/实际 model、model
+- 当前 JobStore schema v8 延续 v6 的 Codex 账号身份强度、请求/实际 model、model
   provider、安全配置和 feature snapshot SHA-256，以及单调 thread-tail checkpoint；
-  旧 v5 session 仅在没有 active/recovery/quarantine 时允许一次性安全补绑。
-- v7 的 `execution_attempt_events` 永久记录 job/backend/session/lease/execution、Codex
+  旧 v5 session 仅在没有 active/recovery/quarantine 时允许一次性安全补绑。v8 新增
+  `account-bound | local-state-opaque` 状态所有权；本地状态不透明行的账号字段必须为 `NULL`。
+- v8 的 `execution_attempt_events` 永久记录 job/backend/session/lease/execution、Codex
   thread/turn、runtime/model/account/安全摘要与 attempt 事件；UPDATE 和 DELETE 都由
   SQLite trigger 拒绝。`backend_sessions` 仍是可变的当前 session/recovery anchor，只有
   账本用于 terminal 或人工 release 后的历史追溯，`jobs/outbox` 仍负责状态裁决。
