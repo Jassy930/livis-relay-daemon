@@ -50,6 +50,11 @@ immutable session hash 还绑定唯一获准 `node_id`，因此同一 state dire
 设备会拒绝复用旧 thread。多设备路由、跨设备会话连续性、设备 ID 轮换和既有状态迁移
 均不在一期范围内；不得通过追加第二个 allowlist 值来绕过该边界。
 
+目标架构仍希望 Hermes、Codex 与 Claude 分别复用各自原生本地运行时的当前认证状态，daemon
+只持有 LiViS OAuth，不读取或复制后端 token。这个目标认证边界尚未接入现有 Codex backend：
+当前 Codex 已实现并通过 app-server canary，但仍使用 daemon 私有 `CODEX_HOME` 与专用 API
+key；Claude 仍只有中立调用契约。迁移计划与门禁见[本地多后端架构与认证边界](LOCAL-BACKENDS.md)。
+
 ## 执行与投递是两套状态
 
 ```text
@@ -142,7 +147,7 @@ backend 切换只允许发生在其他 backend 没有 `Received/Acked/Dispatchin
 
 该临时表边界与 durable job/outbox 保留策略相互独立；jobs、outbox 和投递尝试仍没有自动 retention。大量合法小帧的 Promise 排队也不在本次边界内。
 
-## Hermes connector contract
+## 一期 Hermes connector contract
 
 一期 connector protocol 固定为 v1，关键消息为：
 

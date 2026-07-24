@@ -158,6 +158,7 @@ canary 外，合并文档或 `plutil -lint` 通过不代表用户服务已被修
 - [普通 profile 激活事务](docs/PROFILE-ACTIVATION.md)
 - [版本与发布流程](docs/RELEASING.md)
 - [架构与状态所有权](docs/ARCHITECTURE.md)
+- [本地多后端架构与认证边界](docs/LOCAL-BACKENDS.md)
 - [安全边界](docs/SECURITY.md)
 - [参与贡献](CONTRIBUTING.md)
 - [漏洞报告政策](SECURITY.md)

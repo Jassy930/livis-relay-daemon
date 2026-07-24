@@ -13,6 +13,7 @@
 
 ### 新增
 
+- 新增 Hermes、Codex、Claude 本地后端目标架构、后端中立调用契约与认证所有权边界测试；Codex、Claude 在 adapter 和 canary 完成前保持 `contract-only`。
 - 新增严格 JSON Schema 约束的 `capabilities.json`，并提供只读 CLI、证据引用和一致性门禁。
 - 新增 Hermes bridge 原子安装器、私有配置备份、失败自动恢复和哈希绑定回滚收据。
 - 新增源码包与 bridge 包构建、SHA-256 manifest、路径预检和解包后发布产物审计。

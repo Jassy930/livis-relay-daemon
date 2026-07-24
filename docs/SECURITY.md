@@ -199,6 +199,15 @@ HTTP 请求。完整脱敏事实与验收边界见
 阻塞；在获授权重试得到 2xx 前，不得手工删 token、执行 `session release`、复用或清理该
 state，也不得把本次结果表述为凭据已撤销。
 
+## 原生认证复用目标
+
+- LiViS OAuth 始终只属于 daemon；目标本地 adapter 不携带 token、cookie、scope、账号详情、认证环境变量或原生 session 文件。
+- 未认证只返回 `backend_auth_unavailable`，由操作者在对应原生客户端处理；不得静默切换后端。
+- 现有 Hermes connector 符合本地运行时持有认证的方向；现有 Codex app-server backend 已实现，但仍使用 daemon 私有 `CODEX_HOME` 与专用 API key，不属于“复用日常 Codex 当前登录态”；Claude 仍为 `contract-only`。
+- 将 Codex 迁移到原生认证复用、接入 Claude，以及允许同一 daemon 在请求间切换 backend，都必须先完成独立 adapter、状态迁移、并发所有权和实网 canary，不能仅凭中立类型契约宣称完成。
+
+详细设计和分阶段验证见[本地多后端架构与认证边界](LOCAL-BACKENDS.md)。
+
 ## Upstream 门禁
 
 - `upstream check` 只下载并静态检查，不执行官方脚本或插件。
