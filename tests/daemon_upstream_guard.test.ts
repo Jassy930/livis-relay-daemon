@@ -2,13 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { chmod } from "node:fs/promises";
 import { join } from "node:path";
+import type { ExecutionFailedEvent } from "../src/backends/execution-backend.ts";
 import { RelayDaemon, type RelayDaemonTestHooks } from "../src/daemon.ts";
 import type { RelayIdentity } from "../src/identity.ts";
 import { Logger } from "../src/logger.ts";
 import { SecretStore } from "../src/secrets.ts";
 import { ProfileOperationGuard } from "../src/state/offline-guard.ts";
 import type { JobStore } from "../src/state/store.ts";
-import type { ConnectorInboundMessage, RelayEnvelope, StoredJob } from "../src/types.ts";
+import type { RelayEnvelope, StoredJob } from "../src/types.ts";
 import type { UpstreamSnapshot } from "../src/upstream/checker.ts";
 import { supportedProofPath, UPSTREAM_PROOF_MAX_AGE_MS } from "../src/upstream/proof.ts";
 import { atomicWritePrivate, sha256 } from "../src/util.ts";
@@ -37,10 +38,7 @@ interface DaemonInternals {
   onRelayConnected(): Promise<void>;
   onRelayIncoming(envelope: RelayEnvelope): Promise<void>;
   dispatchPending(): Promise<void>;
-  onConnectorFailed(
-    message: Extract<ConnectorInboundMessage, { type: "failed" }>,
-    connectorId: string,
-  ): Promise<void>;
+  onExecutionFailed(event: ExecutionFailedEvent): Promise<void>;
   armUpstreamProofExpiry(): boolean;
   isUpstreamProofExpired(now?: number): boolean;
   upstreamChecker: { check(): Promise<UpstreamSnapshot> };
@@ -102,13 +100,14 @@ describe("daemon connector failed durable transition", () => {
         notifications += 1;
       };
 
-      await fixture.internals.onConnectorFailed({
-        type: "failed",
+      await fixture.internals.onExecutionFailed({
+        kind: "hermes",
+        executionId: "hermes-test",
         jobId,
         leaseId,
         error: "LiViS 远程渠道不允许执行 Hermes 命令",
         retryable: false,
-      }, "hermes-test");
+      });
 
       const failed = fixture.internals.store.require(jobId);
       expect(failed.status).toBe("Failed");
