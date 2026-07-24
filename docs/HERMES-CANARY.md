@@ -57,6 +57,27 @@ Hermes 0.15.1 只在对应 `*_HOME_CHANNEL` 环境变量缺失时生成一次 ho
 
 只完成前四项时，结论必须写“服务与连接就绪，消息闭环未验证”。看见 PID、`state=running`、WebSocket 握手或 connector ready 都不能写成 canary 通过。
 
+### 2026-07-24 服务与连接就绪回执
+
+本机在停服窗口将稳定部署 checkout 从旧基线升级并固定到 `eea85c9`。升级前完整备份了
+state directory；稳定 checkout 随后通过 `bun run check`，其中包括 451 个 Bun 测试和
+59 个 Hermes bridge 测试。隔离 `livis-test` profile 的 bridge 已由原子安装器从 `0.1.0`
+升级到 `0.1.1`，Hermes runtime 保持 `0.15.1`。
+
+存量 protocol profile 已通过受控迁移从 schema v1 升级到 schema v2，目标 SHA-256 为
+`c8f40fb6c132b363be8695ea4e6ef9116f928c5ff2d3c02070f668ff40c11e61`，wire revision 为
+`livis-relay-v1-access-only-r2`，credential mode 为 `access-token-only`。迁移后重新执行
+upstream check，LiViS v2.0.0 bundle 与当前 profile 精确匹配；online doctor 的配置、profile、
+Hermes 版本、SQLite integrity、quarantine、backend backlog、supported proof 和 upstream
+compatibility 全部通过。
+
+随后按 Relay → Hermes 顺序启动两个独立 LaunchAgent。最终二读确认 Relay daemon `0.1.1`
+已与 LiViS 完成握手，Hermes bridge `0.1.1` 已通过本地 connector 鉴权，`execution.ready` 与
+`connector.ready` 均为 `true`，且无 backend backlog 或 quarantined session。
+
+本次没有从 App 发送新的随机后缀消息，因此结论严格保持为：**服务与连接就绪，消息闭环未验证**。
+旧 job 的 `Succeeded/Delivered` 只能说明历史执行结果，不能替代当前版本组合的消息 canary。
+
 ## 升级后复验
 
 LiViS 官方 bundle、protocol profile、Hermes runtime 或 bridge 任一项变化后，都必须重新执行：
