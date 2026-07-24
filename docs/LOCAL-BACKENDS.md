@@ -159,11 +159,12 @@ Desktop control socket，也不会创建 thread；报告始终保持 `production
 配置、SecretStore 或数据库。
 
 native transport 采用协议优先兼容策略：CLI 与 app-server 版本只要求是有界 semver 并写入报告，
-版本不同本身不阻断；stdio initialize 和响应结构才裁决 readiness。2026-07-24 的真实 Gate 已在
+版本不同本身不阻断；stdio initialize 和响应结构才裁决 readiness。2026-07-24 的 transport Gate 已在
 CLI/app-server `0.145.0` 上返回 `ready`，自有 app-server 已收口，没有 thread、turn 或账号读取。
-Gate 前后 Desktop daemon 均保持 PID `72289`、app-server `0.144.1` 和原启动时间，证明主路径没有
-连接、替换或重启 Desktop。受限沙箱内的 `Operation not permitted` 失败在获授权环境重跑后消失，
-不属于版本、协议或本地账号状态错误。
+随后真实单 turn canary 得到唯一 final `NATIVE_STDIO_CANARY_OK`，job/checkpoint/attempt ledger 全部闭合，
+自有 app-server 再次收口。Gate 前后 Desktop daemon 均保持 PID `72289`、app-server `0.144.1` 和原启动
+时间，证明主路径没有连接、替换或重启 Desktop。受限沙箱内的 `Operation not permitted` 失败在获授权
+环境重跑后消失，不属于版本、协议或本地账号状态错误。
 
 当前 Codex Desktop 及其原生 daemon 是用户拥有的外部系统。relay 只允许 attach 操作者显式配置、
 已经存在的本地 runtime 选择器；默认不得连接 Desktop socket。不得启动、停止、重启、替换或升级
@@ -177,8 +178,11 @@ ambiguous execution 语义。本地 backend 的任意 failed 都按普通、脱�
 状态、不设置 `credential_rejected`，也不因此 quarantine session。
 
 第三个切片 [`native thread policy`](../src/backends/codex/native-thread-policy.ts) 固定 workspace、审批、
-permission profile、feature、model/provider、sandbox、memory 和 fresh/resume checkpoint。这些是执行
-隔离与结果归属门禁，不是账号门禁；失败时不推断原因是否与本地认证有关。
+逐进程 `livis-native-stdio` permission profile、feature、sandbox、memory 和 fresh/resume checkpoint。
+子进程 argv 完整覆盖该 profile，只允许 `:minimal` 只读、workspace roots 可写并关闭网络，不修改用户
+配置；高风险 feature 同样只在自有子进程内关闭并按协议属性回读。fresh session 接受本地 app-server
+实际 model/provider 和有界 instruction-source 路径集合，将其摘要绑定到 session policy；resume 仍按
+SQLite 锚点精确比较。Relay 不读取 instruction 内容，也不把 provider 标识解释成账号或认证分类。
 
 第四个切片 [`client epoch fence`](../src/backends/codex/native-client-epoch.ts) 每次 fake stdio attach
 只分配递增 epoch，不发 RPC、不保存账号或主体绑定。旧 client 的迟到 notification、exit 和 timeout
@@ -200,26 +204,25 @@ transport-only probe。
 notification callback 固定绑定 coordinator 的确切 client epoch；active app-server exit/terminal timeout
 进入持久 recovery/quarantine，idle exit 只降低 transport readiness。attach、initialize、preflight
 失败都验证 Relay 自有进程的收口语义。对应
-[`组合测试`](../tests/codex_native_session_harness.test.ts) 只注入 fake stdio client，仍未连接真实 Desktop，
-也未进入生产入口。
+[`组合测试`](../tests/codex_native_session_harness.test.ts) 仍只注入 fake stdio client；另行授权的真实
+canary 已通过同一 harness 完成一个 turn，但尚未进入生产入口。
 
-这里仍有一个执行隔离门槛：permission profile 与 feature 集合由独立 app-server 从当前本地 runtime
-加载。relay 不得通过修改用户默认配置、重启 Desktop daemon 或关闭用户 feature 来满足门禁；兼容
-端点必须原生提供不影响 Desktop 的逐进程/逐 thread 隔离。做不到就保持 `unsupported`。
+真实 Gate 已证明执行隔离可由独立 app-server 的逐进程 argv 和逐 thread 回读完成，不需要修改用户
+默认配置、重启 Desktop daemon 或关闭 Desktop feature。该结论只覆盖单次 fresh turn；真实 resume、
+取消、超时、断线、长期并发和生产路由仍未闭合，因此能力继续保持 `unsupported`。
 
 工作包：
 
-1. transport + 持久 session coordinator 的离线组合已完成；后续真实 canary 仍必须保持旧 active
-   attempt 先结算或进入 ambiguous quarantine，才允许新 epoch 恢复 thread。
+1. transport + 持久 session coordinator 的离线组合和一次真实 fresh turn 已完成；后续真实 resume
+   canary 仍必须保持旧 active attempt 先结算或进入 ambiguous quarantine，才允许新 epoch 恢复 thread。
 2. 原生模式不读取或持久化 account type、主体、登录状态、token、scope 或 provider 认证分类；现有
    `private-api-key` 兼容路径只能由操作者显式选择，不能自动 fallback。
 3. readiness 只描述 transport 的 `ready | offline | incompatible`；本地执行错误不降低 transport
    readiness，也不阻止后续 job 再次调用当前本地状态。
 4. fake 端点已覆盖成功、普通 backend failed、超时、取消、app-server 退出、resume 和旧 epoch 迟到
-   事件；真实 Desktop/stdio 并发与逐 thread 不干扰只在另行授权的非生产 canary
-   中验证。
-5. 当前真实 transport Gate 已为 `ready`，下一步可以进入受控 thread/turn 与 Desktop 并发 canary；
-   本地账号状态无论正确或错误都不作为前置门禁，实际错误只按普通 execution failed 结算。
+   事件；真实 fresh turn 已通过，真实 resume/异常路径与长时 Desktop 并发仍需另行授权验证。
+5. 当前真实 transport 与单 turn Gate 已通过；本地账号状态无论正确或错误都不作为前置门禁，实际
+   错误只按普通 execution failed 结算。
 
 完成定义：另行授权的非生产 canary 证明 daemon 未产生第二份后端凭据、未读取账号状态、未改变
 Codex Desktop 生命周期或状态、日常 Codex 仍可用、job/lease/checkpoint 全闭合，才考虑把

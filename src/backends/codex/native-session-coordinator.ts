@@ -32,7 +32,7 @@ export interface CodexNativeSessionCoordinatorOptions {
   workspace: string;
   cliVersion: string;
   requestedModel: string | null;
-  expectedModelProvider: string;
+  expectedModelProvider: string | null;
   requestTimeoutMs: number;
   turnTimeoutMs: number;
   maxOutputChars: number;
@@ -92,7 +92,7 @@ function validateOptions(options: CodexNativeSessionCoordinatorOptions): void {
   if (options.requestedModel !== null && options.requestedModel.trim() === "") {
     throw new Error("requestedModel 不能为空字符串");
   }
-  if (options.expectedModelProvider.trim() === "") {
+  if (options.expectedModelProvider !== null && options.expectedModelProvider.trim() === "") {
     throw new Error("expectedModelProvider 不能为空");
   }
   positiveInteger(options.requestTimeoutMs, "requestTimeoutMs");
@@ -128,7 +128,8 @@ function assertResumeMetadata(
     session.sessionHash !== options.sessionHash || session.cwd !== options.workspace ||
     session.cliVersion !== options.cliVersion ||
     session.requestedModel !== options.requestedModel || session.effectiveModel === null ||
-    session.modelProvider !== options.expectedModelProvider ||
+    (options.expectedModelProvider !== null &&
+      session.modelProvider !== options.expectedModelProvider) ||
     session.securityConfigSha256 === null || session.featureSnapshotSha256 === null
   ) {
     throw new CodexNativeSessionCoordinatorError(

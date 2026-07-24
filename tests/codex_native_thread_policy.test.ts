@@ -56,7 +56,7 @@ class FakeNativeThreadClient implements CodexNativeExecutionClient {
     }
     if (method === "permissionProfile/list") {
       return {
-        data: [{ id: "livis-remote", allowed: this.permissionAllowed }],
+        data: [{ id: "livis-native-stdio", allowed: this.permissionAllowed }],
         nextCursor: null,
       } as T;
     }
@@ -96,7 +96,7 @@ class FakeNativeThreadClient implements CodexNativeExecutionClient {
       instructionSources: [],
       approvalPolicy: "never",
       approvalsReviewer: "user",
-      activePermissionProfile: { id: "livis-remote", extends: null },
+      activePermissionProfile: { id: "livis-native-stdio", extends: null },
       sandbox: {
         type: "workspaceWrite",
         writableRoots: [],
@@ -157,7 +157,7 @@ describe("Codex native thread 离线安全策略", () => {
       runtimeWorkspaceRoots: ["/test/native-workspace"],
       approvalPolicy: "never",
       approvalsReviewer: "user",
-      permissions: "livis-remote",
+      permissions: "livis-native-stdio",
       model: "gpt-5.6-sol",
       environments: [{
         environmentId: "local",
@@ -195,6 +195,29 @@ describe("Codex native thread 离线安全策略", () => {
     expect(client.requests[2]?.params).toMatchObject({ threadId: "native-thread-1" });
   });
 
+  test("fresh 接受本地不透明 provider 与有界 instruction source，并绑定到策略摘要", async () => {
+    const client = new FakeNativeThreadClient();
+    client.modelProvider = "custom";
+    client.threadResponseOverride = {
+      instructionSources: ["/Users/test/.codex/AGENTS.md"],
+    };
+    const receipt = await prepareCodexNativeThread(client, options({
+      cliVersion: "0.146.0-alpha.3.1",
+      expectedModelProvider: null,
+    }));
+
+    expect(receipt.modelProvider).toBe("custom");
+    expect(receipt.policyBindingSha256).toHaveLength(64);
+
+    client.threadResponseOverride = { instructionSources: ["relative/AGENTS.md"] };
+    await expect(prepareCodexNativeThread(client, options({
+      expectedModelProvider: null,
+    }))).rejects.toMatchObject({
+      code: "native_thread_policy_incompatible",
+      sessionDisposition: "quarantine_required",
+    });
+  });
+
   test("permission profile 或全局 feature 不满足时在创建 thread 前失败关闭", async () => {
     for (const variant of ["profile", "feature"] as const) {
       const client = new FakeNativeThreadClient();
@@ -213,9 +236,8 @@ describe("Codex native thread 离线安全策略", () => {
     }
   });
 
-  test("继承 instruction、开放网络或额外写根均在 thread 创建后要求 quarantine", async () => {
+  test("开放网络或额外写根均在 thread 创建后要求 quarantine", async () => {
     const variants: Record<string, Record<string, unknown>> = {
-      instructions: { instructionSources: ["user-default"] },
       network: {
         sandbox: {
           type: "workspaceWrite",

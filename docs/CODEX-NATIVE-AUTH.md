@@ -7,8 +7,8 @@
 Desktop 的 control socket，不依赖 `app-server daemon`，也不会启动、停止、重启、升级或配置 Desktop
 daemon。
 
-这项能力仍为实验实现，`codex_native_auth_reuse=unsupported`。transport-only 真实 Gate 已通过不等于
-真实 thread/turn、session resume、并发或生产 `serve` 已通过。
+这项能力仍为实验实现，`codex_native_auth_reuse=unsupported`。transport-only 与单次真实
+thread/turn Gate 已通过；真实 session resume、取消/超时、并发和生产 `serve` 仍未通过。
 
 ## 1. transport-only 探针
 
@@ -34,12 +34,15 @@ SecretStore、IdentityStore，也不会连接 Hermes。
 
 1. 固定 Codex CLI 的文件身份并观测 `--version`；
 2. 从当前进程环境选择本地 `HOME`，以及已经存在时的 `CODEX_HOME`；
-3. 启动 `[codex, app-server, --stdio]`；
+3. 启动独立 `codex app-server --stdio`，通过子进程 argv 注入 workspace-only permission profile，
+   并关闭未经审核的 feature；
 4. 发送 `initialize` 和 `initialized`；
 5. 回读 `codexHome`、client-bound user agent 和平台字段；
 6. 关闭并确认 Relay 自己启动的 app-server 进程组已收口。
 
-它不会调用账号接口、创建或恢复 thread、发送 turn、发起登录、刷新凭据或改变本地认证状态。
+这些 argv 只作用于 Relay 自己启动的进程，不写本地 `config.toml`，也不改变 Desktop 的 feature 或
+permission profile。探针不会调用账号接口、创建或恢复 thread、发送 turn、发起登录、刷新凭据或改变
+本地认证状态。
 
 ## 2. 为什么不连接 Desktop daemon
 
@@ -72,6 +75,14 @@ Relay 只把以下非业务内容交给独立 app-server：
 其他 daemon 环境不透传。Relay 不打开 HOME/CODEX_HOME 下的账号文件，不访问 Keychain，不读取账号
 主体、登录类型、token、scope 或 provider 认证分类。HOME/CODEX_HOME 在本层只是 runtime 选择器；其下
 状态的所有权和解释权仍属于 Codex。
+
+执行 attach 会在 initialize 声明 `experimentalApi=true`，因为 `runtimeWorkspaceRoots`、
+`approvalsReviewer` 和逐 thread policy 回读属于当前 app-server 的实验协议字段；transport-only probe
+仍声明 `false`。这只是协议能力协商，不是账号、凭据或 Desktop remote-control 开关。
+
+执行路径使用 argv 内完整覆盖的 `livis-native-stdio` profile：只读 `:minimal`、只写
+`:workspace_roots`、网络关闭，并排除 `TMPDIR` 与 `/tmp`。Relay 不依赖用户预先配置同名 profile，
+也不使用内建 `:workspace`，因为真实回读证明内建 profile 不隔离系统临时目录。
 
 `initialize.codexHome` 必须与本次选择的 runtime 一致，并且不能位于 Relay state directory 内。这个
 回读只证明进程使用了预期本地 runtime，不证明账号有效，也不会把路径写入公开报告。
@@ -120,6 +131,29 @@ CLI 与 app-server 版本仅用于观测，版本不同本身不阻断；readine
 受限开发沙箱内的首次真实运行因 `Operation not permitted` 失败；同一命令在获授权受控环境重跑后
 通过。这属于执行环境限制，不是 Codex transport、版本或本地认证状态失败。
 
+随后在临时 workspace 和 Relay 数据库上完成一次真实 thread/turn canary。最终结果为：
+
+- submission 为 `submitted`；
+- 唯一 final 精确为 `NATIVE_STDIO_CANARY_OK`；
+- job 为 `Succeeded`，outbox 为 `Pending`；
+- attempt ledger 为 `reserved → accepted → succeeded`；
+- checkpoint 为 `completed`、turn count 为 `1`；
+- session 为 `local-state-opaque`，无 recovery、无 quarantine；
+- CLI/app-server 均为 `0.145.0`，transport 为 `app-server-stdio`；
+- 自有 stdio app-server 已收口，Desktop daemon PID 和原启动时间未改变。
+
+真实 bring-up 同时发现并修复了四个可证伪的协议问题：
+
+1. 原生子进程最初继承了本地启用的 plugin、hook、browser 等 feature；现改为逐进程 argv 关闭，并按
+   实际 feature 属性回读，不绑定精确 CLI 小版本；
+2. 本地 runtime 没有私有 `livis-remote` profile；现通过 argv 完整注入独立的
+   `livis-native-stdio`，不写用户配置；
+3. attach 最初未声明 experimental API，却使用 `runtimeWorkspaceRoots`；现只有执行 attach 声明对应
+   capability；
+4. 本地 runtime 的 provider 和全局 instruction source 属于当前 Codex 状态。fresh session 接受
+   app-server 的实际 provider，把 provider 与有界 instruction-source 路径摘要绑定到 session policy；
+   resume 仍要求持久锚点一致。Relay 不读取 instruction 文件内容，也不解释 provider 的认证状态。
+
 ## 6. Desktop 不干扰不变量
 
 - 默认路径不得连接 Desktop control socket；
@@ -129,7 +163,7 @@ CLI 与 app-server 版本仅用于观测，版本不同本身不阻断；readine
 - 不兼容时不能自动回退到私有 API-key backend；
 - 离线自动化只使用测试拥有的 fake app-server，不使用真实 Desktop socket 作为夹具。
 
-## 7. 离线执行组合状态
+## 7. 执行组合状态
 
 [`CodexNativeSessionHarness`](../src/backends/codex/native-session-harness.ts) 已改为通过
 [`attachCodexNativeStdio`](../src/backends/codex/native-stdio.ts) 获得独立 app-server，再组合：
@@ -142,16 +176,15 @@ CLI 与 app-server 版本仅用于观测，版本不同本身不阻断；readine
 - idle app-server exit 只降低 readiness；
 - 旧 epoch 迟到事件不能命中新 client。
 
-这些组合测试使用 fake client，不读取真实账号状态。组合 harness 仍没有被 `daemon.ts`、`config.ts` 或
-生产 `serve` 导入。
+离线组合测试继续使用 fake client，不读取真实账号状态；本节第 5 节的受控 canary 已额外证明同一
+harness 能完成真实单 turn。组合 harness 仍没有被 `daemon.ts`、`config.ts` 或生产 `serve` 导入，
+因此 `productionReady` 保持 `false`。
 
 ## 8. 下一实现门禁
 
 在 `codex_native_auth_reuse` 从 `unsupported` 升级前，还必须完成：
 
-1. 使用独立 stdio app-server 完成一条受控真实 thread/turn，并确认本地错误只作为普通 execution
-   failure 返回；
-2. 验证 fresh/resume、取消、超时、断线和迟到事件的真实协议形态；
-3. 在 Codex Desktop 同时运行时完成并发 canary，前后回读 Desktop PID、版本和 session 不受影响；
-4. 明确生产配置中的 native/private 模式选择，禁止静默 fallback；
-5. 绑定精确 commit、CLI/app-server 版本、测试门禁和脱敏 receipt 后，才接入 `serve`。
+1. 验证真实 resume、取消、超时、断线和迟到事件的协议形态；
+2. 在 Codex Desktop 同时运行时完成更长时段并发 canary，确认 Desktop session 与日常交互不受影响；
+3. 明确生产配置中的 native/private 模式选择，禁止静默 fallback；
+4. 绑定精确 commit、CLI/app-server 版本、测试门禁和脱敏 receipt 后，才接入 `serve`。

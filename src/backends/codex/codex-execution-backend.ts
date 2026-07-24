@@ -464,17 +464,78 @@ function validateAccountResponse(value: unknown): AuthenticatedCodexAccountInspe
   };
 }
 
-export function validatePermissionProfiles(value: unknown): void {
+export function validatePermissionProfiles(
+  value: unknown,
+  permissionProfile = CODEX_REMOTE_PERMISSION_PROFILE,
+): void {
   const response = requireRecord(value, "permissionProfile/list response");
   if (!Array.isArray(response.data)) {
     throw new Error("permissionProfile/list response.data 必须是数组");
   }
   const profile = response.data.find(
-    (candidate) => isRecord(candidate) && candidate.id === CODEX_REMOTE_PERMISSION_PROFILE,
+    (candidate) => isRecord(candidate) && candidate.id === permissionProfile,
   );
   if (!profile || profile.allowed !== true) {
-    throw new Error(`Codex permission profile ${CODEX_REMOTE_PERMISSION_PROFILE} 不存在或不可用`);
+    throw new Error(`Codex permission profile ${permissionProfile} 不存在或不可用`);
   }
+}
+
+/**
+ * native stdio 只按协议回读安全属性，不把兼容性绑定到某个精确 CLI 小版本。
+ * argv 已请求关闭的能力必须实际关闭；removed feature 即使回读 enabled 也没有运行入口。
+ */
+export function validateNativeCodexFeatures(value: unknown): string {
+  const response = requireRecord(value, "experimentalFeature/list response");
+  if (!Array.isArray(response.data) || response.nextCursor !== null) {
+    throw new Error("Codex feature 列表必须在单页完整返回");
+  }
+  const features = new Map<string, {
+    name: string;
+    stage: string;
+    enabled: boolean;
+    defaultEnabled: boolean;
+  }>();
+  for (const candidate of response.data) {
+    if (!isRecord(candidate) || typeof candidate.name !== "string" ||
+        typeof candidate.stage !== "string" || typeof candidate.enabled !== "boolean" ||
+        typeof candidate.defaultEnabled !== "boolean") {
+      throw new Error("Codex feature 列表包含非法条目");
+    }
+    if (features.has(candidate.name)) {
+      throw new Error(`Codex feature 列表包含重复名称：${candidate.name}`);
+    }
+    features.set(candidate.name, {
+      name: candidate.name,
+      stage: candidate.stage,
+      enabled: candidate.enabled,
+      defaultEnabled: candidate.defaultEnabled,
+    });
+  }
+  for (const name of CODEX_DISABLED_FEATURES) {
+    const feature = features.get(name);
+    if (!feature || (feature.enabled && feature.stage !== "removed")) {
+      throw new Error(`Codex native 高风险 feature 未禁用或未回读：${name}`);
+    }
+  }
+  const enabledRuntimeFeatures = [...features.values()]
+    .filter((feature) => feature.enabled && feature.stage !== "removed")
+    .sort((left, right) => left.name.localeCompare(right.name));
+  const allowed = new Map<string, string>([
+    ["shell_tool", "stable"],
+    ["unified_exec", "stable"],
+  ]);
+  if (
+    enabledRuntimeFeatures.length !== allowed.size ||
+    enabledRuntimeFeatures.some((feature) => allowed.get(feature.name) !== feature.stage)
+  ) {
+    throw new Error(
+      "Codex native enabled runtime feature 集合未经审核：" +
+        (enabledRuntimeFeatures.map((feature) => feature.name).join(",") || "<empty>"),
+    );
+  }
+  return sha256(JSON.stringify([...features.values()].sort((left, right) =>
+    left.name.localeCompare(right.name)
+  )));
 }
 
 export function validateDisabledCodexFeatures(value: unknown, cliVersion: string): string {
@@ -572,13 +633,15 @@ export interface CodexThreadBindingInspection {
   threadId: string;
   effectiveModel: string;
   modelProvider: string;
+  instructionSourcesSha256: string;
 }
 
 export interface CodexThreadPolicyExpectation {
   workspace: string;
   expectedThreadId: string | null;
-  expectedModelProvider: string;
+  expectedModelProvider: string | null;
   permissionProfile: string;
+  instructionSourcePolicy?: "none" | "local-opaque";
 }
 
 /** 私有 app-server 与 native stdio client 共用的逐 thread 安全回读。 */
@@ -602,8 +665,23 @@ export function inspectCodexThreadPolicyResponse(
   ) {
     throw new Error("Codex runtimeWorkspaceRoots 回读与 daemon workspace 不一致");
   }
-  if (!Array.isArray(response.instructionSources) || response.instructionSources.length !== 0) {
-    throw new Error("Codex thread 回读包含继承的 instruction source");
+  if (!Array.isArray(response.instructionSources)) {
+    throw new Error("Codex thread instructionSources 回读不是数组");
+  }
+  const instructionSources = response.instructionSources;
+  if ((expectation.instructionSourcePolicy ?? "none") === "none") {
+    if (instructionSources.length !== 0) {
+      throw new Error("Codex thread 回读包含继承的 instruction source");
+    }
+  } else if (
+    instructionSources.length > 64 ||
+    instructionSources.some((source) =>
+      typeof source !== "string" || source.length === 0 || source.length > 4_096 ||
+      !isAbsolute(source)
+    ) ||
+    new Set(instructionSources).size !== instructionSources.length
+  ) {
+    throw new Error("Codex native instructionSources 不是有界绝对路径集合");
   }
   if (response.approvalPolicy !== "never") {
     throw new Error("Codex approvalPolicy 回读不是 never");
@@ -640,7 +718,10 @@ export function inspectCodexThreadPolicyResponse(
     response.modelProvider,
     "Codex thread response.modelProvider",
   );
-  if (modelProvider !== expectation.expectedModelProvider) {
+  if (
+    expectation.expectedModelProvider !== null &&
+    modelProvider !== expectation.expectedModelProvider
+  ) {
     throw new Error(
       `Codex thread 实际 provider ${modelProvider} 与固定 provider ${expectation.expectedModelProvider} 不一致`,
     );
@@ -649,6 +730,7 @@ export function inspectCodexThreadPolicyResponse(
     threadId,
     effectiveModel: nonEmptyString(response.model, "Codex thread response.model"),
     modelProvider,
+    instructionSourcesSha256: sha256(JSON.stringify(instructionSources)),
   };
 }
 

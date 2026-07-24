@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { chmod, realpath, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
+  CODEX_DISABLED_FEATURES,
   CodexAppServerStartCloseUnconfirmedError,
   type CodexAppServerClientOptions,
 } from "../src/backends/codex/app-server-client.ts";
@@ -13,6 +14,7 @@ import {
   type CodexNativeStdioProbeOptions,
 } from "../src/backends/codex/native-stdio.ts";
 import { temporaryDirectory } from "./helpers.ts";
+import { CODEX_NATIVE_PERMISSION_PROFILE } from "../src/backends/codex/runtime-layout.ts";
 
 const PROJECT_ROOT = resolve(import.meta.dir, "..");
 
@@ -88,6 +90,12 @@ describe("Codex native stdio transport", () => {
       COMMAND_PIN.path,
       "app-server",
       "--stdio",
+      "-c",
+      `permissions.${CODEX_NATIVE_PERMISSION_PROFILE}={` +
+        `description="LiViS native stdio workspace-only",` +
+        `filesystem={":root"="deny",":minimal"="read",":workspace_roots"="write"},` +
+        `network={enabled=false}}`,
+      ...CODEX_DISABLED_FEATURES.flatMap((feature) => ["--disable", feature]),
     ]);
     expect(JSON.stringify(selection.environment)).not.toContain("UNLISTED_SECRET");
   });
@@ -143,11 +151,21 @@ describe("Codex native stdio transport", () => {
       COMMAND_PIN.path,
       "app-server",
       "--stdio",
+      "-c",
+      `permissions.${CODEX_NATIVE_PERMISSION_PROFILE}={` +
+        `description="LiViS native stdio workspace-only",` +
+        `filesystem={":root"="deny",":minimal"="read",":workspace_roots"="write"},` +
+        `network={enabled=false}}`,
+      ...CODEX_DISABLED_FEATURES.flatMap((feature) => ["--disable", feature]),
     ]);
     expect(observedOptions[0]?.env).toEqual({
       HOME: "/Users/test",
       CODEX_HOME: "/Users/test/.codex",
       LANG: "zh_CN.UTF-8",
+    });
+    expect(observedOptions[0]?.capabilities).toEqual({
+      experimentalApi: false,
+      requestAttestation: false,
     });
     expect(closed).toBeTrue();
   });
@@ -215,21 +233,29 @@ describe("Codex native stdio transport", () => {
   });
 
   test("attach 持有独立 stdio 进程，初始化收口不确定时失败关闭", async () => {
+    const observedOptions: CodexAppServerClientOptions[] = [];
     const attached = await attachCodexNativeStdio(probeOptions(), {
       commandRunner: async () => ({ exitCode: 0, stdout: "codex-cli 0.145.0\n", stderr: "" }),
       commandPinAsserter: async () => undefined,
-      clientStart: async () => ({
-        initializeResult: initializeResult("livis-relay-native-stdio-attach"),
-        running: true,
-        exited: new Promise<number>(() => undefined),
-        request: async <T = unknown>() => ({} as T),
-        close: async () => undefined,
-      }),
+      clientStart: async (options) => {
+        observedOptions.push(options);
+        return {
+          initializeResult: initializeResult("livis-relay-native-stdio-attach"),
+          running: true,
+          exited: new Promise<number>(() => undefined),
+          request: async <T = unknown>() => ({} as T),
+          close: async () => undefined,
+        };
+      },
     });
     expect(attached).toMatchObject({
       transport: "app-server-stdio",
       ownsAppServerProcess: true,
       touchedDesktopDaemon: false,
+    });
+    expect(observedOptions[0]?.capabilities).toEqual({
+      experimentalApi: true,
+      requestAttestation: false,
     });
 
     await expect(probeCodexNativeStdio(probeOptions(), {

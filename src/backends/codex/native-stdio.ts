@@ -5,6 +5,7 @@ import type {
   CodexAppServerNotification,
 } from "./app-server-client.ts";
 import {
+  CODEX_DISABLED_FEATURES,
   CodexAppServerClient,
   CodexAppServerProcessOwnershipUnconfirmedError,
   CodexAppServerStartCloseUnconfirmedError,
@@ -15,6 +16,7 @@ import {
 } from "./codex-execution-backend.ts";
 import {
   assertPinnedCodexCommand,
+  CODEX_NATIVE_PERMISSION_PROFILE,
   type PinnedCodexCommand,
 } from "./runtime-layout.ts";
 import type { CodexNativeExecutionClient } from "./native-execution-lifecycle.ts";
@@ -272,7 +274,17 @@ export async function buildCodexNativeStdioEnvironment(
 
 export function buildCodexNativeStdioCommand(command: string): readonly string[] {
   if (!isAbsolute(command)) throw new Error("Codex native stdio command 必须是绝对路径");
-  return [command, "app-server", "--stdio"];
+  return [
+    command,
+    "app-server",
+    "--stdio",
+    "-c",
+    `permissions.${CODEX_NATIVE_PERMISSION_PROFILE}={` +
+      `description="LiViS native stdio workspace-only",` +
+      `filesystem={":root"="deny",":minimal"="read",":workspace_roots"="write"},` +
+      `network={enabled=false}}`,
+    ...CODEX_DISABLED_FEATURES.flatMap((feature) => ["--disable", feature]),
+  ];
 }
 
 function inspectInitialize(
@@ -366,7 +378,12 @@ function clientOptions(
         : "LiViS Relay Native Codex Stdio Probe",
       version: options.clientVersion,
     },
-    capabilities: { experimentalApi: false, requestAttestation: false },
+    capabilities: {
+      // runtimeWorkspaceRoots、approvalsReviewer 与逐 thread policy 回读属于
+      // experimental app-server surface；只有会创建 thread 的 attach 声明它。
+      experimentalApi: clientName === "livis-relay-native-stdio-attach",
+      requestAttestation: false,
+    },
     ...(options.onNotification === undefined
       ? {}
       : { onNotification: options.onNotification }),

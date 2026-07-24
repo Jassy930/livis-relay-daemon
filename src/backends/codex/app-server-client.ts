@@ -7,6 +7,7 @@ export const CODEX_DISABLED_FEATURES = [
   "image_generation",
   "goals",
   "memories",
+  "chronicle",
   "skill_mcp_dependency_install",
   "multi_agent",
   "multi_agent_v2",

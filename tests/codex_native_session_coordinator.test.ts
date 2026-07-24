@@ -73,7 +73,7 @@ class FakeNativeCoordinatorClient implements CodexNativeExecutionClient {
   async request<T = unknown>(method: string, params?: unknown): Promise<T> {
     this.requests.push({ method, params });
     if (method === "permissionProfile/list") {
-      return { data: [{ id: "livis-remote", allowed: true }], nextCursor: null } as T;
+      return { data: [{ id: "livis-native-stdio", allowed: true }], nextCursor: null } as T;
     }
     if (method === "experimentalFeature/list") {
       return { data: featureSnapshot(), nextCursor: null } as T;
@@ -86,7 +86,7 @@ class FakeNativeCoordinatorClient implements CodexNativeExecutionClient {
         instructionSources: [],
         approvalPolicy: "never",
         approvalsReviewer: "user",
-        activePermissionProfile: { id: "livis-remote", extends: null },
+        activePermissionProfile: { id: "livis-native-stdio", extends: null },
         sandbox: {
           type: "workspaceWrite",
           writableRoots: [],

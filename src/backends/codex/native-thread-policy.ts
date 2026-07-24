@@ -7,11 +7,11 @@ import {
 import {
   inspectCodexThreadPolicyResponse,
   inspectCodexThreadTail,
-  validateDisabledCodexFeatures,
+  validateNativeCodexFeatures,
   validatePermissionProfiles,
 } from "./codex-execution-backend.ts";
 import type { CodexNativeExecutionClient } from "./native-execution-lifecycle.ts";
-import { CODEX_REMOTE_PERMISSION_PROFILE } from "./runtime-layout.ts";
+import { CODEX_NATIVE_PERMISSION_PROFILE } from "./runtime-layout.ts";
 import { sha256 } from "../../util.ts";
 
 export interface CodexNativeThreadCheckpoint {
@@ -34,7 +34,7 @@ export interface CodexNativeThreadPolicyOptions {
   workspace: string;
   cliVersion: string;
   requestedModel: string | null;
-  expectedModelProvider: string;
+  expectedModelProvider: string | null;
   requestTimeoutMs: number;
   mode: CodexNativeThreadMode;
 }
@@ -115,7 +115,7 @@ export async function prepareCodexNativeThread(
 ): Promise<CodexNativeThreadPolicyReceipt> {
   if (!isAbsolute(options.workspace)) throw new Error("workspace 必须是绝对路径");
   if (options.cliVersion.trim() === "") throw new Error("cliVersion 不能为空");
-  if (options.expectedModelProvider.trim() === "") {
+  if (options.expectedModelProvider !== null && options.expectedModelProvider.trim() === "") {
     throw new Error("expectedModelProvider 不能为空");
   }
   positiveInteger(options.requestTimeoutMs, "requestTimeoutMs");
@@ -139,8 +139,8 @@ export async function prepareCodexNativeThread(
   );
   let featureSnapshotSha256: string;
   try {
-    validatePermissionProfiles(permissionProfiles);
-    featureSnapshotSha256 = validateDisabledCodexFeatures(featureList, options.cliVersion);
+    validatePermissionProfiles(permissionProfiles, CODEX_NATIVE_PERMISSION_PROFILE);
+    featureSnapshotSha256 = validateNativeCodexFeatures(featureList);
   } catch {
     throw new CodexNativeThreadPolicyError(
       "native_thread_preflight_incompatible",
@@ -154,7 +154,7 @@ export async function prepareCodexNativeThread(
     runtimeWorkspaceRoots: [options.workspace],
     approvalPolicy: "never",
     approvalsReviewer: "user",
-    permissions: CODEX_REMOTE_PERMISSION_PROFILE,
+    permissions: CODEX_NATIVE_PERMISSION_PROFILE,
     ...(options.requestedModel === null ? {} : { model: options.requestedModel }),
   } as const;
   let threadResponse: unknown;
@@ -191,7 +191,8 @@ export async function prepareCodexNativeThread(
       workspace: options.workspace,
       expectedThreadId,
       expectedModelProvider: options.expectedModelProvider,
-      permissionProfile: CODEX_REMOTE_PERMISSION_PROFILE,
+      permissionProfile: CODEX_NATIVE_PERMISSION_PROFILE,
+      instructionSourcePolicy: "local-opaque",
     });
     if (
       options.requestedModel !== null && binding.effectiveModel !== options.requestedModel
@@ -264,13 +265,14 @@ export async function prepareCodexNativeThread(
     modelProvider: binding.modelProvider,
     featureSnapshotSha256,
     policyBindingSha256: sha256(JSON.stringify([
-      "livis-codex-native-thread-policy-v1",
+      "livis-codex-native-thread-policy-v2",
       options.cliVersion,
       options.workspace,
-      CODEX_REMOTE_PERMISSION_PROFILE,
+      CODEX_NATIVE_PERMISSION_PROFILE,
       featureSnapshotSha256,
       binding.effectiveModel,
       binding.modelProvider,
+      binding.instructionSourcesSha256,
     ])),
     memoryMode: "disabled",
     checkpoint,

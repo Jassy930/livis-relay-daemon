@@ -12,6 +12,7 @@ import {
 import type { CodexProviderConfig } from "../../types.ts";
 
 export const CODEX_REMOTE_PERMISSION_PROFILE = "livis-remote";
+export const CODEX_NATIVE_PERMISSION_PROFILE = "livis-native-stdio";
 export const CODEX_CUSTOM_RESPONSES_PROVIDER_ID = "livis-custom-responses";
 
 export function expectedCodexModelProvider(provider: CodexProviderConfig): string {

@@ -83,7 +83,7 @@ class FakeAttachedStdioClient {
       throw new Error("fake preflight unavailable");
     }
     if (method === "permissionProfile/list") {
-      return { data: [{ id: "livis-remote", allowed: true }], nextCursor: null } as T;
+      return { data: [{ id: "livis-native-stdio", allowed: true }], nextCursor: null } as T;
     }
     if (method === "experimentalFeature/list") {
       return { data: featureSnapshot(), nextCursor: null } as T;
@@ -96,7 +96,7 @@ class FakeAttachedStdioClient {
         instructionSources: [],
         approvalPolicy: "never",
         approvalsReviewer: "user",
-        activePermissionProfile: { id: "livis-remote", extends: null },
+        activePermissionProfile: { id: "livis-native-stdio", extends: null },
         sandbox: {
           type: "workspaceWrite",
           writableRoots: [],
@@ -382,6 +382,10 @@ describe("Codex native stdio + coordinator 受控组合 harness", () => {
       HOME: "/Users/test",
       CODEX_HOME: "/Users/test/.codex",
       LANG: "zh_CN.UTF-8",
+    });
+    expect(observedClientOptions[0]?.capabilities).toEqual({
+      experimentalApi: true,
+      requestAttestation: false,
     });
     expect(JSON.stringify(observedClientOptions[0]?.env)).not.toContain("API_KEY");
     expect(JSON.stringify(observedClientOptions[0]?.env)).not.toContain("OAUTH_TOKEN");
