@@ -145,6 +145,12 @@ adapter 还必须提供断连事件通道；在这些字段和映射测试落地
 
 目标是不复制凭据地复用用户已登录的 Codex，同时保留现有 app-server 执行与安全门禁。
 
+首个只读切片已实现：[`codex probe-native-daemon`](./CODEX-NATIVE-AUTH.md) 固定 CLI、核验原生
+daemon/app-server 版本与私有 Unix socket，并通过官方 proxy 只执行 initialize/account-read。
+它不会启动或重启原生 daemon，也不会创建 thread；报告始终保持 `productionReady=false`。
+2026-07-24 本机观察到 CLI `0.145.0` 与运行中 app-server `0.144.1` 不一致，因此当前状态为
+`incompatible`，不能进入生产接线。
+
 已知冲突：当前 Codex 隔离依赖重定向 `HOME`、`TMPDIR` 和 `CODEX_HOME`，而原生当前认证可能与
 用户真实 `HOME`/`CODEX_HOME` 强绑定。不能为了读到认证就直接让 daemon 子进程继承真实 HOME，
 因为这会同时暴露可写配置、session 和 rollout。阶段 B 必须找到受支持的认证与可写状态分离或
@@ -152,7 +158,7 @@ attach 入口；若上游没有该边界，就需要重新设计 workspace/env �
 
 工作包：
 
-1. 用固定 Codex 版本验证是否存在受支持的“认证由原生客户端持有、workspace/config/thread 仍可隔离”的 app-server 或本地服务入口；记录 Desktop、CLI 与 app-server 并发行为。
+1. 继续验证官方 app-server daemon/proxy 能否在认证由原生 daemon 持有时，为 LiViS thread 提供不依赖用户默认 config 的 workspace、权限、工具和网络隔离；只读 transport/auth 探针已落地，Desktop/CLI 并发仍未验证。
 2. 给 Codex adapter 增加显式认证模式，保留现有 `private-api-key` 兼容路径；新模式只能请求原生 runtime 执行，不能读取、复制、链接或导出默认 `~/.codex`、Keychain 或 `auth.json`，也不能用继承整个真实 HOME 代替受支持的认证复用接口。
 3. readiness 只返回标准状态和稳定错误分类；账号、token、scope、cookie、原始 provider 错误不进入 daemon 状态、SQLite 或日志。
 4. 覆盖未认证、已认证、运行中注销/切换、并发 Desktop/CLI、超时、取消、进程退出、resume、daemon 重启和认证状态漂移。

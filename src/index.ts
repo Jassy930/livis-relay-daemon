@@ -13,11 +13,16 @@ import { RelayDaemon, DAEMON_VERSION } from "./daemon.ts";
 import { runCodexCommand } from "./backends/codex/codex-execution-backend.ts";
 import { runCodexAppServerLocalSmoke } from "./backends/codex/local-smoke.ts";
 import {
+  CodexNativeDaemonProbeError,
+  probeCodexNativeDaemon,
+} from "./backends/codex/native-daemon.ts";
+import {
   assertPinnedCodexCommand,
   assertCodexRuntimeLayout,
   buildCodexEnvironment,
   ensureCodexRuntimeLayout,
   pinCodexCommand,
+  pinCodexCommandForStateDir,
 } from "./backends/codex/runtime-layout.ts";
 import { validateCapabilityManifest } from "./capabilities.ts";
 import { IdaasClient } from "./auth/idaas.ts";
@@ -722,6 +727,59 @@ async function commandCodexSmokeAppServer(args: string[]): Promise<void> {
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 }
 
+async function commandCodexProbeNativeDaemon(args: string[]): Promise<void> {
+  const socket = optionValue(args, "--socket");
+  if (!socket) {
+    throw new Error(
+      "用法：codex probe-native-daemon --socket /绝对路径/app-server-control.sock [--config PATH]",
+    );
+  }
+  const loaded = await loadRelayConfig(optionValue(args, "--config"));
+  const canonicalStateDir = await realpath(loaded.config.stateDir);
+  let report: unknown;
+  let ok = false;
+  try {
+    const command = await pinCodexCommandForStateDir(
+      canonicalStateDir,
+      loaded.config.codex.command,
+    );
+    const nativeReport = await probeCodexNativeDaemon({
+      command,
+      socketPath: expandHome(socket),
+      stateDir: canonicalStateDir,
+      cwd: PROJECT_ROOT,
+      minimumVersion: CODEX_MINIMUM_VERSION,
+      maximumExclusiveVersion: CODEX_MAXIMUM_EXCLUSIVE_VERSION,
+      requestTimeoutMs: loaded.config.codex.requestTimeoutMs,
+      shutdownTimeoutMs: loaded.config.codex.shutdownTimeoutMs,
+      clientVersion: DAEMON_VERSION,
+    });
+    report = nativeReport;
+    ok = nativeReport.ok;
+  } catch (error) {
+    const reasonCode = error instanceof CodexNativeDaemonProbeError
+      ? error.code
+      : "native_probe_preflight_failed";
+    const readiness = reasonCode === "native_daemon_not_running" ||
+        reasonCode === "native_proxy_unavailable"
+      ? "offline"
+      : "incompatible";
+    report = {
+      ok: false,
+      probeCompleted: false,
+      readiness,
+      transport: "app-server-daemon-proxy",
+      reasonCode,
+      detail: errorMessage(error),
+      startedNativeDaemon: false,
+      sentModelTurn: false,
+      productionReady: false,
+    };
+  }
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  if (!ok) process.exitCode = 1;
+}
+
 function printHelp(): void {
   process.stdout.write(`livis-relay-daemon ${DAEMON_VERSION}\n\n`);
   process.stdout.write("命令：\n");
@@ -741,6 +799,7 @@ function printHelp(): void {
   process.stdout.write("  connector-token [--config PATH]\n");
   process.stdout.write("  session release <sessionKey> [--config PATH]\n");
   process.stdout.write("  codex smoke-app-server --command PATH [--config PATH] [--state-dir PATH | --create-state-dir PATH] [--verify-read-isolation]\n");
+  process.stdout.write("  codex probe-native-daemon --socket PATH [--config PATH]\n");
 }
 
 async function main(): Promise<void> {
@@ -787,8 +846,9 @@ async function main(): Promise<void> {
       await commandReleaseSession(args);
       break;
     case "codex":
-      if (subcommand !== "smoke-app-server") throw new Error("只支持 codex smoke-app-server");
-      await commandCodexSmokeAppServer(args);
+      if (subcommand === "smoke-app-server") await commandCodexSmokeAppServer(args);
+      else if (subcommand === "probe-native-daemon") await commandCodexProbeNativeDaemon(args);
+      else throw new Error("只支持 codex smoke-app-server / codex probe-native-daemon");
       break;
     case "version":
     case "--version":

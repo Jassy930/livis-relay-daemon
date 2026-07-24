@@ -451,13 +451,24 @@ export async function pinCodexCommand(
   layout: CodexRuntimeLayout,
   command: string,
 ): Promise<PinnedCodexCommand> {
+  return pinCodexCommandForStateDir(layout.stateDir, command);
+}
+
+/**
+ * 为不创建 Codex runtime layout 的只读管理探针固定 CLI。调用方必须先把
+ * stateDir canonicalize；该入口只允许解析并固定 stateDir 外的可信可执行文件。
+ */
+export async function pinCodexCommandForStateDir(
+  stateDir: string,
+  command: string,
+): Promise<PinnedCodexCommand> {
   if (!isAbsolute(command)) throw new Error("Codex command 必须是绝对路径");
   const configured = resolve(command);
-  if (isWithin(layout.stateDir, configured)) {
+  if (isWithin(stateDir, configured)) {
     throw new Error("Codex command 不能位于 daemon stateDir 内");
   }
   const canonical = await realpath(configured);
-  if (isWithin(layout.stateDir, canonical)) {
+  if (isWithin(stateDir, canonical)) {
     throw new Error("Codex command realpath 不能位于 daemon stateDir 内");
   }
   return capturePinnedCodexCommand(canonical);

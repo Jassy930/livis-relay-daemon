@@ -103,9 +103,9 @@
       "id": "codex_native_auth_reuse",
       "direction": "local",
       "status": "unsupported",
-      "evidenceRefs": ["docs/LOCAL-BACKENDS.md"],
-      "testRefs": ["tests/auth_boundary.test.ts", "tests/local_backend_contract.test.ts"],
-      "notes": "目标契约已定义，但尚未证明可在不共享 Codex config/thread/rollout 的前提下复用用户当前认证。"
+      "evidenceRefs": ["docs/LOCAL-BACKENDS.md", "docs/CODEX-NATIVE-AUTH.md"],
+      "testRefs": ["tests/auth_boundary.test.ts", "tests/local_backend_contract.test.ts", "tests/codex_native_daemon.test.ts"],
+      "notes": "已实现不启动 daemon、不创建 thread 的只读 native daemon/proxy 与认证状态探针；生产执行仍未证明 server config、thread/session 和并发隔离，因此保持 unsupported。"
     },
     {
       "id": "claude_execution",
@@ -172,7 +172,8 @@
       "capabilities",
       "status",
       "doctor",
-      "version"
+      "version",
+      "codex probe-native-daemon"
     ],
     "localStateMutation": [
       "init",
