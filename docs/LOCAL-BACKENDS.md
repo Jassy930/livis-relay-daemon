@@ -182,11 +182,26 @@ quarantine。它仍未被生产入口导入，且不会使 capability 升级。
 原生提供不影响 Desktop 的逐客户端/逐 thread 隔离。若上游没有这一能力，原生认证复用保持
 `unsupported`，不能削弱门禁来换取接线。
 
+第四个纯离线切片新增
+[`native auth session`](../src/backends/codex/native-auth-session.ts)：每次 fake proxy attach 分配递增
+client epoch，只通过 `account/read(refreshToken=false)` 建立脱敏强主体绑定，并在 `turn/start` 前
+重新回读。未认证稳定映射为 `backend_auth_unavailable`，主体或认证类型漂移要求 quarantine，畸形
+响应和读取失败保持 incompatible；以上情况都不会发送 `turn/start`。弱 `type-only` 身份不能证明
+同类型账号未被替换，因此禁止绑定持久 thread。
+
+执行 lifecycle 现在同时检查 epoch：旧 proxy 的迟到 notification、exit 和 timeout 不会结算或断开
+新 proxy，新 epoch 也不复用旧 active attempt、accepted gate 或账号 receipt。对应
+[`账号/epoch 测试`](../tests/codex_native_auth_session.test.ts) 与
+[`生命周期测试`](../tests/codex_native_execution_lifecycle.test.ts) 仍全部使用 fake 端点。尚未完成的
+边界是持久 coordinator：它必须先隔离旧 active attempt，再允许新 epoch 恢复 thread；当前原型
+本身不会裁决恢复时机，也没有进入生产入口。
+
 工作包：
 
-1. fake proxy 的基础 turn 生命周期、thread 安全回读和 fresh/resume checkpoint 已经闭合；
-   下一步继续覆盖认证状态漂移和旧事件 fencing。等 Desktop/原生 daemon 自然进入审核窗口，
-   或操作者提供另一个不影响 Desktop 的兼容端点后，再验证官方 daemon/proxy 能否在认证由原生
+1. fake proxy 的基础 turn 生命周期、thread 安全回读、fresh/resume checkpoint、派发前认证漂移
+   和旧 client epoch fencing 已经闭合；下一步实现持久 session coordinator，要求旧 active attempt
+   先结算或进入 ambiguous quarantine，才允许新 epoch 恢复 thread。等 Desktop/原生 daemon 自然
+   进入审核窗口，或操作者提供另一个不影响 Desktop 的兼容端点后，再验证官方 daemon/proxy 能否在认证由原生
    daemon 持有时，通过同一门禁提供不依赖用户默认 config 的 workspace、权限、工具和网络隔离。
    只读 transport/auth 探针已落地，真实 Desktop/CLI 并发仍未验证。
 2. 给 Codex adapter 增加显式认证模式，保留现有 `private-api-key` 兼容路径；新模式只能请求原生 runtime 执行，不能读取、复制、链接或导出默认 `~/.codex`、Keychain 或 `auth.json`，也不能用继承整个真实 HOME 代替受支持的认证复用接口。

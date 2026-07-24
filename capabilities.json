@@ -104,8 +104,8 @@
       "direction": "local",
       "status": "unsupported",
       "evidenceRefs": ["docs/LOCAL-BACKENDS.md", "docs/CODEX-NATIVE-AUTH.md"],
-      "testRefs": ["tests/auth_boundary.test.ts", "tests/local_backend_contract.test.ts", "tests/codex_native_daemon.test.ts", "tests/codex_native_execution_lifecycle.test.ts", "tests/codex_native_thread_policy.test.ts"],
-      "notes": "已实现不启动 daemon、不创建 thread 的只读 native 探针，以及仅对 fake client 验证的执行 lifecycle 与 thread policy/checkpoint；这些原型未接入 serve，真实 server config、认证、并发和 Desktop 不干扰仍未闭合，因此保持 unsupported。"
+      "testRefs": ["tests/auth_boundary.test.ts", "tests/local_backend_contract.test.ts", "tests/codex_native_daemon.test.ts", "tests/codex_native_auth_session.test.ts", "tests/codex_native_execution_lifecycle.test.ts", "tests/codex_native_thread_policy.test.ts"],
+      "notes": "已实现不启动 daemon、不创建 thread 的只读 native 探针，以及仅对 fake client 验证的强主体账号绑定、client epoch fencing、执行 lifecycle 与 thread policy/checkpoint；这些原型未接入 serve，持久 session coordinator、真实 server config、并发和 Desktop 不干扰仍未闭合，因此保持 unsupported。"
     },
     {
       "id": "claude_execution",

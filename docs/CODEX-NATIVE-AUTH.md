@@ -124,7 +124,36 @@ proxy initialize 尝试在 5 秒内未得到响应，没有创建 thread、调�
 必须已经提供不影响 Desktop 的逐客户端/逐 thread 隔离，或由上游增加该能力；否则这里的离线
 原型不能接线，`codex_native_auth_reuse` 必须保持 `unsupported`。
 
-## 9. 下一实现门禁
+## 9. 离线账号绑定与 client epoch fencing
+
+第四个切片新增
+[`CodexNativeClientEpochFence`](../src/backends/codex/native-auth-session.ts)，并把它接入仍然只供
+fake client 使用的执行 lifecycle。它不连接 socket、不创建 thread，也没有进入 `serve`。
+
+每次 proxy attach 都分配严格递增的 client epoch，并先执行一次
+`account/read(refreshToken=false)`。内存 receipt 只保留 `accountType`、主体哈希、identity strength
+和 `requiresOpenaiAuth`；邮箱、账号明文、token、scope、cookie 和 provider 原始错误不会进入 receipt、
+状态或 quarantine reason。执行 lifecycle 在每次 `turn/start` 前再次做同样的只读回读：
+
+- 当前未认证时使用稳定分类 `backend_auth_unavailable`，要求隔离已有 session，且不发送
+  `turn/start`；
+- account type、强主体哈希或认证要求漂移时使用 `native_account_binding_drift`，不允许新账号自动
+  继承旧 thread；
+- 畸形响应或读取失败使用 `native_account_response_incompatible` 并失败关闭，不透传原始错误；
+- 只有 `identityStrength=subject` 的账号可以建立执行绑定。`type-only` 无法证明同类型账号没有被
+  替换，因此保持 incompatible，不能用弱身份恢复持久 thread。
+
+notification、proxy exit 和 turn timeout 都绑定产生它们的 epoch。新 attach 会立即 fence 旧 epoch；
+旧 proxy 的迟到 terminal、exit 或 timer 不会结算、断开或 interrupt 新 proxy。每个新 epoch 必须重新
+建立账号 receipt 和新的 lifecycle 实例，不复用旧 active attempt、accepted gate 或认证绑定。
+
+[`codex_native_auth_session.test.ts`](../tests/codex_native_auth_session.test.ts) 和
+[`codex_native_execution_lifecycle.test.ts`](../tests/codex_native_execution_lifecycle.test.ts) 完全使用
+fake client/proxy 覆盖上述边界。epoch fence 本身不决定何时允许恢复：未来持久 session coordinator
+仍必须先证明旧 active attempt 已结算或已按 ambiguous execution 隔离，再允许新 epoch 恢复 thread。
+这项持久化组合尚未实现，因此 capability 继续保持 `unsupported`。
+
+## 10. 下一实现门禁
 
 在生产接线前还必须独立闭合：
 
@@ -132,7 +161,7 @@ proxy initialize 尝试在 5 秒内未得到响应，没有创建 thread、调�
    并得到 `ready` 探针；relay 不执行任何对齐、升级或重启动作；
 2. 在不修改 Desktop 配置或生命周期的前提下，让兼容端点通过已离线实现的 permission、feature、
    instruction、sandbox、memory 和 checkpoint 门禁；若做不到则记录为上游能力阻塞；
-3. 把已离线验证的 lifecycle/thread policy 与安全 attach、持久 session 和 daemon handler 组合，
-   继续用 fake 端点覆盖运行中注销/切换、被动观察到的 daemon 重启和旧事件 fencing；
+3. 把已离线验证的账号绑定、epoch fence、lifecycle/thread policy 与安全 attach、持久 session 和
+   daemon handler 组合，证明旧 active attempt 完成隔离后才允许新 epoch 恢复 thread；
 4. 真实 Desktop/CLI 并发只能在另行授权的非生产 canary 中验证；完成不复制凭据且不影响 Desktop
    的 canary 后，才允许修改机器可读 capability 状态。

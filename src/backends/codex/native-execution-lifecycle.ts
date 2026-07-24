@@ -4,6 +4,12 @@ import {
   CodexAppServerTimeoutError,
   type CodexAppServerNotification,
 } from "./app-server-client.ts";
+import {
+  CodexNativeAuthSessionError,
+  type CodexNativeAuthSessionErrorCode,
+  type CodexNativeClientEpochFence,
+  type CodexNativeClientEpochReceipt,
+} from "./native-auth-session.ts";
 import type {
   ExecutionBackendHandlers,
   ExecutionJobEvent,
@@ -34,6 +40,9 @@ export interface CodexNativeExecutionLifecycleOptions {
 export interface CodexNativeExecutionLifecycleDependencies {
   client: CodexNativeExecutionClient;
   handlers: ExecutionBackendHandlers;
+  clientEpochFence: CodexNativeClientEpochFence;
+  clientEpochReceipt: CodexNativeClientEpochReceipt;
+  onSessionQuarantine(code: CodexNativeAuthSessionErrorCode): Promise<void>;
 }
 
 interface Deferred<T> {
@@ -159,6 +168,11 @@ export class CodexNativeExecutionLifecycle {
 
   private readonly client: CodexNativeExecutionClient;
   private readonly handlers: ExecutionBackendHandlers;
+  private readonly clientEpochFence: CodexNativeClientEpochFence;
+  private readonly clientEpochReceipt: CodexNativeClientEpochReceipt;
+  private readonly onSessionQuarantine: (
+    code: CodexNativeAuthSessionErrorCode,
+  ) => Promise<void>;
   private readonly threadId: string;
   private readonly workspace: string;
   private readonly requestTimeoutMs: number;
@@ -169,6 +183,7 @@ export class CodexNativeExecutionLifecycle {
   private notificationTail: Promise<void> = Promise.resolve();
   private disconnectPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
+  private lastAuthFailureCode: CodexNativeAuthSessionErrorCode | null = null;
 
   constructor(
     options: CodexNativeExecutionLifecycleOptions,
@@ -188,15 +203,22 @@ export class CodexNativeExecutionLifecycle {
     this.maxOutputChars = options.maxOutputChars;
     this.client = dependencies.client;
     this.handlers = dependencies.handlers;
+    this.clientEpochFence = dependencies.clientEpochFence;
+    this.clientEpochReceipt = dependencies.clientEpochReceipt;
+    this.onSessionQuarantine = dependencies.onSessionQuarantine;
+    if (!this.clientEpochFence.isCurrent(this.clientEpochReceipt, this.client)) {
+      throw new Error("Codex native execution lifecycle 必须绑定当前 client epoch");
+    }
 
     void this.client.exited.then(
-      () => this.disconnect("Codex native proxy 意外退出"),
-      () => this.disconnect("Codex native proxy 退出状态不可读"),
+      () => this.disconnectIfCurrent("Codex native proxy 意外退出"),
+      () => this.disconnectIfCurrent("Codex native proxy 退出状态不可读"),
     ).catch(() => undefined);
   }
 
   get ready(): boolean {
-    return this.state === "running" && this.client.running;
+    return this.state === "running" && this.client.running &&
+      this.clientEpochFence.isCurrent(this.clientEpochReceipt, this.client);
   }
 
   status(): Record<string, unknown> {
@@ -205,15 +227,24 @@ export class CodexNativeExecutionLifecycle {
       state: this.state,
       ready: this.ready,
       active: this.activeAttempt !== null,
+      clientEpoch: this.clientEpochReceipt.clientEpoch,
+      authFailureCode: this.lastAuthFailureCode,
       productionReady: false,
     };
   }
 
-  handleNotification(notification: CodexAppServerNotification): void {
+  handleNotification(
+    notification: CodexAppServerNotification,
+    clientEpoch = this.clientEpochReceipt.clientEpoch,
+  ): void {
+    if (
+      clientEpoch !== this.clientEpochReceipt.clientEpoch ||
+      !this.clientEpochFence.isCurrent(this.clientEpochReceipt, this.client)
+    ) return;
     if (!isRelevantNotification(notification)) return;
     this.notificationTail = this.notificationTail
-      .then(() => this.processNotification(notification))
-      .catch((error: unknown) => this.disconnect(
+      .then(() => this.processNotification(notification, clientEpoch))
+      .catch((error: unknown) => this.disconnectIfCurrent(
         error instanceof Error
           ? "Codex native proxy 返回未经审核的执行事件"
           : "Codex native proxy 执行事件处理失败",
@@ -228,6 +259,18 @@ export class CodexNativeExecutionLifecycle {
     ) {
       return "not_sent";
     }
+
+    try {
+      await this.clientEpochFence.revalidate(
+        this.clientEpochReceipt,
+        this.client,
+        this.requestTimeoutMs,
+      );
+    } catch (error) {
+      await this.failAuthBeforeSubmission(error);
+      return "not_sent";
+    }
+    if (!this.ready || this.activeAttempt !== null) return "not_sent";
 
     const attempt: NativeAttempt = {
       job,
@@ -257,15 +300,21 @@ export class CodexNativeExecutionLifecycle {
         attempt.accepted.resolve(false);
         if (this.activeAttempt === attempt) this.activeAttempt = null;
         if (error instanceof CodexAppServerRequestTransportError) {
-          await this.disconnect("Codex native proxy 在 turn/start 写入前断开");
+          await this.disconnectIfCurrent("Codex native proxy 在 turn/start 写入前断开");
         }
         return "not_sent";
       }
       attempt.accepted.resolve(false);
-      await this.disconnect("Codex native turn/start 提交状态不确定");
+      await this.disconnectIfCurrent("Codex native turn/start 提交状态不确定");
       return "submitted";
     }
 
+    if (!this.clientEpochFence.isCurrent(this.clientEpochReceipt, this.client)) {
+      attempt.accepted.resolve(false);
+      this.finishAttempt(attempt);
+      await this.onSessionQuarantine("native_client_epoch_superseded");
+      return "submitted";
+    }
     try {
       const envelope = isRecord(response) ? response : null;
       const turn = envelope && isRecord(envelope.turn) ? envelope.turn : null;
@@ -274,14 +323,19 @@ export class CodexNativeExecutionLifecycle {
         void this.handleTurnTimeout(attempt).catch(() => undefined);
       }, this.turnTimeoutMs);
       await this.handlers.onAccepted({ ...this.jobEvent(attempt), turnId: attempt.turnId });
-      attempt.accepted.resolve(true);
-      if (attempt.cancelRequested) await this.interrupt(attempt);
-      return "submitted";
     } catch {
       attempt.accepted.resolve(false);
-      await this.disconnect("Codex native turn/start 响应或 accepted 持久化失败");
+      await this.disconnectIfCurrent("Codex native turn/start 响应或 accepted 持久化失败");
       return "submitted";
     }
+    attempt.accepted.resolve(true);
+    if (!this.clientEpochFence.isCurrent(this.clientEpochReceipt, this.client)) {
+      this.finishAttempt(attempt);
+      await this.onSessionQuarantine("native_client_epoch_superseded");
+      return "submitted";
+    }
+    if (attempt.cancelRequested) await this.interrupt(attempt);
+    return "submitted";
   }
 
   async cancel(job: StoredJob): Promise<ExecutionSubmission> {
@@ -314,19 +368,25 @@ export class CodexNativeExecutionLifecycle {
     }
     if (this.state === "stopped") return;
     this.state = "stopping";
+    const wasCurrent = this.clientEpochFence.invalidate(
+      this.clientEpochReceipt,
+      this.client,
+    );
     const attempt = this.activeAttempt;
     let handlerError: unknown;
     if (attempt && !attempt.terminal) {
       this.clearDeadline(attempt);
       attempt.accepted.resolve(false);
-      try {
-        await this.handlers.onDisconnected({
-          kind: "codex",
-          executionId: this.executionId,
-          reason: "Codex native execution lifecycle 正在停止",
-        });
-      } catch (error) {
-        handlerError = error;
+      if (wasCurrent) {
+        try {
+          await this.handlers.onDisconnected({
+            kind: "codex",
+            executionId: this.executionId,
+            reason: "Codex native execution lifecycle 正在停止",
+          });
+        } catch (error) {
+          handlerError = error;
+        }
       }
     }
     let closeError: unknown;
@@ -345,12 +405,22 @@ export class CodexNativeExecutionLifecycle {
     }
   }
 
-  private async processNotification(notification: CodexAppServerNotification): Promise<void> {
+  private async processNotification(
+    notification: CodexAppServerNotification,
+    clientEpoch: number,
+  ): Promise<void> {
+    if (
+      clientEpoch !== this.clientEpochReceipt.clientEpoch ||
+      !this.clientEpochFence.isCurrent(this.clientEpochReceipt, this.client)
+    ) return;
     const attempt = this.activeAttempt;
     if (!attempt || attempt.terminal || this.state !== "running") return;
     if (notificationThreadId(notification) !== this.threadId) return;
     if (!await attempt.accepted.promise) return;
-    if (this.activeAttempt !== attempt || attempt.terminal || this.state !== "running") return;
+    if (
+      this.activeAttempt !== attempt || attempt.terminal || this.state !== "running" ||
+      !this.clientEpochFence.isCurrent(this.clientEpochReceipt, this.client)
+    ) return;
     if (notificationTurnId(notification) !== attempt.turnId) return;
 
     if (notification.method === "item/completed") {
@@ -405,7 +475,7 @@ export class CodexNativeExecutionLifecycle {
           : {}),
       });
       if (failure.credentialRejected) {
-        await this.disconnect("Codex native provider 拒绝当前认证状态");
+        await this.disconnectIfCurrent("Codex native provider 拒绝当前认证状态");
       }
       return;
     }
@@ -467,23 +537,78 @@ export class CodexNativeExecutionLifecycle {
   private interrupt(attempt: NativeAttempt): Promise<void> {
     if (attempt.interruptPromise) return attempt.interruptPromise;
     if (attempt.turnId === null) return Promise.resolve();
+    if (!this.clientEpochFence.isCurrent(this.clientEpochReceipt, this.client)) {
+      return Promise.resolve();
+    }
     attempt.interruptPromise = this.client.request("turn/interrupt", {
       threadId: this.threadId,
       turnId: attempt.turnId,
     }, this.requestTimeoutMs).then(() => undefined).catch(async () => {
-      await this.disconnect("Codex native turn/interrupt 结果不确定");
+      await this.disconnectIfCurrent("Codex native turn/interrupt 结果不确定");
     });
     return attempt.interruptPromise;
   }
 
   private async handleTurnTimeout(attempt: NativeAttempt): Promise<void> {
-    if (this.activeAttempt !== attempt || attempt.terminal || this.state !== "running") return;
+    if (
+      this.activeAttempt !== attempt || attempt.terminal || this.state !== "running" ||
+      !this.clientEpochFence.isCurrent(this.clientEpochReceipt, this.client)
+    ) return;
     attempt.timeoutExpired = true;
     attempt.cancelRequested = true;
     await this.interrupt(attempt);
-    if (this.state === "running") {
-      await this.disconnect("Codex native turn 超时，执行结果不确定");
+    if (this.state === "running" && this.ready) {
+      await this.disconnectIfCurrent("Codex native turn 超时，执行结果不确定");
     }
+  }
+
+  private async failAuthBeforeSubmission(error: unknown): Promise<void> {
+    const authError = error instanceof CodexNativeAuthSessionError
+      ? error
+      : new CodexNativeAuthSessionError(
+          "native_account_response_incompatible",
+          "incompatible",
+          "quarantine_required",
+          "Codex 原生账号派发前回读失败",
+        );
+    this.lastAuthFailureCode = authError.code;
+    let quarantineError: unknown;
+    if (authError.sessionDisposition === "quarantine_required") {
+      try {
+        await this.onSessionQuarantine(authError.code);
+      } catch (caught) {
+        quarantineError = caught;
+      }
+    }
+
+    let disconnectError: unknown;
+    if (this.clientEpochFence.isCurrent(this.clientEpochReceipt, this.client)) {
+      try {
+        await this.disconnect(authError.code);
+      } catch (caught) {
+        disconnectError = caught;
+      }
+    } else {
+      this.state = "disconnected";
+      try {
+        await this.client.close();
+      } catch (caught) {
+        disconnectError = caught;
+      }
+    }
+    if (quarantineError !== undefined || disconnectError !== undefined) {
+      throw new AggregateError(
+        [quarantineError, disconnectError].filter((value) => value !== undefined),
+        "Codex native 认证失败关闭未完整收口",
+      );
+    }
+  }
+
+  private disconnectIfCurrent(reason: string): Promise<void> {
+    if (!this.clientEpochFence.isCurrent(this.clientEpochReceipt, this.client)) {
+      return Promise.resolve();
+    }
+    return this.disconnect(reason);
   }
 
   private disconnect(reason: string): Promise<void> {
@@ -491,6 +616,7 @@ export class CodexNativeExecutionLifecycle {
     if (this.state === "disconnected") return Promise.resolve();
     if (this.state === "stopping" || this.state === "stopped") return Promise.resolve();
     this.state = "disconnected";
+    this.clientEpochFence.invalidate(this.clientEpochReceipt, this.client);
     const attempt = this.activeAttempt;
     if (attempt) {
       this.clearDeadline(attempt);
