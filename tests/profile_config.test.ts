@@ -57,7 +57,7 @@ describe("配置与协议 profile", () => {
     }))).toThrow("wireContractRevision");
     expect(() => parseProtocolProfile(JSON.stringify({
       ...profile,
-      credentialMode: "access-token-only",
+      credentialMode: "access-and-refresh-token",
     }))).toThrow("credentialMode");
   });
 

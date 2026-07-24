@@ -3,8 +3,8 @@
   "id": "livis-test-v2.0.0",
   "officialPluginVersion": "2.0.0",
   "wireProtocolVersion": 1,
-  "wireContractRevision": "livis-relay-v1-access-refresh-r1",
-  "credentialMode": "access-and-refresh-token",
+  "wireContractRevision": "livis-relay-v1-access-only-r2",
+  "credentialMode": "access-token-only",
   "endpoints": {
     "idaasBaseUrl": "https://idaas.test/api",
     "relayWebSocketUrl": "wss://relay.test/api/v1/ws",

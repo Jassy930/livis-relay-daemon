@@ -59,7 +59,7 @@ git diff -- protocol-probes/
 
 ## 当前 artifact
 
-[`protocol-probes/local/livis-relay-v1-access-refresh-r1.json`](../protocol-probes/local/livis-relay-v1-access-refresh-r1.json)固定以下内容：
+[`protocol-probes/local/livis-relay-v1-access-only-r2.json`](../protocol-probes/local/livis-relay-v1-access-only-r2.json)固定以下内容：
 
 - `wireProtocolVersion`、`wireContractRevision` 与 `credentialMode`；
 - `connect`、heartbeat、消息/取消 ACK、`send_result`、`token_refresh` 的完整脱敏形状；
@@ -67,7 +67,7 @@ git diff -- protocol-probes/
 - `/aux`、device `/token`、refresh `/token`、`/revoke` 的 method、path、Content-Type、精确字段集合和敏感字段类别；
 - 仍需真实服务端或正式 schema 回答的未知项。
 
-机器可读 SSOT 是 [`src/protocol/wire-contract-registry.json`](../src/protocol/wire-contract-registry.json)。每个条目固定 revision、credential mode、wire protocol、artifact 精确相对路径和 SHA-256；数组形式允许门禁拒绝重复 revision/path/SHA。旧条目只作为不可变历史账本保留，runtime 只接受 `currentRevision`，不会把当前代码未重建的旧 artifact 宣称为仍受支持。当前 revision 是 `livis-relay-v1-access-refresh-r1`，凭据模式是 `access-and-refresh-token`。这只是对现有兼容基线的诚实命名，不是目标安全策略，也不证明 Relay 要求 refresh token。#23 若改为 access-token-only，必须新增 revision、registry 条目与 artifact，不能覆写当前 revision。
+机器可读 SSOT 是 [`src/protocol/wire-contract-registry.json`](../src/protocol/wire-contract-registry.json)。每个条目固定 revision、credential mode、wire protocol、artifact 精确相对路径和 SHA-256；数组形式允许门禁拒绝重复 revision/path/SHA。旧条目只作为不可变历史账本保留，runtime 只接受 `currentRevision`，不会把当前代码未重建的旧 artifact 宣称为仍受支持。当前 revision 是 `livis-relay-v1-access-only-r2`，凭据模式是 `access-token-only`；历史 `livis-relay-v1-access-refresh-r1` 条目和 artifact 保持原字节不变。新 revision 只证明当前 daemon 的 S2 行为，真实 Relay 兼容性仍须最终 head 的获授权 canary。
 
 ## Probe 矩阵
 
@@ -90,7 +90,7 @@ git diff -- protocol-probes/
 - `expires_in=1` 的 access token 仍可能命中 30 秒本地缓存；
 - 并发 refresh 可能在一次成功轮换后，被另一次旧请求的 `invalid_grant` 清除新 token；
 - `connected` 与 `token_refreshed` 当前不校验原请求关联 ID；
-- 单次 token-refresh ACK 超时若未达到 failure 上限，不会自行重发；
+- token refresh 的临时错误和 ACK 超时会在当前连接代际内有限退避重试，耗尽后关闭该连接并交给外层重连；真实 Relay 观察到的 close code、重连节流和错误帧仍未知；
 - 多个结果 ACK 候选指向不同 job 时，当前采用第一个可解析候选。
 
 这些风险应分别作为后续修复 PR 处理；修复若改变服务端可观察表单、帧或时序，仍需新 revision 和最终 head 的获授权 S4 canary。
@@ -101,8 +101,8 @@ protocol profile schema v2 强制声明：
 
 ```json
 {
-  "wireContractRevision": "livis-relay-v1-access-refresh-r1",
-  "credentialMode": "access-and-refresh-token"
+  "wireContractRevision": "livis-relay-v1-access-only-r2",
+  "credentialMode": "access-token-only"
 }
 ```
 
@@ -120,8 +120,10 @@ protocol profile schema v2 强制声明：
 
 schema v1 profile 没有 revision/mode，不能从 marker 或端点自动猜测后继续运
 行。项目提供显式 `profile migrate-v2`，但它只接受操作者逐字确认的
-`livis-relay-v1-access-refresh-r1 + access-and-refresh-token` 固定映射；该映射
-不再是 current 时会失败关闭，不会跟随未来 registry 漂移。
+`livis-relay-v1-access-only-r2 + access-token-only` 固定映射；该映射不再是
+current 时会失败关闭，不会跟随未来 registry 漂移。旧版本已生成的 r1 migration
+receipt 不由新 binary 重新解释，升级前必须使用生成 receipt 的旧版本完成回滚或保留
+对应旧 binary 与私有备份。
 
 迁移要求停用 daemon/Hermes 与服务管理器自动拉起，先 dry-run，再保存私有
 PREPARED/备份，以 config durable rename 为唯一提交点。old/new/alias proof 会

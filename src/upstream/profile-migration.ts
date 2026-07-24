@@ -32,8 +32,8 @@ import {
   sha256,
 } from "../util.ts";
 
-export const LEGACY_V1_WIRE_CONTRACT_REVISION = "livis-relay-v1-access-refresh-r1" as const;
-export const LEGACY_V1_CREDENTIAL_MODE = "access-and-refresh-token" as const;
+export const LEGACY_V1_WIRE_CONTRACT_REVISION = "livis-relay-v1-access-only-r2" as const;
+export const LEGACY_V1_CREDENTIAL_MODE = "access-token-only" as const;
 
 type MigrationStatus = "migration-required" | "already-current";
 

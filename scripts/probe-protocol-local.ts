@@ -83,7 +83,6 @@ function relayOutboundFrames(profile: ProtocolProfile): Record<string, RelayEnve
       ...common,
       nodeName: "probe-node",
       accessToken: "SENTINEL_ACCESS_TOKEN",
-      refreshToken: "SENTINEL_REFRESH_TOKEN",
     })),
     heartbeat: normalizeEnvelope(buildHeartbeatEnvelope(profile, common.agentId, common.deviceId)),
     ack_send_message: normalizeEnvelope(buildAckEnvelope(
@@ -109,7 +108,6 @@ function relayOutboundFrames(profile: ProtocolProfile): Record<string, RelayEnve
     token_refresh: normalizeEnvelope(buildTokenRefreshEnvelope({
       ...common,
       accessToken: "SENTINEL_ACCESS_TOKEN",
-      refreshToken: "SENTINEL_REFRESH_TOKEN",
     })),
   };
 }

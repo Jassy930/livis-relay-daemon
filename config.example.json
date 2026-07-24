@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "profile": "./protocol-profiles/livis-authorized.example.json",
-  "profileSha256": "2645d8c52c682f65f1932b899b320e85cbfed2a8d102ac4a7ef5b7ecae24e160",
+  "profileSha256": "f9130d064d21d1d90b2a542cbbaae742fb90cedfbad4f84ae6311655d7e38f10",
   "stateDir": "~/.livis-relay",
   "relay": {
     "nodeName": "我的电脑",

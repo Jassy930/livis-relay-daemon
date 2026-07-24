@@ -13,7 +13,7 @@ bun run check
 
 公开仓库只提供无效占位值的 [`protocol-profiles/livis-authorized.example.json`](../protocol-profiles/livis-authorized.example.json)。从有权管理相关服务的一方取得参数，将 profile 保存到仓库外的私有位置；不要直接使用 example 连接服务。
 
-当前只接受 protocol profile schema v2，并要求 `wireContractRevision=livis-relay-v1-access-refresh-r1` 与 `credentialMode=access-and-refresh-token` 精确匹配代码 registry。两者描述当前仍向 Relay 发送 refresh token 的兼容基线，不代表服务端要求或目标安全策略。
+当前只接受 protocol profile schema v2，并要求 `wireContractRevision=livis-relay-v1-access-only-r2` 与 `credentialMode=access-token-only` 精确匹配代码 registry。daemon 只向 Relay 发送短期 access token；该候选契约尚无最终组合 head 的真实 Relay canary，正式启用前必须按协议证据账本完成验证，不能静默恢复长期凭据出站。
 
 ## 3. 初始化
 

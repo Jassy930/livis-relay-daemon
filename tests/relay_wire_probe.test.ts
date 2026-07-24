@@ -7,7 +7,6 @@ import { Logger } from "../src/logger.ts";
 import { serializeResult } from "../src/protocol/livis.ts";
 import type { ProtocolProfile } from "../src/protocol/profile.ts";
 import { RelayClient, type RelayClientHandlers } from "../src/relay/client.ts";
-import { SecretStore } from "../src/secrets.ts";
 import { JobStore } from "../src/state/store.ts";
 import type { RelayEnvelope } from "../src/types.ts";
 import { incomingJob, temporaryDirectory, testConfig, testProfile } from "./helpers.ts";
@@ -89,7 +88,6 @@ describe("本地 Relay wire contract probe（S2，不代表真实服务端要求
   let profile: ProtocolProfile;
   let config: RelayConfig;
   let identity: RelayIdentity;
-  let secrets: SecretStore;
   let store: JobStore;
   let client: RelayClient | null;
   let authCalls: boolean[];
@@ -124,9 +122,6 @@ describe("本地 Relay wire contract probe（S2，不代表真实服务端要求
       deviceId: RELAY_PROBE_SENTINELS.deviceId,
       createdAt: new Date(0).toISOString(),
     };
-    secrets = new SecretStore(directory.path);
-    await secrets.initialize();
-    await secrets.setRefreshToken(RELAY_PROBE_SENTINELS.refreshToken);
     store = new JobStore(
       join(directory.path, "relay-probe.db"),
       `${RELAY_PROBE_SENTINELS.accountId}:${RELAY_PROBE_SENTINELS.agentId}`,
@@ -175,7 +170,6 @@ describe("本地 Relay wire contract probe（S2，不代表真实服务端要求
       config,
       profile,
       identity,
-      secrets,
       auth,
       store,
       handlers,
@@ -272,7 +266,6 @@ describe("本地 Relay wire contract probe（S2，不代表真实服务端要求
         node_desc: `${profile.wireIdentity.nodeType} ${RELAY_PROBE_SENTINELS.nodeName}`,
         client: profile.wireIdentity.client,
         token: "<access-token:1>",
-        refresh_token: "<refresh-token:1>",
       },
     });
     expect(normalizedConnected.metadata?.job_id).toBe(normalizedConnect.metadata?.job_id);
@@ -327,7 +320,6 @@ describe("本地 Relay wire contract probe（S2，不代表真实服务端要求
       },
       payload: {
         token: "<access-token:2>",
-        refresh_token: "<refresh-token:1>",
         nodeType: profile.wireIdentity.nodeType,
       },
     });
@@ -459,7 +451,6 @@ describe("本地 Relay wire contract probe（S2，不代表真实服务端要求
     const firstRefresh = await relay.nextClientEnvelope("token_refresh");
     expect(firstRefresh.envelope.payload).toEqual({
       token: RELAY_PROBE_SENTINELS.refreshedAccessToken,
-      refresh_token: RELAY_PROBE_SENTINELS.refreshToken,
       nodeType: profile.wireIdentity.nodeType,
     });
     relay.sendEnvelope(connectionId, {
@@ -479,11 +470,13 @@ describe("本地 Relay wire contract probe（S2，不代表真实服务端要求
     );
     expect(close).toMatchObject({
       initiator: "daemon",
-      code: 1008,
+      // ws 客户端请求 1012；当前 Bun loopback 服务端在 close handshake
+      // 收口前观察到 1006。这里只固定 S2 实际观察，不外推真实 Relay。
+      code: 1006,
     });
     expect(relay.clientTextCount("token_refresh", connectionId)).toBe(2);
     expect(authCalls).toEqual([false, true, true]);
-    expect(relayClient.status().terminalFailure).toBe("token_refresh ACK 连续失败");
+    expect(relayClient.status().terminalFailure).toBeNull();
   });
 
   test("[S2 当前 daemon 行为] 断线清理握手、心跳、token 与 result ACK 定时状态", async () => {

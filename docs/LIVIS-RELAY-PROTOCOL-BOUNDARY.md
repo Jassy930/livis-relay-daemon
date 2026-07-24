@@ -2,7 +2,7 @@
 
 本文是本项目对 LiViS IDaaS / Relay 服务端协议断言的唯一证据入口。它不是厂商官方规范，也不把客户端实现、fake Relay 或工程推断升级为服务端事实。
 
-最后核对日期：2026-07-23。
+最后核对日期：2026-07-24。
 
 ## 1. 真源与裁决规则
 
@@ -112,8 +112,8 @@ daemon commit
 | Codex E2E | 高层 S4 | 精确测试提交上的 Device Flow、Relay/Codex 执行、durable outbox Delivered 与 App 人工回显 | 字段必填性、exactly-once、请求 payload 无工具 schema、provider 内部请求次数、成功 revoke | 功能闭环通过；revoke/cleanup 阻塞 |
 | #14 | 高层 S4 人工摘要 | 旧版本 Device Flow、握手、单设备纯文本、Hermes final 与 outbox Delivered | 原始字段必填性、在线刷新、取消、重连、常驻运行 | 已合并；旧基线 |
 | #17 | 局部 S4 | macOS LaunchAgent、online doctor、Relay handshake、connector ready | 同一常驻 job 的消息与结果闭环 | 已关闭；部署边界由 #43 替代，旧证据仍不构成消息闭环 |
-| #23 | S3 + S2 | 官方客户端静态字段与 access-token-only fake Relay | 真实 Relay 省略 refresh token | Draft / DIRTY；旧 head CI |
-| #24 | S3 + S2 | 在线刷新 generation/退避的代码和 fake Relay | 真实 `token_expiring/token_refreshed` 与重连 | Draft / DIRTY；旧 head CI |
+| #23 | S3 + S2 | 官方客户端静态字段与 access-token-only fake Relay | 真实 Relay 省略 refresh token | 已整合本地 `main`；S4 待验证 |
+| #24 | S3 + S2 | 在线刷新 generation/退避的代码和 fake Relay | 真实 `token_expiring/token_refreshed` 与重连 | 已整合本地 `main`；S4 待验证 |
 | #28 | LiViS 侧 S2 | 真实 Hermes 0.18.2 runtime 配合 fake UDS 的局部生命周期 | LiViS IDaaS / Relay、真实模型和完整 profile | Draft / DIRTY；旧 head CI |
 
 CI、`.test` fixture、`.invalid` example、合成 artifact 和 GitHub workflow canary 都不是服务端 canary。
@@ -184,7 +184,7 @@ IDaaS token 响应可能直接包含 token 字段，也可能在 audience 键下
 | 方向 | 消息 | 当前关键字段 / 行为 | 证据 | 服务端必填性与状态 |
 |---|---|---|---|---|
 | daemon → Relay | WSS URL | query `protocol_version=1`，TLS profile 使用 `wss` | S4 高层握手；参数形状为 S3/S2，无原始 receipt | 参数必填性未知 |
-| daemon → Relay | `connect` | metadata：`msg_id/job_id/agent_id/timestamp`；payload：`device_id/node_name/node_desc/client/token/refresh_token` | S4 高层握手 + S3/S2 帧形；没有字段级 receipt | `refresh_token` 是否必填或可省略为 U；access-token-only 仍是候选契约 |
+| daemon → Relay | `connect` | metadata：`msg_id/job_id/agent_id/timestamp`；payload：`device_id/node_name/node_desc/client/token`，不发送 refresh token | 历史 S4 只证明旧基线高层握手；当前字段为 S3/S2，没有字段级 S4 receipt | `refresh_token` 是否可省略为 U；access-token-only 仍是待实网验证的候选契约 |
 | Relay → daemon | `connected` | 当前只要求 `type`；其余字段不参与握手 | S4 实际收到 | 服务端完整 schema 未知 |
 | Relay → daemon | `send_message` | metadata `job_id` 必需；payload `from_node_id`、`data.type=exec`、非空 `data.content` 必需；`data` 可为对象或 JSON 字符串 | S4 单设备纯文本；S2 负向校验 | `msg_id/timestamp/from_node_type` 的服务端保证与最大长度未知；没有稳定 conversation/session 标识的字段级证据 |
 | daemon → Relay | `ack_send_message` | metadata 含 job/agent/device/message/timestamp；payload 增加 `nodeType`，metadata 增加 `client` | S4 路径中实际发送；S2 | Relay 是否要求所有字段、如何去重未知 |
@@ -194,8 +194,8 @@ IDaaS token 响应可能直接包含 token 字段，也可能在 audience 键下
 | Relay → daemon | `ack_send_result` | daemon 按 `payload.ref_msg_id`、`metadata.job_id`、`metadata.msg_id` 顺序尝试关联 | S4 至少一种形状完成 Delivered；S3/S2 覆盖候选顺序 | 实际 canary 使用的字段未脱敏记录；服务端优先级未知 |
 | daemon → Relay | `heartbeat` + WS ping | application heartbeat 携带 identity；同时发送 WebSocket ping | S3/S2；无独立 S4 记录 | Relay 是否要求 heartbeat、是否回 pong 未确认；daemon 将任一可解析服务端消息视为存活证据 |
 | Relay → daemon | `token_expiring` | 触发本地 IDaaS refresh | S3/S2；无 S4 | 触发时机、重复语义未知 |
-| daemon → Relay | `token_refresh` | 当前 main 发送新 access token 和 refresh token | S3/S2；无 S4 在线刷新 | refresh token 必填性为 U；只发 access token 的候选尚未验证 |
-| Relay → daemon | `token_refreshed` | 清除本地刷新 ACK timer / failure count | S3/S2；无 S4 | ACK 字段和错误响应未知 |
+| daemon → Relay | `token_refresh` | 当前 main 只发送新 access token；临时 IDaaS 错误或 ACK 超时按当前连接代际有限退避，耗尽后重连 | S3/S2；无 S4 在线刷新 | refresh token 必填性、真实 close/error 语义为 U |
+| Relay → daemon | `token_refreshed` | 使当前连接代际的刷新定时器与异步结果失效 | S3/S2；无 S4 | ACK 字段、关联关系和错误响应未知 |
 
 未知 `type` 在握手后会被记录并忽略；格式错误会被当前消息链拒绝，但不会因此推断服务端应有相同行为。
 
@@ -207,11 +207,11 @@ IDaaS token 响应可能直接包含 token 字段，也可能在 audience 键下
 |---|---|---|
 | SecretStore → IDaaS `/token` / `/revoke` | 允许 | OAuth 所需；refresh token 只在本地持久化 |
 | access token → Relay `connect` / `token_refresh` | 允许 | 短期 bearer 凭据；S4 只确认初始 `connect` |
-| refresh token → Relay `connect` | 当前兼容基线会发送 | 历史 S4 高层握手发生在该代码基线，但没有字段级 receipt；S3/S2 证明客户端发送。这是显式安全例外，不是目标稳态 |
-| refresh token → Relay `token_refresh` | 当前实现会发送 | 只有 S3/S2；尚无 S4 在线刷新证据 |
+| refresh token → Relay `connect` | 禁止 | 当前 r2 实现与 S2 artifact 均不发送；历史 S4 只属于旧 r1 基线，当前真实兼容性待验证 |
+| refresh token → Relay `token_refresh` | 禁止 | 当前 r2 实现与 S2 artifact 均不发送；尚无 S4 在线刷新证据 |
 | refresh token → SQLite、argv、普通日志、Git | 禁止 | 项目安全策略与发布门禁 |
 
-目标安全边界是 Relay 只接收短期 access token，但在真实 Relay 完成 `connect → connected` 和 `token_expiring → token_refresh → token_refreshed` canary 前，它只能标为候选契约。若服务端确实要求长期凭据，项目必须暂停并做服务端/凭据协议决策；不得以“兼容回退”为名静默重新发送 refresh token。
+当前安全边界已强制 Relay 只接收短期 access token，但在真实 Relay 完成 `connect → connected` 和 `token_expiring → token_refresh → token_refreshed` canary 前，它仍只能标为候选契约。若服务端确实要求长期凭据，项目必须暂停并做服务端/凭据协议决策；不得以“兼容回退”为名静默重新发送 refresh token。
 
 ## 8. 本项目支持边界
 
@@ -249,22 +249,19 @@ wire 变化转 Ready 前必须同时满足：
 
 代码内置只读 registry 维护 `wireContractRevision + credentialMode` 并固定对应脱敏 artifact SHA-256；protocol profile schema v2、`runtimeContractSha256()`、supported proof 和 status 同时绑定该契约。本地 artifact 固定 daemon 生成帧、入站解析和 IDaaS 表单的 S2 行为。任何 wire 变化必须建立新 revision 并更新 artifact；复用旧 revision、只改文字或只让 fake Relay 返回成功都不能构成门禁。S2 门禁仍不能替代最终 head 的获授权 S4 canary；真实 canary receipt 的 schema/私有保管和 revision 绑定仍须在执行 S4 前独立实现，未完成时 wire PR 继续保持 Draft。
 
-## 10. 当前 PR 裁决
+## 10. 当前 access-token-only 组合裁决
 
-### #23：access-token-only 候选
+#23 与 #24 的代码已经按顺序整合到本地 `main`：保留 #20 的 revoke 语义，新增 append-only
+`livis-relay-v1-access-only-r2 + access-token-only` revision，strict fake Relay 同时断言
+`connect` 与 `token_refresh` 不含 refresh token，并把 generation / 有限退避建立在该基线上。
 
-#23 保持 Draft。转 Ready 前必须同时满足：
+这仍不是生产兼容结论。转为可正式启用前还必须在同一最终 head：
 
-1. 基于最新 `main` 形成最终组合 head，并保留 #20 的 revoke 语义；
-2. 基于上述代码门禁建立新的 access-token-only revision / credential mode，不得覆写当前 access-and-refresh-token 基线；
-3. strict fake Relay 对 `connect` 与 `token_refresh` 同时断言只有 access token，并拒绝 refresh token；
-4. 在同一最终 head 完成 `connect(access-only) → connected`；
-5. 完成 `token_expiring → 本地 IDaaS refresh → token_refresh(access-only) → token_refreshed`；
-6. 刷新后再完成一条纯文本消息/结果 ACK，并验证断线重连；
-7. 公开 receipt 只记录字段名、credential mode、版本元组和脱敏结果，证明两类 Relay 帧都没有 refresh token；
-8. 服务端不兼容时保持失败关闭，不恢复发送长期凭据。
-
-#24 只能在 #23 的 access-token-only 与 wire revision 基线上移植 generation / 有限退避逻辑，不能独立合入或重新带回 refresh token。
+1. 完成 `connect(access-only) → connected`；
+2. 完成 `token_expiring → 本地 IDaaS refresh → token_refresh(access-only) → token_refreshed`；
+3. 刷新后再完成一条纯文本消息/结果 ACK，并验证断线重连；
+4. 公开 receipt 只记录字段名、credential mode、版本元组和脱敏结果，证明两类 Relay 帧都没有 refresh token；
+5. 服务端不兼容时保持失败关闭，不恢复发送长期凭据。
 
 ## 11. 当前未知项与扩展 canary backlog
 
@@ -281,7 +278,7 @@ wire 变化转 Ready 前必须同时满足：
 9. App 新对话是否产生稳定 conversation/session 标识，以及该标识的生命周期、重放和
    与 `from_node_id`/`job_id` 的关系。
 
-除 #23 专项门禁外，后续获授权隔离 canary backlog 包括：
+除 access-token-only 专项门禁外，后续获授权隔离 canary backlog 包括：
 
 ```text
 单一 node 的纯文本 send_message / ack_send_message

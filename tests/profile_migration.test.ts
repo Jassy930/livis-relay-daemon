@@ -687,7 +687,7 @@ describe("protocol profile schema v1→v2 迁移", () => {
       })).rejects.toThrow("必须显式为");
       await expect(planProtocolProfileV2Migration({
         ...migrationOptions(deployment.configPath),
-        credentialMode: "access-token-only",
+        credentialMode: "access-and-refresh-token",
       })).rejects.toThrow("必须显式为");
 
       process.env.LIVIS_RELAY_STATE_DIR = join(deployment.directory.path, "override");

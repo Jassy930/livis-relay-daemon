@@ -11,13 +11,15 @@
 
 这条迁移只处理仓库外的 active protocol profile 和 config pin，不打开
 `relay.db`，也不改变 SQLite `PRAGMA user_version`、wire 行为、OAuth 凭据或
-一期单设备边界。v1 只能显式映射到已审阅的固定基线：
+一期单设备边界。v1 只能显式映射到已审阅的当前安全基线：
 
-- `wireContractRevision=livis-relay-v1-access-refresh-r1`
-- `credentialMode=access-and-refresh-token`
+- `wireContractRevision=livis-relay-v1-access-only-r2`
+- `credentialMode=access-token-only`
 
 如果代码 registry 的 current revision 已离开该基线，命令会失败关闭，必须
-另写专用迁移；不能把 v1 自动声明成未来 contract。
+另写专用迁移；不能把 v1 自动声明成未来 contract。由旧 r1 binary 生成的
+migration receipt 必须在升级前使用原 binary 回滚，或连同原 binary 和私有备份
+一起保留；新 binary 不把旧 receipt 重解释为 r2。
 
 ### 1. 停服与 dry-run
 
@@ -39,8 +41,8 @@ CONFIG="$HOME/.livis-relay/config.json"
 
 bun run src/index.ts profile migrate-v2 \
   --config "$CONFIG" \
-  --wire-contract-revision livis-relay-v1-access-refresh-r1 \
-  --credential-mode access-and-refresh-token \
+  --wire-contract-revision livis-relay-v1-access-only-r2 \
+  --credential-mode access-token-only \
   --dry-run
 ```
 
@@ -55,8 +57,8 @@ SHA pin。必须保持 `LIVIS_RELAY_STATE_DIR` 未设置；若使用非默认配
 ```bash
 bun run src/index.ts profile migrate-v2 \
   --config "$CONFIG" \
-  --wire-contract-revision livis-relay-v1-access-refresh-r1 \
-  --credential-mode access-and-refresh-token \
+  --wire-contract-revision livis-relay-v1-access-only-r2 \
+  --credential-mode access-token-only \
   --apply \
   --acknowledge-reviewed-wire-contract \
   --acknowledge-daemon-and-hermes-stopped
