@@ -65,16 +65,32 @@ server config 隔离、thread/turn 生命周期、session resume 和 Desktop/CLI
 返回 `native_daemon_version_incompatible`；不会为了通过门禁而重启用户 daemon。此前一次只读
 proxy initialize 尝试在 5 秒内未得到响应，没有创建 thread、调用模型或改写认证状态。
 
-该观察是本机当时状态，不是协议长期结论。版本更新或原生 daemon 重启后必须重新运行探针。
+该观察是本机当时状态，不是协议长期结论。只能等待 Codex Desktop 与其原生 daemon 按用户
+正常使用流程自然升级到兼容版本后重新运行探针，或由操作者显式提供另一个与 Desktop 生命周期
+完全独立的兼容端点。relay 不得为了让探针通过而启动、停止、重启、替换或升级 Desktop 及其
+原生 daemon，也不得启用或关闭 remote control。
 
-## 6. 下一实现门禁
+## 6. Desktop 不干扰不变量
+
+后续实现与测试必须把当前 Codex Desktop 视为用户拥有的外部系统：
+
+- relay 只能连接操作者显式配置、已经存在且通过版本与文件身份门禁的 socket；
+- 版本不兼容、端点离线或协议不兼容时保持 `incompatible` / `offline`，不做修复性生命周期操作；
+- relay 关闭的只能是自己启动的 `app-server proxy` 子进程，不能向原生 daemon 发送停止、重启、
+  升级、remote-control 切换或认证变更请求；
+- 离线开发只能连接测试拥有的 fake proxy/daemon，不得把真实 Desktop socket 作为自动化测试夹具；
+- 不兼容时不能自动回退到现有私有 API-key 后端；认证模式和目标端点都必须来自操作者显式配置。
+
+## 7. 下一实现门禁
 
 在生产接线前还必须独立闭合：
 
-1. 操作者把管理 CLI 与运行中 app-server 对齐到同一审核窗口，并得到 `ready` 探针；
+1. 等待 Desktop/原生 daemon 自然进入同一审核窗口，或连接另一个不影响 Desktop 的兼容端点，
+   并得到 `ready` 探针；relay 不执行任何对齐、升级或重启动作；
 2. 证明共享原生 daemon 时，LiViS thread 能以逐 thread 的固定审批、sandbox、工具和网络策略
    隔离，不依赖或改写用户默认 config；
 3. 把 proxy transport 映射到 `ExecutionBackend` 的 `not_sent | submitted`、accepted、唯一 final、
    credential-rejected、disconnect 与 ambiguous execution 语义；
-4. 覆盖 Desktop/CLI 并发、运行中注销/切换、daemon 重启、resume 和旧事件 fencing；
+4. 用 fake 端点覆盖 transport 生命周期、运行中注销/切换、被动观察到的 daemon 重启、resume 和
+   旧事件 fencing；真实 Desktop/CLI 并发只能在另行授权的非生产 canary 中验证；
 5. 完成不复制凭据的受控本机 canary 后，才允许修改机器可读 capability 状态。

@@ -151,6 +151,12 @@ daemon/app-server 版本与私有 Unix socket，并通过官方 proxy 只执行 
 2026-07-24 本机观察到 CLI `0.145.0` 与运行中 app-server `0.144.1` 不一致，因此当前状态为
 `incompatible`，不能进入生产接线。
 
+当前 Codex Desktop 及其原生 daemon 是用户拥有的外部系统。relay 只允许 attach 操作者显式
+配置、已经存在且版本兼容的 socket；不得启动、停止、重启、替换或升级 Desktop daemon，不得
+启用或关闭 remote control，也不得修改 `~/.codex`、默认配置、认证或 Desktop session。不兼容
+时保持失败关闭，等待 Desktop 自然升级，或连接另一个与 Desktop 生命周期完全独立的兼容端点；
+不能自动回退到私有 API-key 路径。自动化开发和生命周期测试只能使用测试拥有的 fake 端点。
+
 已知冲突：当前 Codex 隔离依赖重定向 `HOME`、`TMPDIR` 和 `CODEX_HOME`，而原生当前认证可能与
 用户真实 `HOME`/`CODEX_HOME` 强绑定。不能为了读到认证就直接让 daemon 子进程继承真实 HOME，
 因为这会同时暴露可写配置、session 和 rollout。阶段 B 必须找到受支持的认证与可写状态分离或
@@ -158,12 +164,20 @@ attach 入口；若上游没有该边界，就需要重新设计 workspace/env �
 
 工作包：
 
-1. 继续验证官方 app-server daemon/proxy 能否在认证由原生 daemon 持有时，为 LiViS thread 提供不依赖用户默认 config 的 workspace、权限、工具和网络隔离；只读 transport/auth 探针已落地，Desktop/CLI 并发仍未验证。
+1. 先用 fake proxy 补齐 transport 生命周期与失败语义；等 Desktop/原生 daemon 自然进入审核窗口，
+   或操作者提供另一个不影响 Desktop 的兼容端点后，再验证官方 daemon/proxy 能否在认证由原生
+   daemon 持有时，为 LiViS thread 提供不依赖用户默认 config 的 workspace、权限、工具和网络
+   隔离。只读 transport/auth 探针已落地，真实 Desktop/CLI 并发仍未验证。
 2. 给 Codex adapter 增加显式认证模式，保留现有 `private-api-key` 兼容路径；新模式只能请求原生 runtime 执行，不能读取、复制、链接或导出默认 `~/.codex`、Keychain 或 `auth.json`，也不能用继承整个真实 HOME 代替受支持的认证复用接口。
 3. readiness 只返回标准状态和稳定错误分类；账号、token、scope、cookie、原始 provider 错误不进入 daemon 状态、SQLite 或日志。
-4. 覆盖未认证、已认证、运行中注销/切换、并发 Desktop/CLI、超时、取消、进程退出、resume、daemon 重启和认证状态漂移。
+4. 用 fake 端点覆盖未认证、已认证、运行中注销/切换、超时、取消、proxy 退出、被动观察到的
+   daemon 重启、resume 和认证状态漂移；真实 Desktop/CLI 并发只在另行授权的非生产 canary 中验证。
 
-完成定义：非生产 canary 证明 daemon 未产生第二份后端凭据、日常 Codex 仍可用、job/lease/checkpoint 全闭合，才把 `codex_native_auth_reuse` 从 `unsupported` 升级。若上游把认证和可写 session/config 强耦合，则保持现有私有 API-key 路径并明确标记阻塞，不能用 symlink 或文件复制绕过。
+完成定义：另行授权的非生产 canary 证明 daemon 未产生第二份后端凭据、未改变 Codex Desktop
+生命周期或状态、日常 Codex 仍可用、job/lease/checkpoint 全闭合，才把
+`codex_native_auth_reuse` 从 `unsupported` 升级。若上游把认证和可写 session/config 强耦合，
+则保持能力为 `unsupported`；现有私有 API-key 路径只能由操作者显式选择，不能自动 fallback，
+也不能用 symlink 或文件复制绕过。
 
 ### 7.4 阶段 C：Claude adapter
 
