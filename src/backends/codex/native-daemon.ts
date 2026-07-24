@@ -2,9 +2,14 @@ import type { Stats } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import type {
+  CodexAppServerNotification,
   CodexAppServerClientOptions,
 } from "./app-server-client.ts";
-import { CodexAppServerClient } from "./app-server-client.ts";
+import {
+  CodexAppServerClient,
+  CodexAppServerProcessOwnershipUnconfirmedError,
+  CodexAppServerStartCloseUnconfirmedError,
+} from "./app-server-client.ts";
 import {
   runCodexCommand,
   validateCodexVersion,
@@ -14,6 +19,7 @@ import {
   assertPinnedCodexCommand,
   type PinnedCodexCommand,
 } from "./runtime-layout.ts";
+import type { CodexNativeExecutionClient } from "./native-execution-lifecycle.ts";
 import {
   parseSemverTriplet,
   versionAtLeast,
@@ -89,6 +95,19 @@ interface CodexNativeProbeClient {
   close(): Promise<void>;
 }
 
+export interface CodexNativeAttachedClient extends CodexNativeExecutionClient {
+  readonly initializeResult: unknown;
+}
+
+export interface CodexNativeDaemonAttachment {
+  client: CodexNativeAttachedClient;
+  transport: "app-server-daemon-proxy";
+  cliVersion: string;
+  appServerVersion: string;
+  startedNativeDaemon: false;
+  productionReady: false;
+}
+
 export interface CodexNativeDaemonProbeOptions {
   command: PinnedCodexCommand;
   socketPath: string;
@@ -102,12 +121,32 @@ export interface CodexNativeDaemonProbeOptions {
   clientVersion: string;
 }
 
+export interface CodexNativeDaemonAttachOptions extends CodexNativeDaemonProbeOptions {
+  onNotification?: (notification: CodexAppServerNotification) => void | Promise<void>;
+}
+
 export interface CodexNativeDaemonProbeDependencies {
   commandRunner?: CodexCommandRunner;
   clientStart?: (options: CodexAppServerClientOptions) => Promise<CodexNativeProbeClient>;
   socketPinResolver?: (path: string) => Promise<PinnedCodexNativeSocket>;
   socketPinAsserter?: (pin: PinnedCodexNativeSocket) => Promise<void>;
   commandPinAsserter?: (pin: PinnedCodexCommand) => Promise<void>;
+}
+
+export interface CodexNativeDaemonAttachDependencies {
+  commandRunner?: CodexCommandRunner;
+  clientStart?: (
+    options: CodexAppServerClientOptions,
+  ) => Promise<CodexNativeAttachedClient>;
+  socketPinResolver?: (path: string) => Promise<PinnedCodexNativeSocket>;
+  socketPinAsserter?: (pin: PinnedCodexNativeSocket) => Promise<void>;
+  commandPinAsserter?: (pin: PinnedCodexCommand) => Promise<void>;
+}
+
+interface CodexNativeDaemonValidatedTarget {
+  cliVersion: string;
+  appServerVersion: string;
+  socketPin: PinnedCodexNativeSocket;
 }
 
 const MANAGEMENT_ENV_KEYS = [
@@ -383,13 +422,11 @@ function validateNativeInitialize(value: unknown, stateDir: string): void {
   }
 }
 
-export async function probeCodexNativeDaemon(
+async function validateCodexNativeDaemonTarget(
   options: CodexNativeDaemonProbeOptions,
-  dependencies: CodexNativeDaemonProbeDependencies = {},
-): Promise<CodexNativeDaemonProbeReport> {
+  dependencies: Omit<CodexNativeDaemonProbeDependencies, "clientStart">,
+): Promise<CodexNativeDaemonValidatedTarget> {
   const commandRunner = dependencies.commandRunner ?? runCodexCommand;
-  const clientStart = dependencies.clientStart ?? ((clientOptions) =>
-    CodexAppServerClient.start(clientOptions));
   const socketPinResolver = dependencies.socketPinResolver ?? pinCodexNativeDaemonSocket;
   const socketPinAsserter = dependencies.socketPinAsserter ?? assertPinnedCodexNativeDaemonSocket;
   const commandPinAsserter = dependencies.commandPinAsserter ?? assertPinnedCodexCommand;
@@ -427,22 +464,140 @@ export async function probeCodexNativeDaemon(
     );
   }
   await socketPinAsserter(socketPin);
+  return {
+    cliVersion,
+    appServerVersion: daemonVersion.appServerVersion,
+    socketPin,
+  };
+}
+
+function nativeProxyClientOptions(
+  options: CodexNativeDaemonAttachOptions,
+  target: CodexNativeDaemonValidatedTarget,
+  clientName: "livis-relay-native-attach" | "livis-relay-native-probe",
+): CodexAppServerClientOptions {
+  return {
+    command: buildCodexNativeProxyCommand(options.command.path, target.socketPin.path),
+    cwd: options.cwd,
+    env: buildCodexNativeProxyEnvironment(options.sourceEnv ?? process.env),
+    requestTimeoutMs: options.requestTimeoutMs,
+    closeTimeoutMs: options.shutdownTimeoutMs,
+    clientInfo: {
+      name: clientName,
+      title: clientName === "livis-relay-native-attach"
+        ? "LiViS Relay Native Codex Attach"
+        : "LiViS Relay Native Codex Probe",
+      version: options.clientVersion,
+    },
+    capabilities: { experimentalApi: false, requestAttestation: false },
+    ...(options.onNotification === undefined
+      ? {}
+      : { onNotification: options.onNotification }),
+  };
+}
+
+async function closeNativeProxyAfterFailure(
+  client: CodexNativeProbeClient,
+  primaryError: unknown,
+): Promise<never> {
+  try {
+    await client.close();
+  } catch (closeError) {
+    throw new CodexNativeDaemonProbeError(
+      "native_proxy_close_unconfirmed",
+      "Codex native proxy 子进程收口未确认；原生 daemon 未被停止",
+      {
+        cause: new AggregateError(
+          [primaryError, closeError],
+          "Codex native attach 与 proxy 收口均失败",
+        ),
+      },
+    );
+  }
+  throw primaryError;
+}
+
+/**
+ * 建立一个仍由调用方持有的 native proxy 连接。
+ *
+ * 这里只验证 CLI、只读 daemon report、socket identity 与 initialize；不读取账号状态、不启动或
+ * 停止原生 daemon，也不创建 thread。成功后的 client 必须交给 coordinator/harness 或显式 close。
+ */
+export async function attachCodexNativeDaemon(
+  options: CodexNativeDaemonAttachOptions,
+  dependencies: CodexNativeDaemonAttachDependencies = {},
+): Promise<CodexNativeDaemonAttachment> {
+  const target = await validateCodexNativeDaemonTarget(options, dependencies);
+  const clientStart = dependencies.clientStart ?? ((clientOptions) =>
+    CodexAppServerClient.start(clientOptions));
+  let client: CodexNativeAttachedClient;
+  try {
+    client = await clientStart(nativeProxyClientOptions(
+      options,
+      target,
+      "livis-relay-native-attach",
+    ));
+  } catch (error) {
+    if (
+      error instanceof CodexAppServerStartCloseUnconfirmedError ||
+      error instanceof CodexAppServerProcessOwnershipUnconfirmedError
+    ) {
+      throw new CodexNativeDaemonProbeError(
+        "native_proxy_close_unconfirmed",
+        "Codex native proxy 初始化失败且进程组收口未确认；原生 daemon 未被停止",
+        { cause: error },
+      );
+    }
+    throw new CodexNativeDaemonProbeError(
+      "native_proxy_unavailable",
+      "Codex native daemon proxy 无法完成 initialize；attach 不会启用 remote control 或重启 daemon",
+      { cause: error },
+    );
+  }
+
+  try {
+    validateNativeInitialize(client.initializeResult, options.stateDir);
+    if (!client.running) {
+      throw new CodexNativeDaemonProbeError(
+        "native_proxy_unavailable",
+        "Codex native daemon proxy 在 initialize 后已不可用",
+      );
+    }
+    await (dependencies.commandPinAsserter ?? assertPinnedCodexCommand)(options.command);
+    await (dependencies.socketPinAsserter ?? assertPinnedCodexNativeDaemonSocket)(
+      target.socketPin,
+    );
+  } catch (error) {
+    return closeNativeProxyAfterFailure(client, error);
+  }
+
+  return {
+    client,
+    transport: "app-server-daemon-proxy",
+    cliVersion: target.cliVersion,
+    appServerVersion: target.appServerVersion,
+    startedNativeDaemon: false,
+    productionReady: false,
+  };
+}
+
+export async function probeCodexNativeDaemon(
+  options: CodexNativeDaemonProbeOptions,
+  dependencies: CodexNativeDaemonProbeDependencies = {},
+): Promise<CodexNativeDaemonProbeReport> {
+  const clientStart = dependencies.clientStart ?? ((clientOptions) =>
+    CodexAppServerClient.start(clientOptions));
+  const socketPinAsserter = dependencies.socketPinAsserter ?? assertPinnedCodexNativeDaemonSocket;
+  const commandPinAsserter = dependencies.commandPinAsserter ?? assertPinnedCodexCommand;
+  const target = await validateCodexNativeDaemonTarget(options, dependencies);
 
   let client: CodexNativeProbeClient;
   try {
-    client = await clientStart({
-      command: buildCodexNativeProxyCommand(options.command.path, socketPin.path),
-      cwd: options.cwd,
-      env: buildCodexNativeProxyEnvironment(sourceEnv),
-      requestTimeoutMs: options.requestTimeoutMs,
-      closeTimeoutMs: options.shutdownTimeoutMs,
-      clientInfo: {
-        name: "livis-relay-native-probe",
-        title: "LiViS Relay Native Codex Probe",
-        version: options.clientVersion,
-      },
-      capabilities: { experimentalApi: false, requestAttestation: false },
-    });
+    client = await clientStart(nativeProxyClientOptions(
+      options,
+      target,
+      "livis-relay-native-probe",
+    ));
   } catch (error) {
     throw new CodexNativeDaemonProbeError(
       "native_proxy_unavailable",
@@ -456,7 +611,7 @@ export async function probeCodexNativeDaemon(
   try {
     validateNativeInitialize(client.initializeResult, options.stateDir);
     await commandPinAsserter(options.command);
-    await socketPinAsserter(socketPin);
+    await socketPinAsserter(target.socketPin);
   } catch (error) {
     hasPrimaryError = true;
     primaryError = error;
@@ -482,8 +637,8 @@ export async function probeCodexNativeDaemon(
     probeCompleted: true,
     readiness: "ready",
     transport: "app-server-daemon-proxy",
-    cliVersion,
-    appServerVersion: daemonVersion.appServerVersion,
+    cliVersion: target.cliVersion,
+    appServerVersion: target.appServerVersion,
     startedNativeDaemon: false,
     sentModelTurn: false,
     productionReady: false,

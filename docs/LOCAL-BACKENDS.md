@@ -184,20 +184,29 @@ resume，历史 active/recovery、metadata/checkpoint 漂移和提交不确定�
 普通本地 backend failed 只结算当前 job，后续 job 仍可继续调用同一 transport。该原型及测试没有
 连接真实 socket，也没有进入 `daemon.ts`、`index.ts`、`config.ts` 或生产 `serve`。
 
+第六个切片 [`native session harness`](../src/backends/codex/native-session-harness.ts) 把可持有连接的
+[`attachCodexNativeDaemon`](../src/backends/codex/native-daemon.ts) 与 coordinator 接到纯离线受控组合。
+notification callback 固定绑定 coordinator 的确切 client epoch；active proxy exit/terminal timeout
+进入持久 recovery/quarantine，idle exit 只降低 transport readiness。attach、initialize、preflight
+失败都证明 relay 自有 proxy 的收口语义，stop 不管理原生 daemon。对应
+[`组合测试`](../tests/codex_native_session_harness.test.ts) 只注入 fake daemon report、socket pin 与
+proxy，仍未连接真实 Desktop，也未进入生产入口。
+
 这里仍有一个执行隔离门槛：permission profile 与 feature 集合由原生 daemon 持有。relay 不得通过
 修改用户默认配置、重启 Desktop daemon 或关闭用户 feature 来满足门禁；兼容端点必须原生提供不
 影响 Desktop 的逐客户端/逐 thread 隔离。做不到就保持 `unsupported`，不能削弱门禁换取接线。
 
 工作包：
 
-1. 持久 session coordinator 的离线组合已完成；后续真实 attach 仍必须保持旧 active attempt 先结算
-   或进入 ambiguous quarantine，才允许新 epoch 恢复 thread。
+1. transport + 持久 session coordinator 的离线组合已完成；后续真实 canary 仍必须保持旧 active
+   attempt 先结算或进入 ambiguous quarantine，才允许新 epoch 恢复 thread。
 2. 原生模式不读取或持久化 account type、主体、登录状态、token、scope 或 provider 认证分类；现有
    `private-api-key` 兼容路径只能由操作者显式选择，不能自动 fallback。
 3. readiness 只描述 transport 的 `ready | offline | incompatible`；本地执行错误不降低 transport
    readiness，也不阻止后续 job 再次调用当前本地状态。
-4. 用 fake 端点覆盖成功、普通 backend failed、超时、取消、proxy 退出、daemon 被动重启、resume
-   和旧 epoch 迟到事件；真实 Desktop/CLI 并发只在另行授权的非生产 canary 中验证。
+4. fake 端点已覆盖成功、普通 backend failed、超时、取消、proxy 退出、resume 和旧 epoch 迟到
+   事件；daemon 被动重启、真实 Desktop/CLI 并发与逐 thread 不干扰只在另行授权的非生产 canary
+   中验证。
 
 完成定义：另行授权的非生产 canary 证明 daemon 未产生第二份后端凭据、未读取账号状态、未改变
 Codex Desktop 生命周期或状态、日常 Codex 仍可用、job/lease/checkpoint 全闭合，才考虑把

@@ -327,6 +327,11 @@ export class CodexNativeSessionCoordinator {
       session.threadId === this.threadReceipt.threadId && !session.recoveryRequired;
   }
 
+  /** 供 transport notification bridge 固定事件产生时的 client 代际。 */
+  get clientEpoch(): number {
+    return this.clientEpochReceipt.clientEpoch;
+  }
+
   dispatch(job: StoredJob): Promise<ExecutionSubmission> {
     if (!this.ready) return Promise.resolve("not_sent");
     return this.lifecycle.dispatch(job);

@@ -141,15 +141,44 @@ JobStore schema v8 为 backend session 与 attempt ledger 增加显式状态所�
 绑定、跨 Store 重开的 idle resume、active ambiguous quarantine、普通 failed 后继续执行、attempt
 账本不保存本地状态详情和旧 epoch exit。测试没有连接真实 socket，也没有操作 Desktop 生命周期。
 
-## 10. 下一实现门禁
+## 10. 受控 transport + coordinator 组合 harness
 
-离线执行状态组合已经完成，下一阶段仍不引入账号处理：
+[`attachCodexNativeDaemon`](../src/backends/codex/native-daemon.ts) 已从一次性探针中抽出可由调用方持有的
+attach：复用同一 CLI、只读 daemon report、socket identity、环境白名单和 initialize 门禁，成功后
+返回 relay 自己启动的 proxy client。它仍不启动或停止原生 daemon，不读取账号状态，也不创建
+thread。initialize 失败且进程组收口无法确认时显式返回 `native_proxy_close_unconfirmed`，不能降格为
+普通 offline。
 
-1. 将 transport-only attach 与 coordinator 接到一个仍不进入生产 `serve` 的受控组合 harness，证明
-   notification 绑定、proxy 所有权和失败收口；
-2. 只在另行授权的非生产 canary 中验证真实 Desktop/CLI 并发、逐 thread 隔离与 Desktop 不干扰；
-3. 保持 coordinator 不读取或持久化 account type、主体、登录状态、token、scope 或 provider 认证分类；
-4. 在上述证据闭合前不修改 `codex_native_auth_reuse=unsupported`，也不接入自动 fallback。
+[`CodexNativeSessionHarness`](../src/backends/codex/native-session-harness.ts) 只在测试中把这个 attach 与
+持久 coordinator 组合。proxy 构造时固定的 notification callback 在 coordinator ready 后绑定其确切
+client epoch；绑定前没有合法 active attempt，期间 notification 只计数并丢弃内容。harness 的资源
+所有权只包括 relay 自己启动的 proxy client，`stop()` 不向原生 daemon 发送生命周期请求。
 
-即使离线 coordinator 已完成，能力仍保持 `unsupported`，直到安全 attach、Desktop 不干扰和真实并发
-canary 分别闭合。
+[`codex_native_session_harness.test.ts`](../tests/codex_native_session_harness.test.ts) 使用注入式 fake
+daemon report、socket pin 和 proxy，覆盖：
+
+- initialize 后 notification 绑定、成功 dispatch、terminal checkpoint 和唯一 final；
+- proxy 环境不获得 API key、OAuth token、`HOME` 或 `CODEX_HOME`；
+- attach 校验失败、initialize/close 双失败和 coordinator preflight 失败的所有权收口；
+- active proxy exit/terminal timeout 进入持久 recovery/quarantine，idle exit 只降低 transport
+  readiness、不错误隔离 session；
+- 旧 epoch 的 exit、timeout 与迟到 notification 不影响新 epoch；
+- harness 与 `daemon.ts`、`index.ts`、`config.ts` 保持双向未接线。
+
+这些仍是纯离线证据。测试没有连接真实 Desktop/socket，没有读取本机当前状态，也没有改变 capability
+状态。
+
+## 11. 下一实现门禁
+
+离线 attach 与执行状态组合已经完成，下一阶段仍不引入账号处理：
+
+1. 在另行授权前不运行真实 Desktop/CLI canary；下一真实门禁是并发、逐 thread 隔离、被动 daemon
+   重启恢复与 Desktop 不干扰，不是账号状态探测；
+2. canary 必须使用操作者显式配置的现有 socket，不启动、停止、重启、升级或修改 Desktop daemon；
+3. 保持 coordinator/harness 不读取或持久化 account type、主体、登录状态、token、scope 或 provider
+   认证分类；本地错误继续按普通 execution failed；
+4. 在真实证据闭合前不导入 `daemon.ts`、`index.ts`、`config.ts`，不修改
+   `codex_native_auth_reuse=unsupported`，也不接入自动 fallback。
+
+即使离线组合 harness 已完成，能力仍保持 `unsupported`，直到 Desktop 不干扰和真实并发 canary
+分别闭合。
