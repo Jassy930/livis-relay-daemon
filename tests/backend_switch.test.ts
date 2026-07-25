@@ -87,7 +87,10 @@ describe("backend switch 原子切换", () => {
       ]);
       expect(dryRun.exitCode).toBe(0);
       expect(dryRun.stderr).toBe("");
-      expect(JSON.parse(dryRun.stdout)).toMatchObject({
+      const dryRunResult = JSON.parse(dryRun.stdout) as {
+        configSha256: string;
+      };
+      expect(dryRunResult).toMatchObject({
         ok: true,
         applied: false,
         changed: true,
@@ -120,6 +123,7 @@ describe("backend switch 原子切换", () => {
         commitMarkerPath: string | null;
         configSha256: string;
       };
+      expect(result.configSha256).toBe(dryRunResult.configSha256);
       expect(await Bun.file(result.backupConfigPath).text()).toBe(current.initialText);
       expect(await Bun.file(result.receiptPath).json()).toMatchObject({
         status: "prepared",

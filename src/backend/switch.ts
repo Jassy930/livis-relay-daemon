@@ -155,7 +155,8 @@ function buildTargetConfig(
       requestTimeoutMs: DEFAULT_CODEX_REQUEST_TIMEOUT_MS,
       turnTimeoutMs: DEFAULT_CODEX_TURN_TIMEOUT_MS,
       shutdownTimeoutMs: DEFAULT_CODEX_SHUTDOWN_TIMEOUT_MS,
-      acknowledgeRemoteExecution: options.acknowledgeRemoteExecution,
+      // dry-run 与 apply 必须生成同一目标配置；flag 只授权写操作，不改变计划内容。
+      acknowledgeRemoteExecution: true,
     };
   }
   const text = `${JSON.stringify(root, null, 2)}\n`;

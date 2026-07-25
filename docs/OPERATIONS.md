@@ -635,8 +635,9 @@ bun run src/index.ts backend switch codex \
   --config /绝对路径/config.json
 ```
 
-计划报告不等于已可切换。按当前 backend 的停止顺序禁用自动拉起并停服；Hermes 模式先停止专用
-Gateway，再停止 Relay。确认两个 label/PID 均退出后执行：
+计划报告不等于已可切换，但其 `configSha256` 必须与相同输入的 apply 目标一致；
+acknowledgement 只授权写操作，不得改变目标配置。按当前 backend 的停止顺序禁用自动拉起并停服；
+Hermes 模式先停止专用 Gateway，再停止 Relay。确认两个 label/PID 均退出后执行：
 
 ```bash
 bun run src/index.ts backend switch codex \
