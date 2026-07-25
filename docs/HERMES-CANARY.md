@@ -75,8 +75,30 @@ compatibility 全部通过。
 已与 LiViS 完成握手，Hermes bridge `0.1.1` 已通过本地 connector 鉴权，`execution.ready` 与
 `connector.ready` 均为 `true`，且无 backend backlog 或 quarantined session。
 
-本次没有从 App 发送新的随机后缀消息，因此结论严格保持为：**服务与连接就绪，消息闭环未验证**。
+截至该次 2026-07-24 回执，没有从 App 发送新的随机后缀消息，因此结论严格保持为：
+**服务与连接就绪，消息闭环未验证**。
 旧 job 的 `Succeeded/Delivered` 只能说明历史执行结果，不能替代当前版本组合的消息 canary。
+
+### 2026-07-25 launchd 普通文本闭环回执
+
+在上述双 LaunchAgent 未重启、部署 checkout 仍固定为 `eea85c9` 的现场，操作者从 App
+重发唯一 canary `请只回复：Hermes 联调成功 0725-1147`。Relay 将其持久化为 job
+`20260725115349-f255bc14-61a6-4ace-8a7a-24f4bacb8c2b`，目标 backend 为 `hermes`。
+
+Hermes 专用 Gateway 日志只记录一次对应 inbound、一次 response ready 和一次 send：11:53:55
+收到消息，4.1 秒后生成纯文本 `Hermes 联调成功 0725-1147`。daemon 随后把同一 job
+结算为 `Succeeded`，durable outbox 在 11:53:59 到达 `Delivered` 并取得 Relay ACK；持久化
+结果与 Hermes 输出逐字一致。操作者随后在 App 端确认收到该纯文本回显。
+
+同一时段的二读状态继续显示 daemon `0.1.1`、Hermes runtime `0.15.1`、bridge `0.1.1`，
+Relay 已连接并完成握手，`execution.ready` 与 `connector.ready` 均为 `true`，无 backend
+backlog 或 quarantined session；supported proof 有效至 `2026-07-26T01:13:50.137Z`。
+上游还先释放并成功交付了此前排队的旧随机后缀 canary，但它不替代上述新 job 的关联证据。
+
+因此，`eea85c9`、protocol profile schema v2、`livis-relay-v1-access-only-r2`、
+`access-token-only`、Hermes runtime `0.15.1` 与 bridge `0.1.1` 这一精确组合已完成本轮
+launchd 普通文本闭环。该结论只覆盖本文定义的单设备、非流式纯文本路径，不扩大到附件、
+审批、远程管理命令、多设备或其他 backend。
 
 ## 升级后复验
 
