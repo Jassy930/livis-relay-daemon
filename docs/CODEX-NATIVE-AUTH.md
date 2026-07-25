@@ -243,7 +243,30 @@ LiViS 闭环证据；它不再表示代码禁止 `serve`。运行中的 status �
 `stateOwnership=local-state-opaque`、`touchedDesktopDaemon=false` 和
 `credentialStateInspected=false`。
 
-## 9. 下一验证门禁
+## 9. 2026-07-25 常驻切换回执
+
+已将本机常驻 execution backend 从 Hermes 切换为 Codex `native-current`，稳定 checkout
+固定在 `61a94e5`。这次回执只证明服务连接态，不代表 LiViS 消息闭环：
+
+- 切换前 Hermes Gateway 和 Relay 均已停止，完整 state 备份中 config/DB 摘要与 live
+  一致，备份数据库 `quick_check=ok`、schema v8；
+- `backend switch` 提交前再次确认全 scope 无非终态 backlog、无 account-bound Codex
+  session、无 quarantine；PREPARED 收据为 `credentialsReadOrMigrated=false`；
+- live config 与 COMMITTED marker 的 SHA-256 同为
+  `3090fe9b70f6949c944c6029ddd78f8d37d46516e92f2d44ff53bf4db82b911e`；
+- 停服 `doctor --online` 的 config/profile/backend/acknowledgement/native initialize/SQLite/
+  quarantine/backlog/upstream 检查全部通过；CLI 与 app-server 均为 `0.145.0`；
+- 启动后只有 Relay LaunchAgent 常驻，Hermes Gateway 保持未加载。LiViS 已完成握手，
+  execution 显示 `kind=codex`、`mode=native-current`、`ready=true`、
+  `stateOwnership=local-state-opaque`、`touchedDesktopDaemon=false`、
+  `credentialStateInspected=false`；
+- SQLite 中 native session 账号类型与主体摘要均为 `NULL`，当前无 backlog/quarantine。
+
+尚未从 LiViS App 发送本次版本的唯一文本 canary，因此能力继续保持
+`operator-only`。Hermes connector 在 Codex 模式为 `null/ready=false` 是预期状态，不得因此
+启动 Hermes Gateway。
+
+## 10. 下一验证门禁
 
 在 `codex_native_auth_reuse` 从 `operator-only` 升级为真实 canary 证据前，还必须完成：
 
