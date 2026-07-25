@@ -147,7 +147,7 @@ describe("配置与协议 profile", () => {
       .toThrow(`不能低于 daemon 安全下限 ${MINIMUM_SAFE_BRIDGE_VERSION}`);
   });
 
-  test("旧配置默认使用 Hermes，三选一配置明确且 Codex 使用固定版本窗", () => {
+  test("旧配置默认使用 Hermes，Codex 模式必须显式且互不回退", () => {
     const config = testConfig("/tmp/test-state");
     const legacy = structuredClone(config) as unknown as Record<string, unknown>;
     delete legacy.execution;
@@ -163,6 +163,7 @@ describe("配置与协议 profile", () => {
       ...config,
       execution: { backend: "codex" },
       codex: {
+        mode: "private-api-key",
         command: "/opt/homebrew/bin/codex",
         toolchainReadRoots: ["/opt/homebrew/bin"],
         model: "gpt-5.6-sol",
@@ -180,6 +181,7 @@ describe("配置与协议 profile", () => {
     }), "/tmp/config.json");
     expect(codex.execution.backend).toBe("codex");
     expect(codex.codex).toEqual({
+      mode: "private-api-key",
       command: "/opt/homebrew/bin/codex",
       toolchainReadRoots: ["/opt/homebrew/bin"],
       model: "gpt-5.6-sol",
@@ -194,6 +196,47 @@ describe("配置与协议 profile", () => {
       shutdownTimeoutMs: 4_000,
       acknowledgeRemoteExecution: true,
     });
+
+    const native = parseRelayConfig(JSON.stringify({
+      ...config,
+      execution: { backend: "codex" },
+      codex: {
+        mode: "native-current",
+        command: "/opt/homebrew/bin/codex",
+        acknowledgeRemoteExecution: true,
+      },
+    }), "/tmp/config.json");
+    expect(native.codex).toMatchObject({
+      mode: "native-current",
+      command: "/opt/homebrew/bin/codex",
+      model: null,
+      provider: { type: "openai" },
+      toolchainReadRoots: [],
+    });
+    expect(() => parseRelayConfig(JSON.stringify({
+      ...config,
+      execution: { backend: "codex" },
+      codex: {
+        command: "/opt/homebrew/bin/codex",
+        acknowledgeRemoteExecution: true,
+      },
+    }), "/tmp/config.json")).toThrow("必须显式设置 config.codex.mode");
+    for (const forbidden of [
+      { provider: { type: "openai" } },
+      { model: "gpt-5.6-sol" },
+      { toolchainReadRoots: ["/opt/homebrew/bin"] },
+    ]) {
+      expect(() => parseRelayConfig(JSON.stringify({
+        ...config,
+        execution: { backend: "codex" },
+        codex: {
+          mode: "native-current",
+          command: "/opt/homebrew/bin/codex",
+          acknowledgeRemoteExecution: true,
+          ...forbidden,
+        },
+      }), "/tmp/config.json")).toThrow("不得配置 provider、model 或 toolchainReadRoots");
+    }
 
     const claude = parseRelayConfig(JSON.stringify({
       ...config,

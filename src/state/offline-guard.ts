@@ -214,7 +214,8 @@ interface OfflineGuardDocument {
   operation:
     | "protocol-profile-migration"
     | "protocol-profile-migration-rollback"
-    | "session-release";
+    | "session-release"
+    | "backend-switch";
   pid: number;
   acquiredAt: string;
   nonce: string;
@@ -230,6 +231,7 @@ function parseOfflineGuard(text: string, path: string): OfflineGuardDocument {
       "protocol-profile-migration",
       "protocol-profile-migration-rollback",
       "session-release",
+      "backend-switch",
     ].includes(operation) ||
     typeof root.acquiredAt !== "string"
   ) {
@@ -332,7 +334,8 @@ export type ProfileOperation =
   | "serve-start"
   | "upstream-check"
   | "upstream-activate"
-  | "upstream-rollback";
+  | "upstream-rollback"
+  | "backend-switch";
 
 export class ProfileOperationGuardBusyError extends Error {
   constructor(readonly path: string) {
@@ -458,6 +461,7 @@ function parseProfileOperationGuard(text: string, path: string): ProfileOperatio
       "upstream-check",
       "upstream-activate",
       "upstream-rollback",
+      "backend-switch",
     ].includes(operation) ||
     typeof root.acquiredAt !== "string"
   ) {

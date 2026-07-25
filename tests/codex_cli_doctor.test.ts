@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, writeFile } from "node:fs/promises";
+import { chmod, mkdir, realpath, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { IdentityStore } from "../src/identity.ts";
 import { SecretStore } from "../src/secrets.ts";
@@ -10,6 +10,110 @@ import { incomingJob, temporaryDirectory, testConfig, testProfile } from "./help
 const PROJECT_ROOT = resolve(import.meta.dir, "..");
 
 describe("Codex doctor 启动前安全门禁", () => {
+  test("native-current 以 initialize 握手裁决兼容性，不受固定版本窗阻断", async () => {
+    const state = await temporaryDirectory("livis-codex-native-doctor-state-");
+    const external = await temporaryDirectory("livis-codex-native-doctor-command-");
+    const nativeHome = await temporaryDirectory("livis-codex-native-doctor-home-");
+    try {
+      await chmod(state.path, 0o700);
+      const profile = await testProfile();
+      const profileText = `${JSON.stringify(profile, null, 2)}\n`;
+      const profilePath = join(state.path, "protocol-profiles", "active.json");
+      await atomicWritePrivate(profilePath, profileText);
+      await new SecretStore(state.path).initialize();
+      await new IdentityStore(state.path, profile).initialize();
+      const canonicalNativeHome = await realpath(nativeHome.path);
+      const codexHome = join(canonicalNativeHome, ".codex");
+      await mkdir(codexHome, { mode: 0o700 });
+      const command = join(external.path, "codex");
+      await writeFile(command, [
+        "#!/bin/sh",
+        "if [ \"$1\" = \"--version\" ]; then",
+        "  printf 'codex-cli 99.0.0\\n'",
+        "  exit 0",
+        "fi",
+        "if [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"--stdio\" ]; then",
+        "  IFS= read -r request || exit 1",
+        `  printf '%s\\n' '${JSON.stringify({
+          id: 1,
+          result: {
+            codexHome,
+            userAgent: "livis-relay-native-stdio-probe/0.1.0 (fake)",
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        })}'`,
+        "  IFS= read -r initialized || exit 0",
+        "  while IFS= read -r message; do :; done",
+        "  exit 0",
+        "fi",
+        "exit 2",
+        "",
+      ].join("\n"), { mode: 0o700 });
+
+      const base = testConfig(state.path);
+      const configPath = join(state.path, "config.json");
+      await atomicWritePrivate(configPath, `${JSON.stringify({
+        ...base,
+        profile: profilePath,
+        profileSha256: sha256(profileText),
+        execution: { backend: "codex" },
+        codex: {
+          mode: "native-current",
+          command,
+          requestTimeoutMs: 1_000,
+          turnTimeoutMs: 2_000,
+          shutdownTimeoutMs: 1_000,
+          acknowledgeRemoteExecution: true,
+        },
+      }, null, 2)}\n`);
+
+      const child = Bun.spawn([
+        process.execPath,
+        "run",
+        "src/index.ts",
+        "doctor",
+        "--config",
+        configPath,
+      ], {
+        cwd: PROJECT_ROOT,
+        env: {
+          ...process.env,
+          HOME: canonicalNativeHome,
+          CODEX_HOME: codexHome,
+          LIVIS_RELAY_CONFIG: undefined,
+          LIVIS_RELAY_STATE_DIR: undefined,
+        },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ]);
+      expect(exitCode).toBe(1);
+      expect(stderr).toBe("");
+      const report = JSON.parse(stdout) as {
+        checks: Array<{ name: string; ok: boolean; detail: string }>;
+      };
+      const native = report.checks.find((check) => check.name === "codex_native_app_server");
+      expect(native).toMatchObject({ ok: true });
+      expect(JSON.parse(native!.detail)).toMatchObject({
+        compatibilityBasis: "protocol-handshake",
+        versionRelation: "different",
+        cliVersion: "99.0.0",
+        appServerVersion: "0.1.0",
+        touchedDesktopDaemon: false,
+        sentModelTurn: false,
+      });
+      expect(report.checks.some((check) => check.name === "codex_version")).toBeFalse();
+    } finally {
+      await Promise.all([state.cleanup(), external.cleanup(), nativeHome.cleanup()]);
+    }
+  });
+
   test("stateDir 内的 Codex command 在执行前被拒绝", async () => {
     const state = await temporaryDirectory("livis-codex-doctor-state-");
     const external = await temporaryDirectory("livis-codex-doctor-external-");

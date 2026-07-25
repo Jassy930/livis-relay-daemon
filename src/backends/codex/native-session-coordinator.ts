@@ -152,10 +152,10 @@ function sameReceiptMetadata(
 }
 
 /**
- * 组合持久 session、client epoch、thread policy/checkpoint 与执行生命周期的离线原型。
+ * 组合持久 session、client epoch、thread policy/checkpoint 与执行生命周期。
  *
  * 本类只接收上层已经建立的 stdio app-server client，不连接真实 Desktop daemon，
- * 也不读取或分类本地 backend 状态。生产 serve 仍不得导入本文件。
+ * 也不读取或分类本地 backend 状态。只有显式 `native-current` adapter 可以把它接入 serve。
  */
 export class CodexNativeSessionCoordinator {
   readonly kind = "codex" as const;
@@ -298,7 +298,7 @@ export class CodexNativeSessionCoordinator {
         kind: "codex",
         executionId,
         implementation: {
-          name: "codex-native-session-coordinator-prototype",
+          name: "codex-native-session-coordinator",
           version: options.cliVersion,
           stateOwnership: "local-state-opaque",
           effectiveModel: threadReceipt.effectiveModel,
@@ -359,7 +359,7 @@ export class CodexNativeSessionCoordinator {
 
   status(): Record<string, unknown> {
     return {
-      implementation: "codex-native-session-coordinator-prototype",
+      implementation: "codex-native-session-coordinator",
       ready: this.ready,
       sessionKey: this.options.sessionKey,
       threadId: this.threadReceipt.threadId,

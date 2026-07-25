@@ -17,7 +17,7 @@
     "codexCli": ">=0.145.0,<0.146.0",
     "livisReferenceClient": "2.0.0",
     "livisProtocolStatus": "observed-not-publicly-versioned",
-    "lastReviewed": "2026-07-24"
+    "lastReviewed": "2026-07-25"
   },
   "topology": {
     "relayStateOwner": "livis-relayd",
@@ -102,10 +102,10 @@
     {
       "id": "codex_native_auth_reuse",
       "direction": "local",
-      "status": "unsupported",
+      "status": "operator-only",
       "evidenceRefs": ["docs/LOCAL-BACKENDS.md", "docs/CODEX-NATIVE-AUTH.md"],
-      "testRefs": ["tests/auth_boundary.test.ts", "tests/local_backend_contract.test.ts", "tests/codex_native_stdio.test.ts", "tests/codex_native_client_epoch.test.ts", "tests/codex_native_execution_lifecycle.test.ts", "tests/codex_native_thread_policy.test.ts", "tests/codex_native_session_coordinator.test.ts", "tests/codex_native_session_harness.test.ts"],
-      "notes": "原生当前状态主路径已改为 Relay 自管的 codex app-server --stdio 子进程：只透传 HOME/CODEX_HOME 等 runtime 选择器，不读取、复制、分类或刷新账号凭据，也不连接 Desktop control socket。2026-07-24 真实 transport-only Gate 已在 CLI/app-server 0.145.0 完成 initialize 并确认自有进程收口；前后 Desktop app-server 仍为 PID 72289 / 0.144.1。client epoch fencing、执行 lifecycle、thread policy/checkpoint、持久 session coordinator 与组合 harness 已切到 stdio fake transport。已知 framing 错误的 daemon proxy attach 实现和 CLI 已移除，只在文档保留迁移记录。原型尚未接入 serve，真实 thread/turn、session resume 与 Desktop 并发 canary 未闭合，因此保持 unsupported。"
+      "testRefs": ["tests/auth_boundary.test.ts", "tests/local_backend_contract.test.ts", "tests/codex_native_stdio.test.ts", "tests/codex_native_client_epoch.test.ts", "tests/codex_native_execution_lifecycle.test.ts", "tests/codex_native_thread_policy.test.ts", "tests/codex_native_session_coordinator.test.ts", "tests/codex_native_session_harness.test.ts", "tests/codex_native_execution_backend.test.ts", "tests/backend_switch.test.ts"],
+      "notes": "显式 codex.mode=native-current 可由操作者接入 Relay 自管的 codex app-server --stdio 子进程；只透传 HOME/CODEX_HOME 等 runtime 选择器，不读取、复制、分类或刷新账号凭据，也不连接 Desktop daemon。兼容性由 initialize 协议握手裁决，不以固定 CLI 版本窗阻断。生产接线、原子 backend switch 与离线门禁已有自动化证据；真实 LiViS thread/turn、session resume 与 Desktop 并发 canary 尚未闭合，因此仅为 operator-only。旧 private-api-key 路径必须显式选择且不会被静默 fallback。"
     },
     {
       "id": "claude_execution",
@@ -181,6 +181,7 @@
       "upstream rollback",
       "profile migrate-v2",
       "profile rollback-migration",
+      "backend switch",
       "session release",
       "codex smoke-app-server",
       "codex probe-native-app-server",
@@ -196,7 +197,8 @@
       "init --acknowledge-unofficial-protocol",
       "upstream activate --acknowledge-reviewed-profile",
       "upstream rollback --acknowledge-rollback",
-      "install-hermes-plugin rollback --acknowledge-rollback"
+      "install-hermes-plugin rollback --acknowledge-rollback",
+      "backend switch --apply --acknowledge-daemon-stopped --acknowledge-remote-execution"
     ]
   },
   "network": {
@@ -234,6 +236,12 @@
       "path": "<stateDir>/backends/codex/home",
       "mode": "0700",
       "contains": ["Codex API key authentication state", "Codex thread and rollout state"],
+      "retention": "operator-managed"
+    },
+    {
+      "path": "<stateDir>/backends/codex/native-sessions",
+      "mode": "0700",
+      "contains": ["Codex opaque thread id", "workspace files", "session checkpoint metadata"],
       "retention": "operator-managed"
     }
   ],

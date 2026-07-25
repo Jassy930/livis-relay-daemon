@@ -35,9 +35,11 @@ bun run src/index.ts init \
 - `execution.backend` 缺省为 `hermes`，只能取 `hermes | codex | claude`，一套 daemon
   同时只启用一个；不要仅因为配置中存在 `codex` 段就认为已经启用。
 - Hermes 模式不扩大 runtime/bridge 审核范围，除非已按升级 runbook 验证。
-- Codex 模式必须保持唯一 node allowlist、CLI `[0.145.0, 0.146.0)` 版本窗，并在审阅
-  [Codex app-server 执行后端](CODEX-APPSERVER.md)后显式设置
-  `codex.acknowledgeRemoteExecution=true`。Claude Code 目前只有配置枚举边界，选择
+- Codex 模式必须保持唯一 node allowlist、显式设置
+  `codex.mode=native-current | private-api-key` 和 `codex.acknowledgeRemoteExecution=true`。
+  `native-current` 由 initialize 协议握手裁决兼容性；`private-api-key` 才使用
+  `[0.145.0, 0.146.0)` 版本窗与专用 CODEX_HOME。两个模式不会自动 fallback。Claude Code
+  目前只有配置枚举边界，选择
   `claude` 时 `doctor` 和 `serve` 都会明确失败，不会回退到其他 backend。
 
 一期暂将 `node_id` 视为设备来源标识，一套 daemon、config、state directory 和所选 backend 只支持该一个设备。配置解析器接受数组是格式兼容，不代表支持多设备；Codex 模式还会在代码级拒绝 `allowAllNodes=true` 或非单元素 allowlist，并把唯一 node ID 纳入 immutable session hash。不得通过追加第二个 ID、开启 `allowAllNodes` 或直接替换原 ID 来接入另一设备；原地换设备会拒绝复用旧 Codex thread。设备更换、跨设备会话和旧状态迁移均需另行设计与验收。
@@ -294,7 +296,7 @@ gateway:
 
 该目录不是 wheel，也不能直接通过 monorepo 根执行 `hermes plugins install owner/repo`；开发、升级和卸载边界见 [`hermes-plugin/README.md`](../hermes-plugin/README.md)。
 
-### 6.2 登录并启用 Codex app-server
+### 6.2 登录并启用 Codex private-api-key app-server
 
 Codex 是 daemon 内部子进程，不安装 Hermes plugin，也不启动 Hermes Gateway。先确认
 CLI 版本位于 `[0.145.0, 0.146.0)`，并记录绝对路径：
@@ -351,6 +353,7 @@ provider 依赖 OpenAI 认证。生产门禁要求 `account.type` 精确为 `api
     "backend": "codex"
   },
   "codex": {
+    "mode": "private-api-key",
     "command": "/绝对路径/codex",
     "toolchainReadRoots": [],
     "model": null,
@@ -381,6 +384,7 @@ HTTPS URL 和复合数据出口确认：
     "backend": "codex"
   },
   "codex": {
+    "mode": "private-api-key",
     "command": "/绝对路径/codex",
     "toolchainReadRoots": ["/绝对/只读/工具链/bin"],
     "model": "已审核的模型 ID",
@@ -605,6 +609,83 @@ macOS 系统 `/usr/bin/nc -O` 的 stdout/stderr 与目标端点严格匹配，�
 缺失都按无法裁决失败。该命令不登录、不发送模型 turn，也不等于
 真实 LiViS 功能闭环；用完后确认输出路径再删除。
 
+### 6.3 使用本机当前 Codex runtime
+
+`native-current` 不执行 Codex login/logout/status，不读取账号文件，也不把本地错误预分类成认证错误。
+开始前只固定 CLI 绝对路径，并在不发送模型 turn 的情况下探测 stdio initialize：
+
+```bash
+command -v codex
+bun run src/index.ts codex probe-native-app-server \
+  --command /绝对路径/codex \
+  --state-dir /绝对路径/已有私有状态目录
+```
+
+版本只用于观测；CLI 与 app-server 小版本不同不会单独阻断，真实 initialize 和响应结构才裁决
+readiness。探针不连接 Codex Desktop daemon，输出必须包含 `touchedDesktopDaemon=false`、
+`sentModelTurn=false` 和 `probeProcessClosed=true`。
+
+切换常驻 backend 前先从当前服务读取 `status`，确认无 backend backlog/quarantine，再完整备份
+state directory（包括 config、数据库及 WAL/SHM）。先执行零写入计划：
+
+```bash
+bun run src/index.ts backend switch codex \
+  --mode native-current \
+  --command /绝对路径/codex \
+  --config /绝对路径/config.json
+```
+
+计划报告不等于已可切换。按当前 backend 的停止顺序禁用自动拉起并停服；Hermes 模式先停止专用
+Gateway，再停止 Relay。确认两个 label/PID 均退出后执行：
+
+```bash
+bun run src/index.ts backend switch codex \
+  --mode native-current \
+  --command /绝对路径/codex \
+  --apply \
+  --acknowledge-daemon-stopped \
+  --acknowledge-remote-execution \
+  --config /绝对路径/config.json
+```
+
+命令要求 JobStore v8，并跨全部 scope 拒绝非终态 backlog、account-bound Codex session 和
+quarantine；它只备份和原子替换 Relay config，不读取、复制或迁移 Codex 凭据。输出中的
+`PREPARED` 收据必须写明 `credentialsReadOrMigrated=false`；完成以 live config SHA 与
+`targetConfigSha256` 相等为准，`CONFIG_COMMITTED` marker 是额外回执。若 durable commit 状态不确定，
+offline/profile guard 会保留，必须按收据和备份人工恢复，不得直接删除 guard 或启动服务。
+
+配置提交后在 daemon 仍停止时运行：
+
+```bash
+bun run src/index.ts doctor --online --config /绝对路径/config.json
+```
+
+native doctor 只完成自有 app-server initialize 后收口，不调用账号接口、不创建 thread、不发送模型
+turn。通过后只启动 `livis-relayd`，不要启动 Hermes Gateway，也不要另起第二个 app-server。`status`
+应至少显示：
+
+- `execution.kind=codex`、`execution.mode=native-current`、`execution.ready=true`；
+- `execution.stateOwnership=local-state-opaque`；
+- `execution.touchedDesktopDaemon=false`、`credentialStateInspected=false`；
+- `execution.harness.coordinator.threadId` 非空；
+- backend backlog 与 quarantine 均为空。
+
+这些只证明服务连接态。随后由操作者从 LiViS App 发送唯一随机文本 canary；必须核对同一 job 的
+`Succeeded`、outbox `Delivered` 和 App 唯一回显，才能记录消息闭环。Codex 本地若是未登录、过期或
+provider 错误，任务只按普通 backend failed 结算；Relay 不修复、不登录、不改配置，也不切回
+`private-api-key` 或 Hermes。
+
+切回 Hermes 时先停止 Relay，完整备份 state，再执行：
+
+```bash
+bun run src/index.ts backend switch hermes \
+  --apply \
+  --acknowledge-daemon-stopped \
+  --config /绝对路径/config.json
+```
+
+`doctor --online` 通过后按 Relay → 专用 Hermes Gateway 顺序启动。
+
 ## 7. 启动顺序
 
 Hermes 模式：先启动 `livis-relayd`，再启动专用 Hermes Gateway。Codex 模式只启动
@@ -617,7 +698,7 @@ bun run src/index.ts status
 bun run src/index.ts doctor --online
 ```
 
-Codex 模式的稳定就绪状态必须显示 `daemon.execution.kind=codex`、
+Codex `private-api-key` 模式的稳定就绪状态必须显示 `daemon.execution.kind=codex`、
 `daemon.execution.state=running`、`daemon.execution.ready=true`、稳定 thread ID 和位于
 state directory 内的 workspace；同时读回账号/模型字段
 `accountType/accountIdentityStrength/requestedModel/effectiveModel/modelProvider`、
@@ -626,6 +707,9 @@ state directory 内的 workspace；同时读回账号/模型字段
 daemon 生命周期累计已消费次数，`maxAttempts` 固定为 3。Hermes 模式则要求 connector
 ready。
 无论哪种模式，服务在线都不等于消息闭环。
+
+Codex `native-current` 的就绪字段和人工 canary 门禁见第 6.3 节；该模式的账号字段必须保持
+不透明，不能要求或记录 `accountType/accountIdentityStrength`。
 
 idle app-server 意外退出且内存/SQLite 都无 active、无 recovery/quarantine、Store anchor
 未漂移时，`state` 会暂时变为 `recovering`、`ready=false`，并按
@@ -1521,17 +1605,19 @@ Codex 账号/模型/安全摘要和 thread-tail checkpoint；v7 以 trigger 强�
    `targetBackend`/状态符合预期后，可从 config 删除一次性 `legacyV4JobBackend`；该字段
    不是 provider 切换命令。
 6. 若准备切换 backend，先继续使用原 backend，直到它不再有
-   `Received/Acked/Dispatching/Running/Cancelling` job，再停服修改配置。用目标 backend
+   `Received/Acked/Dispatching/Running/Cancelling` job，再按第 6.3 节停服并使用
+   `backend switch`；不要手工覆盖 config。CLI 会跨全部 scope 重查 backlog，并对
+   `native-current` 额外拒绝 account-bound Codex session 与 quarantine。提交后用目标 backend
    运行 `doctor`，确认 `execution_backend_backlog` 通过后才允许 `serve`。`serve` 会在启动
-   execution backend 或 Relay 前重复同一门禁，不能靠直接编辑 SQLite 或填写
+   execution backend 或 Relay 前重复 backlog 门禁，不能靠直接编辑 SQLite 或填写
    `legacyV4JobBackend` 绕过。
 
 `status.backendBacklog` 只统计非终态。`Succeeded/Failed/Cancelled/Rejected/Interrupted/`
 `CancelUnknown` 历史不会阻止切换；它们的账本和 job 归属仍保留，尚未 `Delivered` 的
 outbox 则由独立 Relay 投递状态机继续处理，不会交给新 provider 重跑。
 
-本节的“backend 切换”只指 `hermes | codex | claude`。Codex 内部的 OpenAI/custom model
-provider 不受 `execution_backend_backlog` 完整保护：job 行当前只保存
+当前 `backend switch` CLI 只支持已实现的 `hermes | codex`，`claude` 继续失败关闭。Codex
+`private-api-key` 内部的 OpenAI/custom model provider 不受 `execution_backend_backlog` 完整保护：job 行当前只保存
 `target_backend=codex`。因此不得在同一 `stateDir` 修改 `codex.provider`，也不得用
 `session release`、清空 backlog 或 `legacyV4JobBackend` 绕过；provider/key 变更必须按
 第 6.2 节新建完整 state。

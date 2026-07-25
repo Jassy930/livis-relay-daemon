@@ -1,7 +1,9 @@
 # Codex app-server 执行后端
 
-本文定义 daemon 内置 Codex 执行后端的配置、状态所有权、运行目录和上线门禁。
+本文定义 daemon 内置 Codex `private-api-key` 兼容执行后端的配置、状态所有权、运行目录和上线门禁。
 它不改变 LiViS wire 协议边界，也不把 Codex 伪装成 Hermes connector。
+复用本机当前 runtime 的路径见[Codex 原生当前状态边界](CODEX-NATIVE-AUTH.md)；两种模式必须
+显式选择且不会自动 fallback。
 
 Codex 当前是显式选择的实验后端；默认执行后端仍是 Hermes。配置枚举固定为
 `hermes | codex | claude` 且一套 daemon 同时只选一个。Claude Code 尚未实现；选择
@@ -45,6 +47,7 @@ Codex 当前是显式选择的实验后端；默认执行后端仍是 Hermes。�
     "backend": "codex"
   },
   "codex": {
+    "mode": "private-api-key",
     "command": "/绝对路径/codex",
     "toolchainReadRoots": [],
     "model": null,
@@ -81,6 +84,7 @@ custom provider 必须同时指定模型、HTTPS `baseUrl` 与复合确认：
     "backend": "codex"
   },
   "codex": {
+    "mode": "private-api-key",
     "command": "/绝对路径/codex",
     "toolchainReadRoots": ["/绝对/只读/工具链/bin"],
     "model": "已审核的模型 ID",
@@ -337,7 +341,7 @@ JobStore schema v4 新增可变的 `backend_sessions`；schema v5 在 job 首次
 请求/实际 model、model provider、安全配置 SHA、feature 快照 SHA 和稳定 thread-tail
 checkpoint。schema v7 以 SQLite trigger 强制 `jobs.target_backend` 不可变，并新增
 `execution_attempt_events` append-only 账本；当前 schema v8 又增加显式状态所有权。既有
-私有 CODEX_HOME 路径为 `account-bound`，本地当前状态原型为 `local-state-opaque` 且账号字段
+私有 CODEX_HOME 路径为 `account-bound`，本地当前状态路径为 `local-state-opaque` 且账号字段
 保持 `NULL`。状态职责为：
 
 - `jobs/outbox` 是状态裁决与结果投递真源；

@@ -106,8 +106,8 @@ async function preflightRequest(
 }
 
 /**
- * 只供 fake/offline 证明逐 thread 安全边界；尚未接入 native attach 或生产 serve。
- * 调用会创建或恢复 thread，因此真实端点只能在另行授权 canary 中使用。
+ * 固定逐 thread 安全边界。调用会创建或恢复 thread，因此真实端点只能由显式
+ * `native-current` adapter 在操作者授权的 serve/canary 中使用。
  */
 export async function prepareCodexNativeThread(
   client: CodexNativeExecutionClient,

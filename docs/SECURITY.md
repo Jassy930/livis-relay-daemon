@@ -21,29 +21,36 @@
   一套 daemon 同时只启用一个。`claude` 尚未实现，`doctor` 与 `serve` 均失败关闭，
   不会静默回退。切换为 `codex` 时，代码会拒绝
   `allowAllNodes=true` 或不等于一个元素的 `allowedNodeIds`，并且还必须显式设置
-  `codex.acknowledgeRemoteExecution=true`。
+  `codex.mode=native-current | private-api-key` 与 `codex.acknowledgeRemoteExecution=true`。
+  缺少 mode 或任一模式失败都不会静默回退到另一模式。
 - `LIVIS_ALLOW_ALL_USERS` 必须为空/false；`LIVIS_ALLOWED_USERS` 必须只包含与 daemon 完全相同的唯一 `node_id`，`*` 和多个值都不属于一期受支持配置。
 - `LIVIS_PHASE1_READ_ONLY_ACK=true` 只在专用 Hermes profile 已关闭写工具后设置。
 - `LIVIS_HOME_CHANNEL` 必须由本地从当前 state directory 的 `identity.json.agentId` 构造为精确的 `livis:<agent_id>`；禁止通过远程 `/sethome` 写入或改变它。
 - 专用 Hermes profile 的 `gateway_restart_notification` 必须为 `false`，避免向没有 active job/lease 的 LiViS channel 主动发送启停通知。
 - Hermes streaming、tool progress、interim message、附件和远程审批全部关闭。
 - Hermes runtime 审核范围默认是 `[0.15.1, 0.15.2)`；带远程输入门禁的 bridge 范围是 `[0.1.1, 0.2.0)`，旧 `0.1.0` 必须拒绝。
-- Codex CLI 审核范围固定为 `[0.145.0, 0.146.0)`；必须使用 daemon state
-  directory 内通过标准输入单独写入 API key 的 `CODEX_HOME`，不得复用 `~/.codex`。
-  生产 backend 只接受 `account.type=apiKey`；OAuth/ChatGPT、Bedrock、空账号和未知类型
-  都必须在 permission profile、thread 与 turn RPC 前失败关闭。每次 dispatch 都必须在
-  `turn/start` 前重新回读账号并与内存/SQLite 锚点核对，运行中认证模式漂移同样失败关闭。
-- Codex provider 只允许精确 `{type:"openai"}`，或带 HTTPS `baseUrl` 与
+- `codex.mode=native-current` 只把本机 HOME/CODEX_HOME 当作 Codex runtime 选择器，Relay
+  不打开其账号文件、不调用账号接口、不分类认证错误，也不把状态复制进 state directory。
+  CLI/app-server 版本只观测为有界 semver，兼容性由真实 initialize 与 thread policy 回读裁决；
+  本地错误按普通 failed 结算。该模式不接受 `provider`、`model` 或 `toolchainReadRoots` 配置。
+- `codex.mode=private-api-key` 的 CLI 审核范围固定为 `[0.145.0, 0.146.0)`；必须使用 daemon
+  state directory 内通过标准输入单独写入 API key 的 `CODEX_HOME`，不得复用 `~/.codex`。
+  该模式只接受 `account.type=apiKey`；OAuth/ChatGPT、Bedrock、空账号和未知类型都必须在
+  permission profile、thread 与 turn RPC 前失败关闭。每次 dispatch 都必须在 `turn/start` 前
+  重新回读账号并与内存/SQLite 锚点核对，运行中认证模式漂移同样失败关闭。
+- `private-api-key` 的 Codex provider 只允许精确 `{type:"openai"}`，或带 HTTPS `baseUrl` 与
   `acknowledgeApiKeyTransmission=true` 的 custom Responses provider。该确认同时覆盖 API key、
   prompt、会话上下文和工具结果。custom URL 禁止 userinfo、query、fragment；首期禁止
   `env_key`、`experimental_bearer_token`、static/env headers、query 参数和 command-backed
   auth，request/SSE retry 固定为 `0`，WebSocket 固定关闭。未知字段失败关闭。
-- `forced_login_method="api"` 与运行态 `account.type=apiKey` 是两道独立门禁。API key 只由
+- `private-api-key` 中的 `forced_login_method="api"` 与运行态 `account.type=apiKey` 是两道独立门禁。API key 只由
   专用 `CODEX_HOME` 的文件凭据存储管理，不得进入 argv、环境变量、relay JSON/TOML、日志、
   SQLite、workspace 或 agent 环境；发送给选定 provider 是其唯一获准网络用途。
-- provider 选择、custom URL 与固定重试策略进入安全摘要，但 API key 不进入，且当前
+- `private-api-key` 的 provider 选择、custom URL 与固定重试策略进入安全摘要，但 API key 不进入，且当前
   `jobs.target_backend` 只绑定 `codex`。同一 state directory 禁止 provider 切换、endpoint
   变更或 key 轮换；只能创建全新 state/CODEX_HOME。`session release` 不是切换工具。
+  从该模式切到 `native-current` 必须使用停服 `backend switch`，并拒绝任何 account-bound
+  Codex session、非终态 backlog 或 quarantine；命令不会读取或迁移凭据。
 - 未知版本、哈希、wire protocol 或运行契约变化 fail closed。
 - job 在首次入库事务内持久绑定 `target_backend`；schema v8 的 SQLite trigger 会拒绝
   任何后续改写，积压 job 不会跟随后来配置切换。`serve` 在启动 backend 或 Relay 前
@@ -87,7 +94,7 @@ daemon 0.1.1 内建 bridge 0.1.1 安全下限。配置中的 `hermes.bridgeMinim
 
 - state directory：`0700`。
 - connector socket、配置、身份、secret、proof、candidate 与审批回执：`0600`。
-- Codex 的 `<stateDir>/backends/codex/home`、sessions、session root、workspace、
+- `private-api-key` 的 `<stateDir>/backends/codex/home`、sessions、session root、workspace、
   workspace 外的宿主 HOME/TMPDIR 与 workspace 内的 agent HOME/TMPDIR 逐层要求
   `0700` 且不能是 symlink，并校验 realpath 与 dev/ino；daemon 固定的
   `config.toml` 为 `0600`。登录凭据由专用 Codex CLI 管理，仍受外层 `0700`
@@ -95,6 +102,10 @@ daemon 0.1.1 内建 bridge 0.1.1 安全下限。配置中的 `hermes.bridgeMinim
   bundled `.system` skills；Codex 0.145.0 仍会自行生成 SQLite/WAL/SHM、installation
   ID 等 `0755` 子目录或 `0644` 文件。它们依赖父目录 `0700` 隔离，不能把 daemon
   自管目录/文件的 `0700/0600` 保证外推到所有上游产物。
+- `native-current` 的工具目录固定为
+  `<stateDir>/backends/codex/native-sessions/<sessionHash>/workspace`，逐层由 Relay 建立为
+  `0700`。用户 HOME/CODEX_HOME 保持 Codex 所有，Relay 只校验选择器不位于 state directory，
+  不读取、复制、chmod 或备份其内容。
 - schema v1→v2 迁移和 supported-proof writer 新建的私有目录会在 fsync 前显式固定并精确读回 `0700`；若上次进程在 `mkdir` 与固定权限之间退出，重试会受控修复只缺 owner 权限的已有目录。durable 临时文件与两类 guard 会在各自创建 fd 上显式固定并精确读回 `0600` 后才写入、同步或 rename。不能只依赖 `mkdir` / `open` 的 mode 参数，因为进程 umask 仍可能移除 owner 权限。
 - `config.connector.socketPath` 的父目录必须是 state directory 内的私有非 symlink 目录；profile 迁移会在该路径创建并持久化普通文件 guard。创建 fd 会保持打开到安全 release，以固定原 inode，并与当前路径交叉复核 dev/inode、link count、文件类型、权限和 nonce；父目录的类型、私有权限与 realpath 也会在每次所有权检查和 release 完成前重验。位于 `/tmp` 等共享目录或 state directory 外的 socket 不属于迁移支持边界。
 - connector 使用至少 32 字节随机 Bearer token，并做常量时间比较。
@@ -107,7 +118,7 @@ daemon 0.1.1 内建 bridge 0.1.1 安全下限。配置中的 `hermes.bridgeMinim
 
 ## Codex 工具沙箱
 
-Codex backend 只通过 `--strict-config --stdio` 启动，并禁用 plugins、remote plugin、
+`private-api-key` 只通过 `--strict-config --stdio` 启动，并禁用 plugins、remote plugin、
 apps、shell snapshot、hooks、image generation、goals、memories、skill 依赖安装和
 multi-agent；配置同时关闭 agents、bundled skills 与自动 skill instructions。daemon
 通过 `experimentalFeature/list` 回读精确的已审核 enabled allowlist；未知 enabled、重复
@@ -115,6 +126,12 @@ multi-agent；配置同时关闭 agents、bundled skills 与自动 skill instruc
 完整排序快照的 SHA-256 会绑定到 backend session。`shell_snapshot` 会在宿主权限下
 source runtime HOME 的 shell rc，hooks 也可直接启动宿主命令；两者不能只依赖 turn
 sandbox。
+
+`native-current` 启动独立 `app-server --stdio`，在 argv 中完整注入 `livis-native-stdio`
+permission profile并关闭同一组未经审核 feature；它不写用户 config。子进程环境使用白名单，
+只传 HOME/CODEX_HOME runtime 选择器、清洗后的 PATH/TMPDIR 与 locale/terminal 设置，daemon
+环境中的其他 token 不下传。thread 回读要求 `livis-native-stdio`、workspace-only roots、
+`approval_policy=never` 与工具网络关闭；账号状态仍不参与上述安全裁决。
 
 daemon 在每次创建或恢复 thread 后还必须读回：approval policy 为 `never`、
 active permission profile 为 `livis-remote`、sandbox 为 `workspaceWrite`、工具网络
@@ -201,12 +218,14 @@ HTTP 请求。完整脱敏事实与验收边界见
 阻塞；在获授权重试得到 2xx 前，不得手工删 token、执行 `session release`、复用或清理该
 state，也不得把本次结果表述为凭据已撤销。
 
-## 原生本地状态不透明目标
+## 原生本地状态不透明边界
 
 - LiViS OAuth 始终只属于 daemon；目标本地 adapter 不携带 token、cookie、scope、账号详情、认证环境变量或原生 session 文件。
 - daemon 不读取或判断本地账号状态。只要 transport 可用就调用；本地 backend 错误按普通 failed 结算，不静默切换后端。
-- 现有 Codex app-server backend 仍使用 daemon 私有 `CODEX_HOME` 与专用 API key，属于待迁移兼容路径；目标原生 Codex 与 Claude adapter 必须保持本地状态不透明。
-- 接入原生 Codex、Claude，以及允许同一 daemon 在请求间切换 backend，都必须先完成独立 adapter、状态迁移、并发所有权和实网 canary，不能仅凭中立类型契约宣称完成。
+- Codex `native-current` 已按本地状态不透明边界接入 `serve`，当前仅为 `operator-only`；旧
+  `private-api-key` 仍使用 daemon 私有 `CODEX_HOME` 与专用 API key，必须显式选择且不会 fallback。
+- 停服 `backend switch` 已有守卫与原子配置提交；Claude 以及同一 daemon 在线按请求切换 backend
+  仍必须先完成独立 adapter、并发所有权和实网 canary，不能仅凭中立类型契约宣称完成。
 
 详细设计和分阶段验证见[本地多后端架构与状态边界](LOCAL-BACKENDS.md)。
 

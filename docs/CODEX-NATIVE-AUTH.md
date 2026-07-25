@@ -7,10 +7,65 @@
 Desktop 的 control socket，不依赖 `app-server daemon`，也不会启动、停止、重启、升级或配置 Desktop
 daemon。
 
-这项能力仍为实验实现，`codex_native_auth_reuse=unsupported`。transport-only 与单次真实
-thread/turn Gate 已通过；真实 session resume、取消/超时、并发和生产 `serve` 仍未通过。
+这项能力当前为 `codex_native_auth_reuse=operator-only`：显式生产接线、离线守卫和原子配置切换
+已有自动化证据，transport-only 与单次真实 thread/turn Gate 也已通过；但真实 LiViS 消息闭环、
+session resume、取消/超时和 Desktop 长时并发仍未通过，因此不能标为 live canary。
 
-## 1. transport-only 探针
+## 1. 显式模式与原子切换
+
+Codex 后端必须显式选择模式；缺少 `codex.mode` 时配置解析和 `serve` 都失败关闭：
+
+```json
+{
+  "execution": { "backend": "codex" },
+  "codex": {
+    "mode": "native-current",
+    "command": "/绝对路径/codex",
+    "requestTimeoutMs": 30000,
+    "turnTimeoutMs": 900000,
+    "shutdownTimeoutMs": 5000,
+    "acknowledgeRemoteExecution": true
+  }
+}
+```
+
+`native-current` 不接受 `provider`、`model` 或 `toolchainReadRoots`；这些字段属于显式
+`private-api-key` 兼容模式，不能成为 fallback。推荐使用切换命令生成配置，不手工改写：
+
+```bash
+# 只读计划，不写配置
+bun run src/index.ts backend switch codex \
+  --mode native-current \
+  --command /绝对路径/codex \
+  --config /绝对路径/config.json
+
+# 完整备份 state directory、停止 daemon/Hermes 并确认无遗留进程后执行
+bun run src/index.ts backend switch codex \
+  --mode native-current \
+  --command /绝对路径/codex \
+  --apply \
+  --acknowledge-daemon-stopped \
+  --acknowledge-remote-execution \
+  --config /绝对路径/config.json
+```
+
+`apply` 只接受 JobStore v8，并跨全部 scope 拒绝非终态 backend backlog、任意 account-bound
+Codex session 和 quarantine。命令先在 connector socket 与 profile operation 路径持有离线 guard，
+再写原配置备份和 `PREPARED` 收据，最后原子替换并语义读回配置；提交后验证失败会恢复原配置。
+可选 `CONFIG_COMMITTED` marker 写入失败不改变配置提交结果，是否完成以 live config SHA-256 与
+`PREPARED.targetConfigSha256` 相等为准。若 durable rename 已发生但父目录 fsync 未确认，命令保留
+guard 并要求人工恢复，不能直接重启服务。收据固定写明 `credentialsReadOrMigrated=false`。
+
+切回 Hermes 使用同一门禁，但不接受 Codex mode/command：
+
+```bash
+bun run src/index.ts backend switch hermes \
+  --apply \
+  --acknowledge-daemon-stopped \
+  --config /绝对路径/config.json
+```
+
+## 2. transport-only 探针
 
 使用 Relay 配置中的 Codex command 与 state directory：
 
@@ -44,7 +99,7 @@ SecretStore、IdentityStore，也不会连接 Hermes。
 permission profile。探针不会调用账号接口、创建或恢复 thread、发送 turn、发起登录、刷新凭据或改变
 本地认证状态。
 
-## 2. 为什么不连接 Desktop daemon
+## 3. 为什么不连接 Desktop daemon
 
 “复用当前本地认证状态”和“复用 Desktop 正在运行的 app-server 实例”是两个不同目标。前者只要求
 Codex 子进程自行使用当前 runtime；后者还会引入 Desktop session、control socket、WebSocket transport
@@ -62,7 +117,7 @@ Codex 子进程自行使用当前 runtime；后者还会引入 Desktop session�
 而 Desktop control socket 使用 WebSocket framing；把 NDJSON client 直接接到 proxy 不会完成 WebSocket
 upgrade。旧实现和 CLI 已移除，只在本文保留根因与迁移记录。
 
-## 3. 环境与认证所有权
+## 4. 环境与认证所有权
 
 Relay 只把以下非业务内容交给独立 app-server：
 
@@ -87,7 +142,7 @@ Relay 只把以下非业务内容交给独立 app-server：
 `initialize.codexHome` 必须与本次选择的 runtime 一致，并且不能位于 Relay state directory 内。这个
 回读只证明进程使用了预期本地 runtime，不证明账号有效，也不会把路径写入公开报告。
 
-## 4. 结果语义
+## 5. 结果语义
 
 | 状态 | 含义 | 是否证明真实执行正常 |
 | --- | --- | --- |
@@ -110,7 +165,7 @@ CLI 与 app-server 版本仅用于观测，版本不同本身不阻断；readine
 这里没有 `authentication-required`。本地账号状态错误不会改变 transport readiness；只有未来实际执行
 时才由 Codex 返回普通、脱敏的 backend failure，且不会触发 Relay 登录或凭据恢复流程。
 
-## 5. 2026-07-24 本机真实 Gate
+## 6. 2026-07-24 本机真实 Gate
 
 在受控权限环境运行 transport-only 探针得到：
 
@@ -154,7 +209,7 @@ CLI 与 app-server 版本仅用于观测，版本不同本身不阻断；readine
    app-server 的实际 provider，把 provider 与有界 instruction-source 路径摘要绑定到 session policy；
    resume 仍要求持久锚点一致。Relay 不读取 instruction 文件内容，也不解释 provider 的认证状态。
 
-## 6. Desktop 不干扰不变量
+## 7. Desktop 不干扰不变量
 
 - 默认路径不得连接 Desktop control socket；
 - 不得执行 `app-server daemon start|stop|restart` 或 remote-control 切换；
@@ -163,7 +218,7 @@ CLI 与 app-server 版本仅用于观测，版本不同本身不阻断；readine
 - 不兼容时不能自动回退到私有 API-key backend；
 - 离线自动化只使用测试拥有的 fake app-server，不使用真实 Desktop socket 作为夹具。
 
-## 7. 执行组合状态
+## 8. 执行组合与生产接线
 
 [`CodexNativeSessionHarness`](../src/backends/codex/native-session-harness.ts) 已改为通过
 [`attachCodexNativeStdio`](../src/backends/codex/native-stdio.ts) 获得独立 app-server，再组合：
@@ -176,15 +231,25 @@ CLI 与 app-server 版本仅用于观测，版本不同本身不阻断；readine
 - idle app-server exit 只降低 readiness；
 - 旧 epoch 迟到事件不能命中新 client。
 
-离线组合测试继续使用 fake client，不读取真实账号状态；本节第 5 节的受控 canary 已额外证明同一
-harness 能完成真实单 turn。组合 harness 仍没有被 `daemon.ts`、`config.ts` 或生产 `serve` 导入，
-因此 `productionReady` 保持 `false`。
+离线组合测试继续使用 fake client，不读取真实账号状态；本节第 6 节的受控 canary 已额外证明同一
+harness 能完成真实单 turn。显式 `native-current` 由
+[`CodexNativeExecutionBackend`](../src/backends/codex/native-execution-backend.ts) 建立
+`<stateDir>/backends/codex/native-sessions/<sessionHash>/workspace`，固定 Codex command，并把 harness
+接入 `ExecutionBackend`；`daemon.ts` 只在该显式模式下选择它。旧私有 adapter 只在
+`mode=private-api-key` 时选择，两个实现不存在异常 fallback。
 
-## 8. 下一实现门禁
+probe/attachment 中的 `productionReady=false` 表示该报告本身没有发送模型 turn、不能充当生产或
+LiViS 闭环证据；它不再表示代码禁止 `serve`。运行中的 status 应显示 `mode=native-current`、
+`stateOwnership=local-state-opaque`、`touchedDesktopDaemon=false` 和
+`credentialStateInspected=false`。
 
-在 `codex_native_auth_reuse` 从 `unsupported` 升级前，还必须完成：
+## 9. 下一验证门禁
 
-1. 验证真实 resume、取消、超时、断线和迟到事件的协议形态；
-2. 在 Codex Desktop 同时运行时完成更长时段并发 canary，确认 Desktop session 与日常交互不受影响；
-3. 明确生产配置中的 native/private 模式选择，禁止静默 fallback；
-4. 绑定精确 commit、CLI/app-server 版本、测试门禁和脱敏 receipt 后，才接入 `serve`。
+在 `codex_native_auth_reuse` 从 `operator-only` 升级为真实 canary 证据前，还必须完成：
+
+1. 从当前部署的 LiViS App 发送唯一文本 canary，核对同一 job 的
+   `Succeeded → outbox Delivered → App 回显`；
+2. 验证真实 resume、取消、超时、断线和迟到事件的协议形态；
+3. 在 Codex Desktop 同时运行时完成更长时段并发 canary，确认 Desktop session 与日常交互不受影响；
+4. 绑定精确 commit、CLI/app-server 版本、测试门禁和脱敏 receipt。任一缺失都保持
+   `operator-only`，不能用 doctor ready 或 transport probe 代替。

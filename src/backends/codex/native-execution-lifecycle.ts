@@ -125,11 +125,11 @@ function isRelevantNotification(notification: CodexAppServerNotification): boole
 }
 
 /**
- * native stdio 执行路径的离线生命周期原型。
+ * native stdio 执行路径的生命周期实现。
  *
  * 它只把一个测试或上层已经安全 attach 的 app-server client 映射成 ExecutionBackend 的提交、
  * accepted、terminal、cancel 和 disconnect 语义；不负责连接真实 Desktop、不声明
- * server config/thread sandbox 已安全，也没有接入 `serve`。
+ * server config/thread sandbox 已安全；生产接线仍由显式 `native-current` adapter 负责。
  */
 export class CodexNativeExecutionLifecycle {
   readonly kind = "codex" as const;

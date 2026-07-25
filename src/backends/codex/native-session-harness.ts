@@ -94,8 +94,8 @@ async function closeAttachmentAfterStartFailure(
 /**
  * 原生 stdio app-server 与持久 session coordinator 的受控组合 harness。
  *
- * 本模块不进入 daemon/config，不读取账号状态、不连接 Desktop daemon，也不声明生产可用。唯一拥有的
- * 外部资源是 Relay 自己启动并负责收口的 stdio app-server。
+ * 本模块不读取账号状态、不连接 Desktop daemon。只有显式 `native-current` adapter 可以把它接入
+ * operator-only serve；唯一拥有的外部资源是 Relay 自己启动并负责收口的 stdio app-server。
  */
 export class CodexNativeSessionHarness {
   readonly kind = "codex" as const;
@@ -177,7 +177,7 @@ export class CodexNativeSessionHarness {
 
   status(): Record<string, unknown> {
     return {
-      implementation: "codex-native-session-harness-prototype",
+      implementation: "codex-native-session-harness",
       ready: this.ready,
       executionId: this.executionId,
       transport: this.attachment.transport,

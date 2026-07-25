@@ -11,6 +11,7 @@ import type {
 } from "./backends/execution-backend.ts";
 import { HermesExecutionBackend } from "./backends/hermes-backend.ts";
 import { CodexExecutionBackend } from "./backends/codex/codex-execution-backend.ts";
+import { CodexNativeExecutionBackend } from "./backends/codex/native-execution-backend.ts";
 import type { RelayConfig } from "./config.ts";
 import { ConnectorServer, type ConnectorServerHandlers } from "./connector/server.ts";
 import { IdaasClient } from "./auth/idaas.ts";
@@ -98,6 +99,12 @@ export class RelayDaemon {
         "Codex backend 只支持单设备：必须关闭 allowAllNodes 并配置唯一 allowedNodeId",
       );
     }
+    if (
+      dependencies.config.execution.backend === "codex" &&
+      dependencies.config.codex.mode === null
+    ) {
+      throw new Error("Codex backend 必须显式选择 native-current 或 private-api-key 模式");
+    }
     const store = new JobStore(join(dependencies.config.stateDir, "relay.db"), scopeKey, {
       legacyV4JobBackend: dependencies.config.execution.legacyV4JobBackend ?? undefined,
     });
@@ -172,25 +179,41 @@ export class RelayDaemon {
     );
     const sessionKey = `livis:${dependencies.identity.agentId}`;
     const executionBackend: ExecutionBackend = dependencies.config.execution.backend === "codex"
-      ? new CodexExecutionBackend({
-        stateDir: dependencies.config.stateDir,
-        scopeKey,
-        sessionKey,
-        remoteNodeId: dependencies.config.security.allowedNodeIds[0]!,
-        command: dependencies.config.codex.command,
-        toolchainReadRoots: dependencies.config.codex.toolchainReadRoots,
-        model: dependencies.config.codex.model,
-        provider: dependencies.config.codex.provider,
-        maxOutputChars: dependencies.config.security.maxOutputChars,
-        requestTimeoutMs: dependencies.config.codex.requestTimeoutMs,
-        turnTimeoutMs: dependencies.config.codex.turnTimeoutMs,
-        interruptGraceMs: dependencies.config.codex.interruptGraceMs,
-        shutdownTimeoutMs: dependencies.config.codex.shutdownTimeoutMs,
-      }, {
-        store,
-        handlers: executionHandlers,
-        logger: logger.child("codex"),
-      })
+      ? dependencies.config.codex.mode === "native-current"
+        ? new CodexNativeExecutionBackend({
+            stateDir: dependencies.config.stateDir,
+            scopeKey,
+            sessionKey,
+            remoteNodeId: dependencies.config.security.allowedNodeIds[0]!,
+            command: dependencies.config.codex.command,
+            maxOutputChars: dependencies.config.security.maxOutputChars,
+            requestTimeoutMs: dependencies.config.codex.requestTimeoutMs,
+            turnTimeoutMs: dependencies.config.codex.turnTimeoutMs,
+            shutdownTimeoutMs: dependencies.config.codex.shutdownTimeoutMs,
+            clientVersion: DAEMON_VERSION,
+          }, {
+            store,
+            handlers: executionHandlers,
+          })
+        : new CodexExecutionBackend({
+            stateDir: dependencies.config.stateDir,
+            scopeKey,
+            sessionKey,
+            remoteNodeId: dependencies.config.security.allowedNodeIds[0]!,
+            command: dependencies.config.codex.command,
+            toolchainReadRoots: dependencies.config.codex.toolchainReadRoots,
+            model: dependencies.config.codex.model,
+            provider: dependencies.config.codex.provider,
+            maxOutputChars: dependencies.config.security.maxOutputChars,
+            requestTimeoutMs: dependencies.config.codex.requestTimeoutMs,
+            turnTimeoutMs: dependencies.config.codex.turnTimeoutMs,
+            interruptGraceMs: dependencies.config.codex.interruptGraceMs,
+            shutdownTimeoutMs: dependencies.config.codex.shutdownTimeoutMs,
+          }, {
+            store,
+            handlers: executionHandlers,
+            logger: logger.child("codex"),
+          })
       : new HermesExecutionBackend(connector);
 
     const relayHandlers: RelayClientHandlers = {

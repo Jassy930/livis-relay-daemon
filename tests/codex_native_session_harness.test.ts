@@ -577,7 +577,7 @@ describe("Codex native stdio + coordinator 受控组合 harness", () => {
     currentStore.close();
   });
 
-  test("组合 harness 保持在生产入口之外", async () => {
+  test("组合 harness 只经显式 native-current adapter 进入生产入口", async () => {
     const harnessSource = await Bun.file(join(
       import.meta.dir,
       "../src/backends/codex/native-session-harness.ts",
@@ -585,7 +585,15 @@ describe("Codex native stdio + coordinator 受控组合 harness", () => {
     for (const forbidden of ["../../daemon.ts", "../../index.ts", "../../config.ts"]) {
       expect(harnessSource).not.toContain(forbidden);
     }
-    for (const productionFile of ["daemon.ts", "index.ts", "config.ts"]) {
+    const adapter = await Bun.file(join(
+      import.meta.dir,
+      "../src/backends/codex/native-execution-backend.ts",
+    )).text();
+    expect(adapter).toContain("native-session-harness");
+    const daemon = await Bun.file(join(import.meta.dir, "../src/daemon.ts")).text();
+    expect(daemon).toContain("CodexNativeExecutionBackend");
+    expect(daemon).toContain('codex.mode === "native-current"');
+    for (const productionFile of ["index.ts", "config.ts"]) {
       const source = await Bun.file(join(import.meta.dir, "../src", productionFile)).text();
       expect(source).not.toContain("native-session-harness");
     }

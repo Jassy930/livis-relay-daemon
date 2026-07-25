@@ -1,8 +1,9 @@
 # 本地多后端架构与状态边界
 
 本文定义 `livis-relayd` 调用本机 Hermes、Codex 和 Claude 的当前基线与目标架构。Hermes
-connector 已实现；Codex app-server backend 也已实现并取得受控 canary，但当前仍使用 daemon
-私有 `CODEX_HOME` 与专用 API key。Claude 才是 `contract-only`。目标原生 adapter 不复用或处理
+connector 已实现；Codex 现在有显式 `native-current` 与 `private-api-key` 两条互斥路径，前者只调用
+操作者当前本地 runtime，后者保留 daemon 私有 `CODEX_HOME` 兼容实现。Claude 才是
+`contract-only`。原生 adapter 不复用或处理
 “认证信息”，而是把本地 backend 的当前状态视为完全不透明：能连接就调用，执行错误就按普通
 backend failed 处理。
 
@@ -28,7 +29,8 @@ backend failed 处理。
 | 后端 | 调用链 | 当前认证所有权 | 当前状态 |
 | --- | --- | --- | --- |
 | Hermes | daemon → UDS connector → 专用 Hermes Gateway | Hermes 专用 profile | 已实现；远程输入门禁与 canary 已落地 |
-| Codex | daemon → stdio JSON-RPC → `codex app-server` | `<stateDir>/backends/codex/home` 中由 Codex 管理的专用 API key | 已实现、实验性；不是用户日常 Codex 当前登录态 |
+| Codex `native-current` | daemon → 自有 stdio JSON-RPC → `codex app-server` | Codex 当前本地 runtime；对 daemon 不透明 | `operator-only`；已接入 `serve`，真实 LiViS 消息 canary 待验证 |
+| Codex `private-api-key` | daemon → stdio JSON-RPC → `codex app-server` | `<stateDir>/backends/codex/home` 中由 Codex 管理的专用 API key | 已实现的旧兼容路径；必须显式选择 |
 | Claude | 尚无 transport | 尚未定义 | `contract-only`；`execution.backend=claude` 可被配置解析，但 `serve` 明确失败关闭 |
 
 当前 `execution.backend` 是 daemon 级三选一配置；切换需要停服、排空异 backend 非终态 job
@@ -55,8 +57,8 @@ flowchart LR
 | 本地 session/thread ID | 对应 backend adapter | 作为不透明引用保存和回传 | 新建会话或失败关闭 |
 
 LiViS OAuth 与本地推理后端认证是两个独立安全域。backend adapter 不得导入 `IdaasClient`
-或 `SecretStore`，daemon 也不得把 LiViS token 交给本地后端。这里描述目标 adapter contract；
-现有 Codex 的私有 `CODEX_HOME` 是需要迁移的兼容路径，不得被文档隐藏。
+或 `SecretStore`，daemon 也不得把 LiViS token 交给本地后端。Codex 两种模式必须由操作者显式
+选择；私有 `CODEX_HOME` 兼容路径不会因 native initialize/执行失败而自动启用。
 
 ## 4. 认证边界与当前门禁强度
 
@@ -129,7 +131,7 @@ adapter 还必须提供断连事件通道；在这些字段和映射测试落地
 
 ### 7.1 当前收口状态
 
-- 本地状态不透明的静态声明与离线扫描基线已经完成：概念 payload 不含凭据或账号字段，Codex 实现状态与现有私有认证路径分开，Claude 明确为 `contract-only`。生产 adapter 生命周期契约仍需补齐提交可证明性与断连，不能把声明层视为已完成接线。
+- 本地状态不透明的静态声明、执行生命周期、持久 session coordinator、生产 adapter、显式模式路由与原子切换 CLI 已完成；提交可证明性、断连和 ambiguous execution 已映射到 `ExecutionBackend`。Claude 仍明确为 `contract-only`。
 - 当前只有 `bun run src/index.ts ...` 和 package script，没有安装后可直接调用的稳定 `livis-relay` / `livis-relayd` bin 入口。
 - 当前 `main` 使用 `livis-relay-v1-access-only-r2`，本地 S2 门禁已闭合；最终组合 head 的真实 Relay access-only canary 仍是正式启用阻塞项。
 - 旧 `worktree-arch-refactor` 的多 connector/outbox pump 原型假设与当前 JobStore v8、ExecutionBackend 和单 backend 失败关闭边界不同，只能作为设计输入，不能直接 cherry-pick。旧 Hermes 0.18.2 / connector v2 / 远程 `/sethome` 路线同样不得进入当前基线。
@@ -195,9 +197,8 @@ epoch、thread policy/checkpoint、JobStore job/lease/run generation 与 lifecyc
 状态机。JobStore schema v8 用 `local-state-opaque` 显式标识这类 session/attempt，相关账号列必须
 保持 `NULL`；fresh thread 与初始 checkpoint 在同一 SQLite 事务中绑定，idle 重启只允许精确
 resume，历史 active/recovery、metadata/checkpoint 漂移和提交不确定性都进入 ambiguous quarantine。
-普通本地 backend failed 只结算当前 job，后续 job 仍可继续调用同一 transport。该原型及测试没有
-连接真实 Desktop socket，也没有进入 `daemon.ts`、`config.ts` 或生产 `serve`；`index.ts` 只暴露
-transport-only probe。
+普通本地 backend failed 只结算当前 job，后续 job 仍可继续调用同一 transport。该状态机及测试不连接
+真实 Desktop socket；生产只由显式 `native-current` adapter 接线。
 
 第六个切片 [`native session harness`](../src/backends/codex/native-session-harness.ts) 把可持有连接的
 [`attachCodexNativeStdio`](../src/backends/codex/native-stdio.ts) 与 coordinator 接到纯离线受控组合。
@@ -205,11 +206,20 @@ notification callback 固定绑定 coordinator 的确切 client epoch；active a
 进入持久 recovery/quarantine，idle exit 只降低 transport readiness。attach、initialize、preflight
 失败都验证 Relay 自有进程的收口语义。对应
 [`组合测试`](../tests/codex_native_session_harness.test.ts) 仍只注入 fake stdio client；另行授权的真实
-canary 已通过同一 harness 完成一个 turn，但尚未进入生产入口。
+canary 已通过同一 harness 完成一个 turn。生产
+[`CodexNativeExecutionBackend`](../src/backends/codex/native-execution-backend.ts) 只在
+`codex.mode=native-current` 时建立私有 native workspace、固定 command 并启动该 harness。
+
+原子切换由 `backend switch` 完成：dry-run 只读报告；`--apply` 必须持有 offline/profile guard，
+要求 JobStore v8、全 scope 零非终态 backlog、零 account-bound Codex session、零 quarantine，并先写
+备份和 PREPARED 收据。配置以 durable atomic replace 提交并读回；错误不触发私有模式 fallback，
+收据明确 `credentialsReadOrMigrated=false`。详细命令见
+[Codex 原生当前状态边界](CODEX-NATIVE-AUTH.md#1-显式模式与原子切换)。
 
 真实 Gate 已证明执行隔离可由独立 app-server 的逐进程 argv 和逐 thread 回读完成，不需要修改用户
 默认配置、重启 Desktop daemon 或关闭 Desktop feature。该结论只覆盖单次 fresh turn；真实 resume、
-取消、超时、断线、长期并发和生产路由仍未闭合，因此能力继续保持 `unsupported`。
+取消、超时、断线和长期并发的真实路径仍未闭合；生产路由已有离线证据，因此能力提升为
+`operator-only`，不能写成 live canary。
 
 工作包：
 
@@ -224,9 +234,9 @@ canary 已通过同一 harness 完成一个 turn，但尚未进入生产入口�
 5. 当前真实 transport 与单 turn Gate 已通过；本地账号状态无论正确或错误都不作为前置门禁，实际
    错误只按普通 execution failed 结算。
 
-完成定义：另行授权的非生产 canary 证明 daemon 未产生第二份后端凭据、未读取账号状态、未改变
-Codex Desktop 生命周期或状态、日常 Codex 仍可用、job/lease/checkpoint 全闭合，才考虑把
-`codex_native_auth_reuse` 从 `unsupported` 升级。现有私有路径不能自动 fallback，也不能用 symlink
+完成定义：另行授权的 LiViS 非生产 canary 证明 daemon 未产生第二份后端凭据、未读取账号状态、未改变
+Codex Desktop 生命周期或状态、日常 Codex 仍可用，并核对同一 job 的执行、投递和 App 回显全闭合，
+才考虑把 `codex_native_auth_reuse` 从 `operator-only` 升级。现有私有路径不能自动 fallback，也不能用 symlink
 或文件复制绕过。
 
 ### 7.4 阶段 C：Claude adapter

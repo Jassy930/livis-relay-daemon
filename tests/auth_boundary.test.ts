@@ -60,6 +60,8 @@ describe("本地后端认证所有权边界", () => {
       "src/backends/codex/native-execution-lifecycle.ts",
       "src/backends/codex/native-thread-policy.ts",
       "src/backends/codex/native-session-coordinator.ts",
+      "src/backends/codex/native-session-harness.ts",
+      "src/backends/codex/native-execution-backend.ts",
     ]) {
       const source = await Bun.file(resolve(PROJECT_ROOT, path)).text();
       expect(source, `${path} 不得读取或绑定账号状态`).not.toMatch(
@@ -68,19 +70,24 @@ describe("本地后端认证所有权边界", () => {
     }
   });
 
-  test("native 执行原型在能力 unsupported 期间不得进入生产 serve", async () => {
-    for (const path of ["src/daemon.ts", "src/index.ts", "src/config.ts"]) {
-      const source = await Bun.file(resolve(PROJECT_ROOT, path)).text();
-      expect(source, `${path} 不得导入 native 执行原型`).not.toMatch(
-        /native-(?:client-epoch|execution-lifecycle|thread-policy|session-coordinator)/,
-      );
-    }
+  test("native 当前状态只能由显式模式接入且不回退到私有凭据路径", async () => {
+    const daemon = await Bun.file(resolve(PROJECT_ROOT, "src/daemon.ts")).text();
+    const config = await Bun.file(resolve(PROJECT_ROOT, "src/config.ts")).text();
+    const adapter = await Bun.file(resolve(
+      PROJECT_ROOT,
+      "src/backends/codex/native-execution-backend.ts",
+    )).text();
+    expect(daemon).toContain('dependencies.config.codex.mode === "native-current"');
+    expect(daemon).toContain("new CodexNativeExecutionBackend");
+    expect(config).toContain("禁止在 native-current 与 private-api-key 之间静默选择");
+    expect(adapter).not.toMatch(/CodexExecutionBackend|ensureCodexRuntimeLayout|buildCodexEnvironment/);
+    expect(adapter).not.toMatch(/account\/read|credential_rejected|apiKey/);
     const manifest = await Bun.file(resolve(PROJECT_ROOT, "capabilities.json")).json() as {
       capabilities: Array<{ id: string; status: string }>;
       safetyDefaults: { nativeBackendCredentialReuse?: boolean };
     };
     expect(manifest.capabilities.find((entry) => entry.id === "codex_native_auth_reuse")?.status)
-      .toBe("unsupported");
+      .toBe("operator-only");
     expect(manifest.safetyDefaults.nativeBackendCredentialReuse).toBeFalse();
   });
 });

@@ -9,7 +9,8 @@
 - 默认 Hermes backend 通过本机 connector IPC 与 `MessageEvent` / `SendResult` 转换；
   plugin 不连接 LiViS、不打开 relay SQLite，也不隐式启动 daemon。
 - 显式 Codex backend 由 daemon 直接管理一个 `codex app-server --stdio` 子进程，不
-  经过 Hermes connector，也不把 thread 当作 job 状态真源。`codex` 是 execution backend；
+  经过 Hermes connector，也不把 thread 当作 job 状态真源。`codex.mode` 必须显式选择
+  `native-current | private-api-key`，两个 adapter 互不 fallback。`codex` 是 execution backend；
   其下的默认 OpenAI 或显式 custom Responses 是 model provider，不是第四种 backend。
 - Hermes 模式下 daemon 与专用 Hermes Gateway 分别由 launchd/systemd 管理；Codex
   模式只管理 daemon 服务，app-server 随 daemon 启停。
@@ -36,8 +37,9 @@ model provider。
 
 受支持的部署拓扑固定为一个 daemon、一个 config、一个 state directory、一个执行
 backend 和恰好一个获准 `node_id`。Hermes 模式额外对应一个专用 profile；Codex
-模式额外对应一个 daemon 私有 `CODEX_HOME`、一个 session workspace 和一个持久
-thread。两种已实现 backend 不得在同一 daemon 中同时启用或共享会话；未来 Claude
+`private-api-key` 对应 daemon 私有 `CODEX_HOME`，Codex `native-current` 则只把当前
+HOME/CODEX_HOME 当 runtime 选择器，并把工具 workspace 放在 state directory 内；两种模式
+各自持有一个持久 thread。两种已实现 backend 不得在同一 daemon 中同时启用或共享会话；未来 Claude
 实现后也必须遵守同一三选一边界。
 
 `security.allowedNodeIds` 的数组形式和 Hermes `LIVIS_ALLOWED_USERS` 的逗号列表形式只是
@@ -50,10 +52,10 @@ immutable session hash 还绑定唯一获准 `node_id`，因此同一 state dire
 设备会拒绝复用旧 thread。多设备路由、跨设备会话连续性、设备 ID 轮换和既有状态迁移
 均不在一期范围内；不得通过追加第二个 allowlist 值来绕过该边界。
 
-目标架构仍希望 Hermes、Codex 与 Claude 分别复用各自原生本地运行时的当前认证状态，daemon
-只持有 LiViS OAuth，不读取或复制后端 token。这个目标认证边界尚未接入现有 Codex backend：
-当前 Codex 已实现并通过 app-server canary，但仍使用 daemon 私有 `CODEX_HOME` 与专用 API
-key；Claude 仍只有中立调用契约。迁移计划与门禁见[本地多后端架构与认证边界](LOCAL-BACKENDS.md)。
+目标架构要求 Hermes、Codex 与 Claude 分别使用各自原生本地运行时的当前状态，daemon
+只持有 LiViS OAuth，不读取或复制后端 token。Codex `native-current` 已按该边界接入生产路由，
+当前证据等级为 `operator-only`；旧 `private-api-key` 仍是必须显式选择的兼容路径。Claude 仍只有
+中立调用契约。迁移计划与门禁见[本地多后端架构与认证边界](LOCAL-BACKENDS.md)。
 
 ## OAuth 凭据边界
 

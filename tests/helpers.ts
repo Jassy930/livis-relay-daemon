@@ -61,6 +61,7 @@ export function testConfig(stateDir: string): RelayConfig {
       bridgeMaximumExclusiveVersion: "0.2.0",
     },
     codex: {
+      mode: "private-api-key",
       command: "codex",
       toolchainReadRoots: [],
       model: null,

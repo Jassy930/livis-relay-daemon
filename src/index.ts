@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { readdir, realpath } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   CODEX_MAXIMUM_EXCLUSIVE_VERSION,
   CODEX_MINIMUM_VERSION,
@@ -75,6 +75,7 @@ import {
   versionLessThan,
   sha256,
 } from "./util.ts";
+import { switchBackend, type SwitchableBackend } from "./backend/switch.ts";
 
 const PROJECT_ROOT = resolve(import.meta.dir, "..");
 const BUILTIN_PROFILE_DIRECTORY = join(PROJECT_ROOT, "protocol-profiles");
@@ -515,68 +516,106 @@ async function commandDoctor(args: string[]): Promise<void> {
     return;
   }
   const backendKind = context.config.execution.backend;
-  const backendMinimumVersion = backendKind === "codex"
-    ? CODEX_MINIMUM_VERSION
-    : context.config.hermes.minimumVersion;
-  const backendMaximumVersion = backendKind === "codex"
-    ? CODEX_MAXIMUM_EXCLUSIVE_VERSION
-    : context.config.hermes.maximumExclusiveVersion;
-  try {
-    let backendStdout: string;
-    let backendStderr: string;
-    let backendExit: number;
-    if (backendKind === "codex") {
-      const layout = await ensureCodexRuntimeLayout({
-        stateDir: context.config.stateDir,
-        scopeKey: IdentityStore.scopeKey(context.identity),
-        sessionKey: `livis:${context.identity.agentId}`,
-        remoteNodeId: context.config.security.allowedNodeIds[0]!,
-        provider: context.config.codex.provider,
-        toolchainReadRoots: context.config.codex.toolchainReadRoots,
+  if (backendKind === "codex" && context.config.codex.mode === "native-current") {
+    try {
+      const canonicalStateDir = await realpath(context.config.stateDir);
+      const command = await pinCodexCommandForStateDir(
+        canonicalStateDir,
+        context.config.codex.command,
+      );
+      const report = await probeCodexNativeStdio({
+        command,
+        stateDir: canonicalStateDir,
+        cwd: PROJECT_ROOT,
+        requestTimeoutMs: context.config.codex.requestTimeoutMs,
+        shutdownTimeoutMs: context.config.codex.shutdownTimeoutMs,
+        clientVersion: DAEMON_VERSION,
       });
-      await assertCodexRuntimeLayout(layout);
-      const command = await pinCodexCommand(layout, context.config.codex.command);
-      const result = await runCodexCommand([command.path, "--version"], {
-        cwd: layout.workspace,
-        env: await buildCodexEnvironment(layout),
-        timeoutMs: context.config.codex.requestTimeoutMs,
+      checks.push({
+        name: "codex_native_app_server",
+        ok: report.ok,
+        detail: JSON.stringify(report),
       });
-      await assertPinnedCodexCommand(command);
-      backendStdout = result.stdout;
-      backendStderr = result.stderr;
-      backendExit = result.exitCode;
-    } else {
-      const backendProcess = Bun.spawn([context.config.hermes.command, "--version"], {
-        stdout: "pipe",
-        stderr: "pipe",
+    } catch (error) {
+      const reasonCode = error instanceof CodexNativeStdioError
+        ? error.code
+        : "native_probe_preflight_failed";
+      checks.push({
+        name: "codex_native_app_server",
+        ok: false,
+        detail: JSON.stringify({
+          compatibilityBasis: "protocol-handshake",
+          reasonCode,
+          error: errorMessage(error),
+          touchedDesktopDaemon: false,
+          sentModelTurn: false,
+        }),
       });
-      [backendStdout, backendStderr, backendExit] = await Promise.all([
-        new Response(backendProcess.stdout).text(),
-        new Response(backendProcess.stderr).text(),
-        backendProcess.exited,
-      ]);
     }
-    const currentVersion = parseSemverTriplet(`${backendStdout}\n${backendStderr}`);
-    const minimumVersion = parseSemverTriplet(backendMinimumVersion);
-    const maximumVersion = parseSemverTriplet(backendMaximumVersion);
-    const versionOkay = backendExit === 0 &&
-      currentVersion !== null &&
-      minimumVersion !== null &&
-      maximumVersion !== null &&
-      versionAtLeast(currentVersion, minimumVersion) &&
-      versionLessThan(currentVersion, maximumVersion);
-    checks.push({
-      name: `${backendKind}_version`,
-      ok: versionOkay,
-      detail: `${backendStdout}${backendStderr}`.trim() +
-        `\n审核范围：[${backendMinimumVersion}, ${backendMaximumVersion})`,
-    });
-  } catch (error) {
-    checks.push({
-      name: `${backendKind}_version`,
-      ok: false,
-      detail: `${errorMessage(error)}\n审核范围：[${backendMinimumVersion}, ${backendMaximumVersion})`,
-    });
+  } else {
+    const backendMinimumVersion = backendKind === "codex"
+      ? CODEX_MINIMUM_VERSION
+      : context.config.hermes.minimumVersion;
+    const backendMaximumVersion = backendKind === "codex"
+      ? CODEX_MAXIMUM_EXCLUSIVE_VERSION
+      : context.config.hermes.maximumExclusiveVersion;
+    try {
+      let backendStdout: string;
+      let backendStderr: string;
+      let backendExit: number;
+      if (backendKind === "codex") {
+        const layout = await ensureCodexRuntimeLayout({
+          stateDir: context.config.stateDir,
+          scopeKey: IdentityStore.scopeKey(context.identity),
+          sessionKey: `livis:${context.identity.agentId}`,
+          remoteNodeId: context.config.security.allowedNodeIds[0]!,
+          provider: context.config.codex.provider,
+          toolchainReadRoots: context.config.codex.toolchainReadRoots,
+        });
+        await assertCodexRuntimeLayout(layout);
+        const command = await pinCodexCommand(layout, context.config.codex.command);
+        const result = await runCodexCommand([command.path, "--version"], {
+          cwd: layout.workspace,
+          env: await buildCodexEnvironment(layout),
+          timeoutMs: context.config.codex.requestTimeoutMs,
+        });
+        await assertPinnedCodexCommand(command);
+        backendStdout = result.stdout;
+        backendStderr = result.stderr;
+        backendExit = result.exitCode;
+      } else {
+        const backendProcess = Bun.spawn([context.config.hermes.command, "--version"], {
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        [backendStdout, backendStderr, backendExit] = await Promise.all([
+          new Response(backendProcess.stdout).text(),
+          new Response(backendProcess.stderr).text(),
+          backendProcess.exited,
+        ]);
+      }
+      const currentVersion = parseSemverTriplet(`${backendStdout}\n${backendStderr}`);
+      const minimumVersion = parseSemverTriplet(backendMinimumVersion);
+      const maximumVersion = parseSemverTriplet(backendMaximumVersion);
+      const versionOkay = backendExit === 0 &&
+        currentVersion !== null &&
+        minimumVersion !== null &&
+        maximumVersion !== null &&
+        versionAtLeast(currentVersion, minimumVersion) &&
+        versionLessThan(currentVersion, maximumVersion);
+      checks.push({
+        name: `${backendKind}_version`,
+        ok: versionOkay,
+        detail: `${backendStdout}${backendStderr}`.trim() +
+          `\n审核范围：[${backendMinimumVersion}, ${backendMaximumVersion})`,
+      });
+    } catch (error) {
+      checks.push({
+        name: `${backendKind}_version`,
+        ok: false,
+        detail: `${errorMessage(error)}\n审核范围：[${backendMinimumVersion}, ${backendMaximumVersion})`,
+      });
+    }
   }
   const store = new JobStore(
     join(context.config.stateDir, "relay.db"),
@@ -788,6 +827,68 @@ async function commandCodexProbeNativeAppServer(args: string[]): Promise<void> {
   if (!ok) process.exitCode = 1;
 }
 
+async function commandBackendSwitch(args: string[]): Promise<void> {
+  const target = args[2];
+  if (target !== "hermes" && target !== "codex") {
+    throw new Error("backend switch 只支持 hermes 或 codex；Claude 尚未实现");
+  }
+  const valueOptions = new Set(["--config", "--mode", "--command"]);
+  const flags = new Set([
+    "--apply",
+    "--acknowledge-daemon-stopped",
+    "--acknowledge-remote-execution",
+  ]);
+  for (let index = 3; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (valueOptions.has(argument)) {
+      index += 1;
+      if (index >= args.length || args[index]!.startsWith("--")) {
+        throw new Error(`${argument} 必须提供非空值`);
+      }
+      continue;
+    }
+    if (flags.has(argument)) {
+      if (args.indexOf(argument, index + 1) >= 0) {
+        throw new Error(`${argument} 不能重复传入`);
+      }
+      continue;
+    }
+    throw new Error(`backend switch 未知选项：${argument}`);
+  }
+
+  const mode = optionValue(args, "--mode");
+  const command = optionValue(args, "--command");
+  if (target === "codex") {
+    if (mode !== "native-current") {
+      throw new Error("切换到 Codex 必须显式传入 --mode native-current");
+    }
+    if (!command) {
+      throw new Error("切换到 Codex native-current 必须传入 --command 绝对路径");
+    }
+    if (!isAbsolute(command)) {
+      throw new Error("切换到 Codex native-current 必须传入 --command 绝对路径");
+    }
+  } else if (
+    mode !== undefined || command !== undefined ||
+    hasFlag(args, "--acknowledge-remote-execution")
+  ) {
+    throw new Error("切换到 Hermes 不接受 --mode、--command 或 Codex remote acknowledgement");
+  }
+
+  const result = await switchBackend({
+    configPath: optionValue(args, "--config") ??
+      process.env.LIVIS_RELAY_CONFIG ??
+      DEFAULT_CONFIG_PATH,
+    targetBackend: target as SwitchableBackend,
+    codexMode: target === "codex" ? "native-current" : undefined,
+    codexCommand: command === undefined ? undefined : expandHome(command),
+    apply: hasFlag(args, "--apply"),
+    acknowledgeDaemonStopped: hasFlag(args, "--acknowledge-daemon-stopped"),
+    acknowledgeRemoteExecution: hasFlag(args, "--acknowledge-remote-execution"),
+  });
+  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+}
+
 function printHelp(): void {
   process.stdout.write(`livis-relay-daemon ${DAEMON_VERSION}\n\n`);
   process.stdout.write("命令：\n");
@@ -798,6 +899,8 @@ function printHelp(): void {
   process.stdout.write("  serve [--config PATH]\n");
   process.stdout.write("  status [--config PATH]\n");
   process.stdout.write("  doctor [--online] [--config PATH]\n");
+  process.stdout.write("  backend switch hermes [--apply --acknowledge-daemon-stopped] [--config PATH]\n");
+  process.stdout.write("  backend switch codex --mode native-current --command PATH [--apply --acknowledge-daemon-stopped --acknowledge-remote-execution] [--config PATH]\n");
   process.stdout.write("  upstream check [--config PATH]\n");
   process.stdout.write("  upstream activate --profile PATH --acknowledge-reviewed-profile [--config PATH]\n");
   process.stdout.write("  upstream rollback --backup PATH --acknowledge-rollback [--config PATH]\n");
@@ -837,6 +940,10 @@ async function main(): Promise<void> {
       break;
     case "doctor":
       await commandDoctor(args);
+      break;
+    case "backend":
+      if (subcommand !== "switch") throw new Error("只支持 backend switch");
+      await commandBackendSwitch(args);
       break;
     case "upstream":
       if (subcommand === "check") await commandUpstreamCheck(args);

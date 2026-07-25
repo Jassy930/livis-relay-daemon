@@ -59,6 +59,11 @@ export interface RelayConfig {
     bridgeMaximumExclusiveVersion: string;
   };
   codex: {
+    /**
+     * `native-current` 只选择操作者当前本地 runtime，不读取或管理其认证状态。
+     * `private-api-key` 是旧的 daemon 私有 CODEX_HOME 兼容路径；两者不得静默 fallback。
+     */
+    mode: "native-current" | "private-api-key" | null;
     command: string;
     /**
      * 显式暴露给远程工具沙箱的只读工具链目录。它们会加入 PATH，但绝不会
@@ -222,6 +227,26 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
   const codexToolchainReadRoots = codexToolchainReadRootsRaw.map((path) => expandHome(path));
   const codexModel = optionalNonEmptyString(codex?.model, "config.codex.model");
   const codexProvider = parseCodexProvider(codex);
+  const codexMode = codex?.mode === undefined || codex.mode === null
+    ? null
+    : asNonEmptyString(codex.mode, "config.codex.mode");
+  if (
+    codexMode !== null && codexMode !== "native-current" && codexMode !== "private-api-key"
+  ) {
+    throw new Error("config.codex.mode 只支持 native-current 或 private-api-key");
+  }
+  if (executionBackend === "codex" && codexMode === null) {
+    throw new Error(
+      "Codex backend 必须显式设置 config.codex.mode；禁止在 native-current 与 private-api-key 之间静默选择",
+    );
+  }
+  if (executionBackend === "codex" && codexMode === "native-current") {
+    if (codex?.provider !== undefined || codexModel !== null || codexToolchainReadRoots.length > 0) {
+      throw new Error(
+        "Codex native-current 使用本地当前 runtime；不得配置 provider、model 或 toolchainReadRoots",
+      );
+    }
+  }
   if (executionBackend === "codex" && (allowAllNodes || allowedNodeIds.length !== 1)) {
     throw new Error(
       "Codex backend 只支持单设备：config.security.allowAllNodes 必须为 false，且 allowedNodeIds 必须恰好包含一个 nodeId",
@@ -322,6 +347,7 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
       bridgeMaximumExclusiveVersion: bridgeMaximumVersion,
     },
     codex: {
+      mode: codexMode,
       command: codexCommand,
       toolchainReadRoots: codexToolchainReadRoots,
       model: codexModel,
@@ -415,6 +441,7 @@ export async function initializeConfig(options: {
       bridgeMaximumExclusiveVersion: "0.2.0",
     },
     codex: {
+      mode: null,
       command: "codex",
       toolchainReadRoots: [],
       model: null,

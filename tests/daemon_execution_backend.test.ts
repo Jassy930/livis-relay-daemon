@@ -178,6 +178,60 @@ function seedInactiveHermesTerminal(
 }
 
 describe("RelayDaemon execution backend 接线", () => {
+  test("native-current 显式路由到本地状态不透明 adapter", async () => {
+    const directory = await temporaryDirectory("livis-daemon-native-route-");
+    const profile = await testProfile();
+    const profileText = `${JSON.stringify(profile, null, 2)}\n`;
+    const profilePath = join(directory.path, "protocol-profiles", "active.json");
+    await atomicWritePrivate(profilePath, profileText);
+    const secrets = new SecretStore(directory.path);
+    await secrets.initialize();
+    const identity: RelayIdentity = {
+      schemaVersion: 1,
+      accountId: "account",
+      agentId: `${profile.wireIdentity.agentIdPrefix}native-route`,
+      deviceId: `${profile.wireIdentity.deviceIdPrefix}native-route`,
+      createdAt: "2026-07-25T00:00:00.000Z",
+    };
+    const base = testConfig(directory.path);
+    const config = {
+      ...base,
+      profile: profilePath,
+      profileSha256: sha256(profileText),
+      execution: { backend: "codex" as const },
+      codex: {
+        ...base.codex,
+        mode: "native-current" as const,
+        command: "/opt/homebrew/bin/codex",
+        acknowledgeRemoteExecution: true,
+      },
+    };
+    const daemon = RelayDaemon.create({
+      config,
+      profile,
+      identity,
+      secrets,
+      secretValues: await secrets.load(),
+      upstreamProofExpiresAt: Date.now() + 60_000,
+      logger: new Logger("test.daemon-native-route", "error"),
+    });
+    try {
+      const internals = daemon as unknown as DaemonInternals;
+      expect(internals.executionBackend.constructor.name).toBe("CodexNativeExecutionBackend");
+      expect(internals.executionBackend.status()).toMatchObject({
+        kind: "codex",
+        mode: "native-current",
+        implementation: "codex-native-current",
+        stateOwnership: "local-state-opaque",
+        touchedDesktopDaemon: false,
+        credentialStateInspected: false,
+      });
+    } finally {
+      await daemon.stop();
+      await directory.cleanup();
+    }
+  });
+
   test("异 backend 的全部终态不进入 backlog，也不阻断当前 backend 启动", async () => {
     const fixture = await daemonFixture("livis-daemon-inactive-backend-terminal-");
     try {
