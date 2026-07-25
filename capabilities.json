@@ -105,7 +105,7 @@
       "status": "operator-only",
       "evidenceRefs": ["docs/LOCAL-BACKENDS.md", "docs/CODEX-NATIVE-AUTH.md"],
       "testRefs": ["tests/auth_boundary.test.ts", "tests/local_backend_contract.test.ts", "tests/codex_native_stdio.test.ts", "tests/codex_native_client_epoch.test.ts", "tests/codex_native_execution_lifecycle.test.ts", "tests/codex_native_thread_policy.test.ts", "tests/codex_native_session_coordinator.test.ts", "tests/codex_native_session_harness.test.ts", "tests/codex_native_execution_backend.test.ts", "tests/backend_switch.test.ts"],
-      "notes": "显式 codex.mode=native-current 可由操作者接入 Relay 自管的 codex app-server --stdio 子进程；只透传 HOME/CODEX_HOME 等 runtime 选择器，不读取、复制、分类或刷新账号凭据，也不连接 Desktop daemon。兼容性由 initialize 协议握手裁决，不以固定 CLI 版本窗阻断。生产接线、原子 backend switch 与离线门禁已有自动化证据；真实 LiViS thread/turn、session resume 与 Desktop 并发 canary 尚未闭合，因此仅为 operator-only。旧 private-api-key 路径必须显式选择且不会被静默 fallback。"
+      "notes": "显式 codex.mode=native-current 可由操作者接入 Relay 自管的 codex app-server --stdio 子进程；只透传 HOME/CODEX_HOME 等 runtime 选择器，不读取、复制、分类或刷新账号凭据，也不连接 Desktop daemon。兼容性由 initialize 协议握手裁决，不以固定 CLI 版本窗阻断。生产接线、原子 backend switch、离线门禁与真实 LiViS 文本闭环已有证据；真实 session resume/异常路径、工具执行与 Desktop 长时并发 canary 尚未闭合，因此仅为 operator-only。旧 private-api-key 路径必须显式选择且不会被静默 fallback。"
     },
     {
       "id": "claude_execution",

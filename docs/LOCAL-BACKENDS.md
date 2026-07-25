@@ -29,7 +29,7 @@ backend failed 处理。
 | 后端 | 调用链 | 当前认证所有权 | 当前状态 |
 | --- | --- | --- | --- |
 | Hermes | daemon → UDS connector → 专用 Hermes Gateway | Hermes 专用 profile | 已实现；远程输入门禁与 canary 已落地 |
-| Codex `native-current` | daemon → 自有 stdio JSON-RPC → `codex app-server` | Codex 当前本地 runtime；对 daemon 不透明 | `operator-only`；已接入 `serve`，真实 LiViS 消息 canary 待验证 |
+| Codex `native-current` | daemon → 自有 stdio JSON-RPC → `codex app-server` | Codex 当前本地 runtime；对 daemon 不透明 | `operator-only`；已接入 `serve` 并完成真实 LiViS 文本闭环，异常路径/长时并发待验证 |
 | Codex `private-api-key` | daemon → stdio JSON-RPC → `codex app-server` | `<stateDir>/backends/codex/home` 中由 Codex 管理的专用 API key | 已实现的旧兼容路径；必须显式选择 |
 | Claude | 尚无 transport | 尚未定义 | `contract-only`；`execution.backend=claude` 可被配置解析，但 `serve` 明确失败关闭 |
 
@@ -217,9 +217,9 @@ canary 已通过同一 harness 完成一个 turn。生产
 [Codex 原生当前状态边界](CODEX-NATIVE-AUTH.md#1-显式模式与原子切换)。
 
 真实 Gate 已证明执行隔离可由独立 app-server 的逐进程 argv 和逐 thread 回读完成，不需要修改用户
-默认配置、重启 Desktop daemon 或关闭 Desktop feature。该结论只覆盖单次 fresh turn；真实 resume、
-取消、超时、断线和长期并发的真实路径仍未闭合；生产路由已有离线证据，因此能力提升为
-`operator-only`，不能写成 live canary。
+默认配置、重启 Desktop daemon 或关闭 Desktop feature。真实 LiViS 唯一文本 canary 现已完成
+`Succeeded → Delivered → App 回显`；但真实 resume、取消、超时、断线、工具执行和长期并发
+仍未闭合，因此整项能力继续为 `operator-only`，不能写成全量 `live-canary-verified`。
 
 工作包：
 
@@ -230,7 +230,8 @@ canary 已通过同一 harness 完成一个 turn。生产
 3. readiness 只描述 transport 的 `ready | offline | incompatible`；本地执行错误不降低 transport
    readiness，也不阻止后续 job 再次调用当前本地状态。
 4. fake 端点已覆盖成功、普通 backend failed、超时、取消、app-server 退出、resume 和旧 epoch 迟到
-   事件；真实 fresh turn 已通过，真实 resume/异常路径与长时 Desktop 并发仍需另行授权验证。
+   事件；真实 fresh turn 与 LiViS 文本闭环已通过，真实 resume/异常路径、工具执行与长时
+   Desktop 并发仍需另行授权验证。
 5. 当前真实 transport 与单 turn Gate 已通过；本地账号状态无论正确或错误都不作为前置门禁，实际
    错误只按普通 execution failed 结算。
 

@@ -8,8 +8,9 @@ Desktop 的 control socket，不依赖 `app-server daemon`，也不会启动、�
 daemon。
 
 这项能力当前为 `codex_native_auth_reuse=operator-only`：显式生产接线、离线守卫和原子配置切换
-已有自动化证据，transport-only 与单次真实 thread/turn Gate 也已通过；但真实 LiViS 消息闭环、
-session resume、取消/超时和 Desktop 长时并发仍未通过，因此不能标为 live canary。
+已有自动化证据，transport-only、单次真实 thread/turn Gate 与真实 LiViS 文本消息闭环
+也已通过；但真实 session resume、取消/超时/断线、工具执行和 Desktop 长时并发
+仍未通过，因此不能把整项能力提升为 `live-canary-verified`。
 
 ## 1. 显式模式与原子切换
 
@@ -245,8 +246,9 @@ LiViS 闭环证据；它不再表示代码禁止 `serve`。运行中的 status �
 
 ## 9. 2026-07-25 常驻切换回执
 
-已将本机常驻 execution backend 从 Hermes 切换为 Codex `native-current`，稳定 checkout
-固定在 `61a94e5`。这次回执只证明服务连接态，不代表 LiViS 消息闭环：
+已将本机常驻 execution backend 从 Hermes 切换为 Codex `native-current`，运行时实现包含
+`3ee9e1c` 与 `61a94e5`。回执先完成服务连接态，后续由操作者完成了真实 LiViS
+文本消息闭环：
 
 - 切换前 Hermes Gateway 和 Relay 均已停止，完整 state 备份中 config/DB 摘要与 live
   一致，备份数据库 `quick_check=ok`、schema v8；
@@ -262,17 +264,28 @@ LiViS 闭环证据；它不再表示代码禁止 `serve`。运行中的 status �
   `credentialStateInspected=false`；
 - SQLite 中 native session 账号类型与主体摘要均为 `NULL`，当前无 backlog/quarantine。
 
-尚未从 LiViS App 发送本次版本的唯一文本 canary，因此能力继续保持
+本次文本 canary 的精确回执为：
+
+- 输入标识为 `LIVIS_CODEX_NATIVE_CANARY_20260725_1255_61A94E5`；
+- job `20260725143535-05fea484-cccf-4c3d-a661-d20b40ddb29a` 持久绑定
+  `target_backend=codex`，attempt ledger 为 `reserved → accepted → succeeded`；
+- job 为 `Succeeded`，outbox 为 `Delivered`，LiViS 结果 ACK 已确认；
+- 唯一 final 包含完整 canary 标识，并明确 Chronicle 受沙箱限制、未执行其他操作；
+- 操作者已在 LiViS App 目视确认该唯一回显；回显后 execution 恢复 idle，仍无
+  backlog/quarantine；
+- Codex Desktop daemon 仍为 PID `72289`、启动时间 `2026-07-13 16:23:14`，与切换前证据
+  锚点一致。
+
+这证明了真实文本路径，不证明工具/编码、resume 或异常恢复语义，因此能力继续保持
 `operator-only`。Hermes connector 在 Codex 模式为 `null/ready=false` 是预期状态，不得因此
 启动 Hermes Gateway。
 
 ## 10. 下一验证门禁
 
-在 `codex_native_auth_reuse` 从 `operator-only` 升级为真实 canary 证据前，还必须完成：
+在 `codex_native_auth_reuse` 从 `operator-only` 提升为 `live-canary-verified` 前，还必须完成：
 
-1. 从当前部署的 LiViS App 发送唯一文本 canary，核对同一 job 的
-   `Succeeded → outbox Delivered → App 回显`；
-2. 验证真实 resume、取消、超时、断线和迟到事件的协议形态；
-3. 在 Codex Desktop 同时运行时完成更长时段并发 canary，确认 Desktop session 与日常交互不受影响；
-4. 绑定精确 commit、CLI/app-server 版本、测试门禁和脱敏 receipt。任一缺失都保持
+1. 验证真实 resume、取消、超时、断线和迟到事件的协议形态；
+2. 在 Codex Desktop 同时运行时完成更长时段并发 canary，确认 Desktop session 与日常交互不受影响；
+3. 若宣称工具/编码能力，完成真实工作区文件、工具事件与独立测试的 canary；
+4. 为上述未闭合路径绑定精确 commit、CLI/app-server 版本、测试门禁和脱敏 receipt。任一缺失都保持
    `operator-only`，不能用 doctor ready 或 transport probe 代替。

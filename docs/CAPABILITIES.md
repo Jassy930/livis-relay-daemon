@@ -3,8 +3,9 @@
 根目录 [`capabilities.json`](../capabilities.json) 是当前公开能力、证据等级、安全默认值、命令权限和发布产物的机器可读事实源；[`schemas/capabilities.schema.json`](../schemas/capabilities.schema.json) 使用 JSON Schema Draft 2020-12 严格约束结构和枚举值。
 
 当前契约明确区分 Codex app-server 私有兼容路径的受控 canary 与原生当前状态调用：前者已有证据，
-后者要求账号状态对 relay 完全不透明，生产接线与停服切换已有自动化证据，当前为
-`operator-only`，尚不能写成 LiViS 实网 canary。Claude 和同一 daemon 在线多后端路由仍保持 `unsupported`，不能因
+后者要求账号状态对 relay 完全不透明，生产接线、停服切换与真实 LiViS 文本闭环已有证据；
+由于 resume/异常、工具执行和长时 Desktop 并发尚未闭合，当前仍为 `operator-only`。Claude 和同一
+daemon 在线多后端路由仍保持 `unsupported`，不能因
 类型契约或配置枚举存在而提升状态。
 
 ## 证据等级
