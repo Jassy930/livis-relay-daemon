@@ -17,6 +17,7 @@
 - 新增严格 JSON Schema 约束的 `capabilities.json`，并提供只读 CLI、证据引用和一致性门禁。
 - 新增 Hermes bridge 原子安装器、私有配置备份、失败自动恢复和哈希绑定回滚收据。
 - 新增源码包与 bridge 包构建、SHA-256 manifest、路径预检和解包后发布产物审计。
+- 新增 backend-aware 部署安装器：正式 manifest 固定 SHA、clean-git 产物复审、隔离依赖安装、不可变 release、私有部署收据，以及 `plan/install/upgrade/rollback/uninstall`。服务管理必须显式确认并可注入测试；全流程不读取、复制、迁移或判断 Hermes、Codex、Claude 原生认证状态。
 
 ### 修复
 

@@ -28,6 +28,7 @@ export interface DeploymentServicePlan {
   stopRequired: boolean;
   reloadRequired: boolean;
   startRequired: boolean;
+  nativeHomeAccess: boolean;
   explicitAcknowledgementRequired: boolean;
 }
 
@@ -71,6 +72,7 @@ export interface DeploymentReceipt {
   installedDeployment: DeploymentPointer;
   previousServiceDefinitionSha256: string | null;
   previousServiceDefinitionBackupPath: string | null;
+  previousServiceActive: boolean;
   hermesInstallReceiptPath: string | null;
   serviceRestartPerformed: boolean;
   credentialsReadOrMigrated: false;

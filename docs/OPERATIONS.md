@@ -91,7 +91,8 @@ refresh token 与完整 state 已按失败关闭保留，远端撤销和清理�
 ## 6. 准备执行后端
 
 一套 daemon 只能在 Hermes、Codex、Claude 中选择一个 backend。默认 Hermes 的运维
-步骤见 6.1；显式 Codex 的私有登录与目录步骤见 6.2。Claude 尚无实现和启动步骤。
+步骤见 6.1；显式 Codex 的私有登录与目录步骤见 6.2，本机当前 Codex/Claude runtime
+分别见 6.3 与 6.4。
 三者不能同时启动，也不能共享会话或工作区。
 
 ### 6.1 安装 Hermes plugin
@@ -774,6 +775,92 @@ checkpoint 均保持不变。漂移会直接 quarantine 且不继续重试，预
 
 替换模板中的绝对路径后再加载服务。Hermes 模式下 daemon 和 Gateway 必须是两个
 独立服务；Codex 模式只加载 daemon 服务，并确保 `codex.command` 的绝对路径可执行。
+
+### 发布安装器（推荐）
+
+正式部署优先使用 [`deploy` 安装器](DEPLOYMENT-INSTALLER.md)，不要再把任意开发 checkout
+直接作为常驻运行目录。安装器 runner 可以来自已审阅 checkout 或临时解包的源码发布包，
+但目标 release 只会从传入的正式 `release-manifest.json` 与归档重建，不复制 runner
+工作区。首次部署前仍需按第 2～6 节准备获授权 profile、初始化 config 并选择 backend；
+安装器不会执行 LiViS 或本地后端登录。
+
+先从独立可信渠道取得 manifest 的 SHA-256，再做零持久状态写入计划。归档审计会短暂使用
+系统临时目录，但不会写 deployment、config、stateDir 或服务状态。以下示例使用默认
+`$HOME/.local/share/livis-relay-daemon` 部署根和当前平台服务管理器：
+
+```bash
+bun run src/index.ts deploy plan \
+  --manifest '/绝对路径/release-manifest.json' \
+  --manifest-sha256 '<可信渠道取得的64位小写SHA-256>' \
+  --config "$HOME/.livis-relay/config.json"
+```
+
+Hermes backend 还必须在所有 plan/install/upgrade 命令中显式增加：
+
+```bash
+--hermes-home "$LIVIS_HERMES_HOME"
+```
+
+若 plan 中版本、commit、backend、config、releasePath、`service.nativeHomeAccess`、
+service definition SHA 或
+`credentialsReadOrMigrated=false` 与预期不一致，停止操作。首次安装可让安装器管理 Relay
+服务；Hermes Gateway 仍由操作者按精确专用 label 停止和启动：
+
+```bash
+bun run src/index.ts deploy install \
+  --manifest '/绝对路径/release-manifest.json' \
+  --manifest-sha256 '<可信SHA-256>' \
+  --config "$HOME/.livis-relay/config.json" \
+  --apply \
+  --manage-service \
+  --acknowledge-service-restart
+```
+
+Hermes 模式再增加 `--hermes-home "$LIVIS_HERMES_HOME"` 与
+`--acknowledge-hermes-stopped`。不希望安装器调用 `launchctl/systemctl` 时，不传
+`--manage-service`，改传 `--acknowledge-daemon-stopped`；安装器仍写入并读回服务定义，
+但输出会保持 `serviceRestartPerformed=false`。只安装不可变 release、不生成服务定义时，
+显式使用 `--service-manager none`。
+
+升级前必须按第 8 节在停服状态完整备份 state directory。安装器故意不复制 stateDir，
+避免把 token、SQLite 和 backend workspace 混入部署收据：
+
+```bash
+bun run src/index.ts deploy upgrade \
+  --manifest '/绝对路径/新版本/release-manifest.json' \
+  --manifest-sha256 '<新版本可信SHA-256>' \
+  --config "$HOME/.livis-relay/config.json" \
+  --apply \
+  --acknowledge-daemon-stopped \
+  --acknowledge-state-backup
+```
+
+upgrade 不就地覆盖旧 release。需要回滚时，先确认旧代码可读取当前 state schema，再使用
+目标 upgrade 收据；Hermes 模式同样要确认专用 Gateway 已停止：
+
+```bash
+bun run src/index.ts deploy rollback \
+  --install-root "$HOME/.local/share/livis-relay-daemon" \
+  --receipt '/绝对路径/receipts/.../receipt.json' \
+  --apply \
+  --acknowledge-daemon-stopped \
+  --acknowledge-state-compatibility
+```
+
+卸载只移除当前 Relay 服务定义与活动部署指针，不删除 release、收据、config、stateDir、
+Hermes bridge、Codex/Claude workspace、assistant context 或任何本地认证状态：
+
+```bash
+bun run src/index.ts deploy uninstall \
+  --install-root "$HOME/.local/share/livis-relay-daemon" \
+  --apply \
+  --acknowledge-daemon-stopped \
+  --acknowledge-uninstall
+```
+
+安装器完成只证明发布输入、release/收据/服务定义读回和可选服务动作通过。随后仍须执行
+`status`、`doctor --online` 及对应 backend 的真实 LiViS 消息 canary。当前 launchd/systemd
+模板与以下稳定 checkout 步骤保留为人工诊断和安装器不可用时的回退，不再是推荐主路径。
 
 ### macOS LaunchAgent
 

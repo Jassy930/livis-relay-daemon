@@ -94,12 +94,16 @@ export const SOURCE_REQUIRED_PATHS = [
   "package.json",
   "bun.lock",
   "src/index.ts",
+  "src/install/deployment.ts",
+  "src/install/deployment-service.ts",
+  "src/install/deployment-contract.ts",
   "src/release/artifacts.ts",
   "scripts/check-public-release.ts",
   "scripts/check-release-artifacts.ts",
   "hermes-plugin/plugin.yaml",
   "hermes-plugin/adapter.py",
   "docs/RELEASING.md",
+  "docs/DEPLOYMENT-INSTALLER.md",
 ] as const;
 
 export const BRIDGE_REQUIRED_PATHS = [
@@ -373,7 +377,7 @@ async function walkExtracted(root: string, current = root): Promise<string[]> {
   return files.sort();
 }
 
-function parseReleaseManifest(value: unknown, path: string): ReleaseManifest {
+export function parseReleaseManifest(value: unknown, path: string): ReleaseManifest {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`${path} 必须是 JSON object`);
   }
@@ -395,9 +399,14 @@ function parseReleaseManifest(value: unknown, path: string): ReleaseManifest {
   return root as unknown as ReleaseManifest;
 }
 
+export async function loadReleaseManifest(manifestPathValue: string): Promise<ReleaseManifest> {
+  const manifestPath = resolve(manifestPathValue);
+  return parseReleaseManifest(JSON.parse(await readFile(manifestPath, "utf8")), manifestPath);
+}
+
 export async function auditReleaseArtifacts(manifestPathValue: string): Promise<ReleaseArtifactAuditReport> {
   const manifestPath = resolve(manifestPathValue);
-  const manifest = parseReleaseManifest(JSON.parse(await readFile(manifestPath, "utf8")), manifestPath);
+  const manifest = await loadReleaseManifest(manifestPath);
   const findings: AuditFinding[] = [];
   const reports: ReleaseArtifactAuditReport["artifacts"] = [];
   const kinds = new Set<ReleaseArtifactKind>();

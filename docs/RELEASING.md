@@ -21,7 +21,9 @@
 6. 在空的 `dist/` 中执行 `bun run release:verify`。该命令构建源码包和 Hermes bridge 包，生成 `release-manifest.json`，再按 manifest 读回大小与 SHA-256 并解包审计。
 7. 对解包后的源码包运行敏感路径/内容门禁；bridge 包只允许 `plugin.yaml`、`__init__.py`、`adapter.py`、README、LICENSE、NOTICE、能力契约和 Schema。
 8. 使用审计通过的 bridge 包做一次 plugin 加载和 UDS canary。产物审计不替代真实 Hermes 或 LiViS 验证。
-9. 创建签名 tag `vX.Y.Z`，再创建 GitHub Release，附两个归档和 `release-manifest.json`。
+9. 计算 `release-manifest.json` 自身的 SHA-256，把它写入由签名 tag/release note 独立绑定的
+   发布说明；再创建签名 tag `vX.Y.Z` 和 GitHub Release，附两个归档与 manifest。部署
+   安装器要求操作者从可信渠道取得这个 manifest SHA，不能只信同一下载目录里的自声明值。
 
 ## 发布产物命令
 
@@ -42,6 +44,16 @@ bun run release:verify
 - `livis-relay-daemon-X.Y.Z.tar.gz`：明确白名单目录组成的源码发行包，不会包含 `.claude/`、`node_modules/`、`.venv/`、缓存或运行状态。
 - `livis-hermes-bridge-X.Y.Z.tar.gz`：最小 Hermes bridge 安装包。
 - `release-manifest.json`：记录版本、源码状态、Git commit、每个归档的唯一根目录、大小、SHA-256 和必需路径。只有干净 checkout 会记录 commit；日常工作树自检明确标记为 `working-tree` 且不绑定 commit。
+
+正式候选构建后记录 manifest 自身摘要：
+
+```bash
+shasum -a 256 dist/release-manifest.json
+```
+
+这个摘要是 [`deploy` 安装器](DEPLOYMENT-INSTALLER.md)的固定信任输入。manifest 内部不保存
+自身摘要，也没有内置签名信任根；如果摘要与 manifest/归档来自同一个未受信渠道，哈希
+只能检测传输错误，不能证明发布者身份。
 
 审计在解包前拒绝绝对路径、`..`、多根目录、超过 20000 个条目、符号链接和硬链接；解包后再次拒绝白名单外 bridge 文件、敏感路径、生产身份、私钥和运行状态。任何归档被修改后都会因 SHA-256 不匹配而失败。
 

@@ -8,7 +8,7 @@
 可信渠道取得 manifest SHA-256
 → 读回 release manifest 与两个归档
 → 完整产物审计
-→ plan 零写入
+→ plan 零持久状态写入
 → install / upgrade 显式 apply
 → 写入私有收据和当前部署指针
 → 可验证 rollback / uninstall
@@ -30,7 +30,9 @@
 - 源码包和 Hermes bridge 包的文件名、唯一根目录、大小、SHA-256 与必需路径契约完整；
 - 归档不含绝对路径、目录穿越、多根、符号链接、硬链接或发布白名单外内容；
 - apply 阶段重新快照输入并复跑同一审计，不能把较早的 plan 结果直接当写入授权；
-- 解包后运行 `bun install --frozen-lockfile --ignore-scripts`，并对发布文件执行哈希读回。
+- 解包后运行 `bun install --frozen-lockfile --ignore-scripts --backend=copyfile`，避免生命周期
+  脚本与依赖 hardlink 把 release 完整性外包给可变缓存；安装后同时固定发布文件和完整
+  `node_modules` 树的 SHA-256 读回。
 
 manifest SHA-256 只能绑定操作者拿到的字节，不能自行证明发布者身份。v1 不内置签名信任根；发布者身份与 manifest 哈希的可信分发仍是操作者门禁。
 
@@ -46,7 +48,9 @@ manifest SHA-256 只能绑定操作者拿到的字节，不能自行证明发布
 └── receipts/
     └── <operationId>/
         ├── receipt.json
-        ├── release-manifest.json
+        ├── release-bundle/
+        │   ├── release-manifest.json
+        │   └── 两个发布归档
         └── service.before（仅原定义存在时）
 ```
 
@@ -66,7 +70,10 @@ backend 由现有 config 解析得出，CLI 不能另传一个不一致的 backe
 
 ## 5. 服务管理副作用
 
-`plan` 永远零写入，也不会调用 `launchctl` 或 `systemctl`。`install`、`upgrade`、`rollback`、`uninstall` 的文件写入需要 `--apply`；需要安装、停止、reload 或启动用户服务时，还必须同时传入服务副作用确认参数。
+`plan` 永远不写 deployment、config、stateDir 或服务状态，也不会调用 `launchctl` 或
+`systemctl`。为完成归档内容审计，它会在系统临时目录解包并在返回前清理；这不是部署
+提交点。`install`、`upgrade`、`rollback`、`uninstall` 的持久文件写入需要 `--apply`；
+需要安装、停止、reload 或启动用户服务时，还必须同时传入服务副作用确认参数。
 
 服务控制通过 `DeploymentServiceController` 注入，测试只使用内存 fake。生产控制器只允许精确 label/unit：
 
@@ -74,13 +81,20 @@ backend 由现有 config 解析得出，CLI 不能另传一个不一致的 backe
 - Linux user service：`livis-relayd.service`；
 - `none`：只安装精确 release 与部署收据，不生成或操作服务定义。
 
+Linux systemd 对 Hermes 与 Codex `private-api-key` 保持 `ProtectHome=read-only`；Codex 或
+Claude `native-current` 必须让原生 runtime 按用户当前状态自行读写 home，因此生成
+`ProtectHome=false`，但仍不注入任何认证环境变量。这个差异会进入服务定义 SHA 和部署
+收据，plan 时必须人工核对。macOS LaunchAgent 不增加额外 HOME 沙箱；真正的工具与
+workspace 约束仍由各 backend adapter 持有。
+
 操作者选择不让安装器管理服务时，升级与回滚必须显式确认 daemon（Hermes 模式还包括专用 Gateway）已停止；安装器只更新磁盘定义并在结果中返回 `serviceRestartPerformed=false`。任何服务状态不明、定义读回不一致或启动失败都失败关闭，不能写成部署完成。
 
 ## 6. 操作状态机
 
 ### plan
 
-读取并验证 manifest、归档、config、backend、目标布局和服务定义，输出确定性计划；不创建目录、不安装依赖、不写收据、不触发服务动作。
+读取并验证 manifest、归档、config、backend、目标布局和服务定义，输出确定性计划；除
+临时解包审计外，不创建持久目录、不安装依赖、不写收据、不触发服务动作。
 
 ### install
 

@@ -51,6 +51,10 @@ flowchart LR
 - `private-api-key` 具备有界 idle recovery；`native-current` 的 active 断连进入持久 recovery/quarantine，idle 断开只降低 readiness，均绝不自动重放业务 job。
 - Hermes bridge 在建立 job 映射、发送 `accepted` 和进入 dispatcher 之前，拒绝全部斜杠命令及 Hermes 0.15.1 会归一化的自然语言重启别名；active session、blocking approval 或状态不可读时同样失败关闭。daemon 内部 cancel 生成的 `/stop` 仍走独立控制路径。
 - LiViS profile 按 SHA-256 固定；未知 wire protocol、版本或 artifact 漂移默认拒绝。
+- 正式部署可用 `deploy plan/install/upgrade/rollback/uninstall` 消费固定 manifest SHA 的
+  clean-git 发布归档，生成不可变 release 与私有收据；服务副作用必须显式确认，安装器
+  不读取、复制、迁移或判断 Hermes/Codex/Claude 原生认证状态。详见
+  [部署安装器架构与边界](docs/DEPLOYMENT-INSTALLER.md)。
 - `login/serve` 要求近期 supported proof；daemon 每 6 小时在线复核。
 - `wireContractRevision + credentialMode` 同时绑定 profile、runtime digest 与 supported proof；机器可读 registry、append-only 历史门禁和本地脱敏 probe artifact 防止 wire 代码静默漂移或覆写旧基线。
 - schema v1→v2 迁移采用固定 contract 人工确认、私有 PREPARED/备份、source→target 重建校验、持久化 guard、proof quarantine 和可自愈显式回滚；迁移命令不打开 SQLite。

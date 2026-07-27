@@ -93,6 +93,14 @@
       "notes": "只在操作者提供明确专用 HERMES_HOME 后原子安装；不会启动或重启 Gateway。"
     },
     {
+      "id": "audited_release_deployment",
+      "direction": "local",
+      "status": "operator-only",
+      "evidenceRefs": ["docs/DEPLOYMENT-INSTALLER.md", "docs/OPERATIONS.md", "docs/RELEASING.md"],
+      "testRefs": ["tests/deployment_boundary.test.ts", "tests/deployment_installer.test.ts", "tests/deployment_service.test.ts", "tests/deployment_cli.test.ts", "tests/release_artifacts.test.ts"],
+      "notes": "deploy plan/install/upgrade/rollback/uninstall 只消费由操作者固定 SHA-256 的 clean-git release manifest 与审计归档，使用不可变 release、私有收据和显式服务副作用确认；不读取、复制、迁移或判断 Hermes、Codex、Claude 原生认证状态。真实 launchd/systemd 安装、升级和回滚 canary 尚未执行。"
+    },
+    {
       "id": "codex_app_server_execution",
       "direction": "bidirectional",
       "status": "live-canary-verified",
@@ -182,6 +190,7 @@
       "status",
       "doctor",
       "claude probe-native-cli",
+      "deploy plan",
       "version"
     ],
     "localStateMutation": [
@@ -196,7 +205,11 @@
       "codex smoke-app-server",
       "codex probe-native-app-server",
       "install-hermes-plugin install",
-      "install-hermes-plugin rollback"
+      "install-hermes-plugin rollback",
+      "deploy install",
+      "deploy upgrade",
+      "deploy rollback",
+      "deploy uninstall"
     ],
     "externalStateMutation": [
       "login",
@@ -208,7 +221,11 @@
       "upstream activate --acknowledge-reviewed-profile",
       "upstream rollback --acknowledge-rollback",
       "install-hermes-plugin rollback --acknowledge-rollback",
-      "backend switch --apply --acknowledge-daemon-stopped --acknowledge-remote-execution"
+      "backend switch --apply --acknowledge-daemon-stopped --acknowledge-remote-execution",
+      "deploy install/upgrade --apply",
+      "deploy rollback --apply --acknowledge-state-compatibility",
+      "deploy uninstall --apply --acknowledge-uninstall",
+      "deploy --manage-service --acknowledge-service-restart"
     ]
   },
   "network": {
@@ -265,6 +282,12 @@
       "mode": "0700",
       "contains": ["AGENTS.md instructions", "operator-managed read-only memory Markdown"],
       "retention": "operator-managed"
+    },
+    {
+      "path": "<installRoot>",
+      "mode": "0700",
+      "contains": ["immutable release trees", "deployment pointer", "private deployment receipts", "audited release bundle snapshot"],
+      "retention": "until-explicit-cleanup"
     }
   ],
   "release": {

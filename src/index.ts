@@ -81,6 +81,14 @@ import {
   sha256,
 } from "./util.ts";
 import { switchBackend, type SwitchableBackend } from "./backend/switch.ts";
+import {
+  applyDeployment,
+  planDeployment,
+  rollbackDeployment,
+  uninstallDeployment,
+  type DeploymentPlanOptions,
+} from "./install/deployment.ts";
+import type { DeploymentServiceManager } from "./install/deployment-contract.ts";
 
 const PROJECT_ROOT = resolve(import.meta.dir, "..");
 const BUILTIN_PROFILE_DIRECTORY = join(PROJECT_ROOT, "protocol-profiles");
@@ -962,6 +970,138 @@ async function commandBackendSwitch(args: string[]): Promise<void> {
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
+function deploymentInstallRoot(args: string[]): string {
+  return expandHome(optionValue(args, "--install-root") ?? "~/.local/share/livis-relay-daemon");
+}
+
+function deploymentServiceManager(args: string[]): DeploymentServiceManager {
+  const explicit = optionValue(args, "--service-manager");
+  if (explicit !== undefined) {
+    if (!["launchd", "systemd", "none"].includes(explicit)) {
+      throw new Error("--service-manager 只支持 launchd、systemd 或 none");
+    }
+    return explicit as DeploymentServiceManager;
+  }
+  if (process.platform === "darwin") return "launchd";
+  if (process.platform === "linux") return "systemd";
+  return "none";
+}
+
+function assertDeployArguments(
+  args: string[],
+  valueOptions: readonly string[],
+  flags: readonly string[],
+): void {
+  const values = new Set(valueOptions);
+  const booleans = new Set(flags);
+  for (let index = 2; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (values.has(argument)) {
+      const value = args[index + 1];
+      if (!value || value.startsWith("--")) throw new Error(`${argument} 必须提供非空值`);
+      index += 1;
+      continue;
+    }
+    if (booleans.has(argument)) continue;
+    throw new Error(`deploy ${args[1] ?? ""} 未知参数：${argument}`);
+  }
+}
+
+function deploymentPlanOptions(
+  args: string[],
+  requestedOperation?: "install" | "upgrade",
+): DeploymentPlanOptions {
+  const manifestPath = optionValue(args, "--manifest");
+  const manifestSha256 = optionValue(args, "--manifest-sha256");
+  if (!manifestPath || !manifestSha256) {
+    throw new Error("deploy plan/install/upgrade 必须传入 --manifest 与 --manifest-sha256");
+  }
+  const hermesHome = optionValue(args, "--hermes-home");
+  return {
+    manifestPath: expandHome(manifestPath),
+    manifestSha256,
+    configPath: expandHome(
+      optionValue(args, "--config") ?? process.env.LIVIS_RELAY_CONFIG ?? DEFAULT_CONFIG_PATH,
+    ),
+    installRoot: deploymentInstallRoot(args),
+    serviceManager: deploymentServiceManager(args),
+    manageService: hasFlag(args, "--manage-service"),
+    bunPath: expandHome(optionValue(args, "--bun") ?? process.execPath),
+    hermesHome: hermesHome ? expandHome(hermesHome) : undefined,
+    requestedOperation,
+  };
+}
+
+async function commandDeploy(args: string[]): Promise<void> {
+  const subcommand = args[1];
+  if (subcommand === "plan") {
+    assertDeployArguments(
+      args,
+      ["--manifest", "--manifest-sha256", "--config", "--install-root", "--service-manager", "--bun", "--hermes-home"],
+      ["--manage-service"],
+    );
+    const result = await planDeployment(deploymentPlanOptions(args));
+    process.stdout.write(`${JSON.stringify({ ok: true, applied: false, plan: result }, null, 2)}\n`);
+    return;
+  }
+  if (subcommand === "install" || subcommand === "upgrade") {
+    assertDeployArguments(
+      args,
+      ["--manifest", "--manifest-sha256", "--config", "--install-root", "--service-manager", "--bun", "--hermes-home"],
+      ["--apply", "--manage-service", "--acknowledge-daemon-stopped", "--acknowledge-hermes-stopped", "--acknowledge-service-restart", "--acknowledge-state-backup"],
+    );
+    const result = await applyDeployment({
+      ...deploymentPlanOptions(args, subcommand),
+      apply: hasFlag(args, "--apply"),
+      acknowledgeDaemonStopped: hasFlag(args, "--acknowledge-daemon-stopped"),
+      acknowledgeHermesStopped: hasFlag(args, "--acknowledge-hermes-stopped"),
+      acknowledgeServiceRestart: hasFlag(args, "--acknowledge-service-restart"),
+      acknowledgeStateBackup: hasFlag(args, "--acknowledge-state-backup"),
+    });
+    process.stdout.write(`${JSON.stringify({ ok: true, applied: true, receipt: result }, null, 2)}\n`);
+    return;
+  }
+  if (subcommand === "rollback") {
+    assertDeployArguments(
+      args,
+      ["--receipt", "--install-root"],
+      ["--apply", "--manage-service", "--acknowledge-daemon-stopped", "--acknowledge-hermes-stopped", "--acknowledge-service-restart", "--acknowledge-state-compatibility"],
+    );
+    const receiptPath = optionValue(args, "--receipt");
+    if (!receiptPath) throw new Error("deploy rollback 必须传入 --receipt");
+    const result = await rollbackDeployment({
+      installRoot: deploymentInstallRoot(args),
+      receiptPath: expandHome(receiptPath),
+      apply: hasFlag(args, "--apply"),
+      manageService: hasFlag(args, "--manage-service"),
+      acknowledgeDaemonStopped: hasFlag(args, "--acknowledge-daemon-stopped"),
+      acknowledgeHermesStopped: hasFlag(args, "--acknowledge-hermes-stopped"),
+      acknowledgeServiceRestart: hasFlag(args, "--acknowledge-service-restart"),
+      acknowledgeStateCompatibility: hasFlag(args, "--acknowledge-state-compatibility"),
+    });
+    process.stdout.write(`${JSON.stringify({ ok: true, applied: true, receipt: result }, null, 2)}\n`);
+    return;
+  }
+  if (subcommand === "uninstall") {
+    assertDeployArguments(
+      args,
+      ["--install-root"],
+      ["--apply", "--acknowledge-uninstall", "--manage-service", "--acknowledge-daemon-stopped", "--acknowledge-service-restart"],
+    );
+    const result = await uninstallDeployment({
+      installRoot: deploymentInstallRoot(args),
+      apply: hasFlag(args, "--apply"),
+      acknowledgeUninstall: hasFlag(args, "--acknowledge-uninstall"),
+      manageService: hasFlag(args, "--manage-service"),
+      acknowledgeDaemonStopped: hasFlag(args, "--acknowledge-daemon-stopped"),
+      acknowledgeServiceRestart: hasFlag(args, "--acknowledge-service-restart"),
+    });
+    process.stdout.write(`${JSON.stringify({ ok: true, applied: true, receipt: result }, null, 2)}\n`);
+    return;
+  }
+  throw new Error("只支持 deploy plan / install / upgrade / rollback / uninstall");
+}
+
 function printHelp(): void {
   process.stdout.write(`livis-relay-daemon ${DAEMON_VERSION}\n\n`);
   process.stdout.write("命令：\n");
@@ -975,6 +1115,10 @@ function printHelp(): void {
   process.stdout.write("  backend switch hermes [--apply --acknowledge-daemon-stopped] [--config PATH]\n");
   process.stdout.write("  backend switch codex --mode native-current --command PATH [--apply --acknowledge-daemon-stopped --acknowledge-remote-execution] [--config PATH]\n");
   process.stdout.write("  backend switch claude --mode native-current --command PATH [--apply --acknowledge-daemon-stopped --acknowledge-remote-execution] [--config PATH]\n");
+  process.stdout.write("  deploy plan --manifest PATH --manifest-sha256 SHA256 [--config PATH --install-root PATH --service-manager launchd|systemd|none --hermes-home PATH]\n");
+  process.stdout.write("  deploy install|upgrade --manifest PATH --manifest-sha256 SHA256 --apply [--manage-service --acknowledge-service-restart | --acknowledge-daemon-stopped] [--acknowledge-hermes-stopped] [--acknowledge-state-backup] [--config PATH --install-root PATH]\n");
+  process.stdout.write("  deploy rollback --receipt PATH --apply --acknowledge-state-compatibility [--manage-service --acknowledge-service-restart | --acknowledge-daemon-stopped] [--acknowledge-hermes-stopped] [--install-root PATH]\n");
+  process.stdout.write("  deploy uninstall --apply --acknowledge-uninstall [--manage-service --acknowledge-service-restart | --acknowledge-daemon-stopped] [--install-root PATH]\n");
   process.stdout.write("  upstream check [--config PATH]\n");
   process.stdout.write("  upstream activate --profile PATH --acknowledge-reviewed-profile [--config PATH]\n");
   process.stdout.write("  upstream rollback --backup PATH --acknowledge-rollback [--config PATH]\n");
@@ -1021,6 +1165,9 @@ async function main(): Promise<void> {
     case "backend":
       if (subcommand !== "switch") throw new Error("只支持 backend switch");
       await commandBackendSwitch(args);
+      break;
+    case "deploy":
+      await commandDeploy(args);
       break;
     case "upstream":
       if (subcommand === "check") await commandUpstreamCheck(args);
