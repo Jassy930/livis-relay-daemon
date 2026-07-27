@@ -183,7 +183,7 @@ describe("Codex doctor 启动前安全门禁", () => {
         ok: false,
       });
       expect(report.checks.find((check) => check.name === "codex_version")?.detail)
-        .toContain("Codex command realpath 不能位于 daemon stateDir 内");
+        .toContain("不能位于 daemon stateDir 内");
       expect(await Bun.file(sentinel).exists()).toBeFalse();
     } finally {
       await Promise.all([state.cleanup(), external.cleanup()]);

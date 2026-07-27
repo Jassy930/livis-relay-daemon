@@ -380,8 +380,11 @@ describe("Codex daemon 托管目录", () => {
 
       await chmod(layout.hostHome, 0o700);
       await assertCodexRuntimeLayout(layout);
+      // 先创建替代目录，避免 Linux 在删除后立即复用旧 inode，导致测试失去确定性。
+      const replacementAgentTmpDir = join(layout.workspace, ".agent-tmp-replacement");
+      await mkdir(replacementAgentTmpDir, { mode: 0o700 });
       await rm(layout.agentTmpDir, { recursive: true });
-      await mkdir(layout.agentTmpDir, { mode: 0o700 });
+      await rename(replacementAgentTmpDir, layout.agentTmpDir);
       await expect(assertCodexRuntimeLayout(layout)).rejects.toThrow("固定 inode");
     } finally {
       await directory.cleanup();
