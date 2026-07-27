@@ -1,186 +1,184 @@
-# LiViS 共享 Relay Daemon（一期：Hermes 默认，Codex / Claude 实验后端）
+# LiViS Relay Daemon
 
 [![CI](https://github.com/Jassy930/livis-relay-daemon/actions/workflows/ci.yml/badge.svg)](https://github.com/Jassy930/livis-relay-daemon/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-这是一个独立于 LiViS 官方 OpenClaw 插件、Hermes core、Codex 与 Claude Code 的本地 relay daemon。当前协议实现基于对 LiViS v2.0.0 wire 行为的静态观察，由 daemon 持有消息、执行租约和 durable outbox，再把请求交给默认 Hermes backend，或显式启用 Codex / Claude backend。Codex 必须显式选择本机当前 runtime 的 `native-current`，或使用专用 API key 的 `private-api-key` 兼容模式；Claude 首版只支持本机当前状态的无会话纯文本安全路径。三者不会自动 fallback。服务端事实、历史 canary 与未知项以[协议证据边界](docs/LIVIS-RELAY-PROTOCOL-BOUNDARY.md)为准。
+在本地把 LiViS 消息连接到 Hermes、Codex 或 Claude Code。
 
-> 当前属于实验性的第三方兼容实现，不是理想、Hermes、Codex 或 OpenAI 官方组件，也不代表任何官方背书。本仓库不包含或再分发官方 bundle；使用者在连接相关服务前，应自行确认适用的服务条款、协议权限和数据合规要求。
+`livis-relay-daemon` 接收 LiViS 文本任务，调用选定的本地 AI 后端，并通过 SQLite 保存任务与回复
+投递状态。一套 daemon 同时只使用一个后端，不会自动切换或静默 fallback。
 
-公开仓库不附带可直连生产服务的 live profile，也不默认复用任何官方 OAuth 客户端身份。运行前必须准备自己有权使用的 profile，详见 [`protocol-profiles/README.md`](protocol-profiles/README.md)。
+> 当前版本为实验性的第三方兼容实现，不是 LiViS、Hermes、Codex、Claude 或相关厂商的官方组件。
 
-```mermaid
-flowchart LR
-    L["理想同学 / LiViS Relay"] <-->|"OAuth + WSS"| D["livis-relayd\nBun / SQLite"]
-    D -->|"显式选择一个 backend"| B{"ExecutionBackend"}
-    B <-->|"UDS WebSocket\nBearer + lease"| P["Hermes livis-bridge plugin"]
-    P <--> H["专用 Hermes Gateway\n只读工具配置"]
-    B <-->|"stdio JSON-RPC\nthread / turn"| C["daemon 自管 Codex app-server\nnative-current 或 private-api-key"]
-    B -->|"CLI stream-json\nstateless text"| A["daemon 自管 Claude Code 子进程\nnative-current / safe-mode"]
+## 主要功能
+
+- 支持 Hermes、Codex 和 Claude Code 本地后端。
+- 复用 Codex/Claude 本机当前 runtime 状态，不单独读取、复制或管理其认证凭据。
+- 使用 SQLite 持久化 job、执行状态和 durable outbox。
+- 支持任务幂等、租约隔离、结果重投和 best-effort 取消。
+- 提供状态诊断、后端切换和发布部署命令。
+- 可选使用 `AGENTS.md + memory/*.md` 提供个人助手上下文。
+
+```text
+LiViS Relay  <-- OAuth + WSS -->  livis-relayd  <-- 本地接口 -->  Hermes / Codex / Claude Code
+                                      |
+                                      └── SQLite jobs + outbox
 ```
 
-## 一期边界
+## 支持的后端
 
-- 默认只接 Hermes；Codex 与 Claude 都必须显式配置并确认远程执行。Claude 当前只开放无工具、无持久会话的单任务纯文本路径。
-- 只支持纯文本、单个 final result。
-- 一期暂将 LiViS `node_id` 视为设备来源标识；每套 daemon、config 与 state directory 只允许一个预先配置的 `node_id`。
-- 不支持多设备同时接入、跨设备共享后端会话或原地换设备；稳定 session key 固定为 `livis:<agentId>`。
-- Hermes 必须使用专用 profile、专用工作区和只读工具集。Codex `native-current` 只调用当前本地 runtime，账号和认证错误对 daemon 不透明；`private-api-key` 使用 state directory 内的专用 `CODEX_HOME`、API key 和 workspace，并可选择默认 OpenAI 或经确认的 custom Responses provider。
-- Claude `native-current` 从白名单环境调用本地 Claude Code 当前状态；不读取账号信息，并固定 `safe-mode`、空 tools/MCP/skills/slash commands 与 `--no-session-persistence`。
-- 可选 `assistantContext` 让 Codex/Claude 共用 stateDir 外的只读 `AGENTS.md + memory/*.md` 长期真源；backend workspace 只保存每轮恢复的快照，不自动写回记忆。
-- 不支持远程审批、附件、token stream、tool progress、管理命令和远程 `/update`。
-- Hermes home channel 只能由本地 `LIVIS_HOME_CHANNEL=livis:<agent_id>` 固定；远程 `/sethome` 不属于初始化步骤。
-- 取消语义为 `best_effort`；无法证明工具线程退出时进入 `CancelUnknown` 并隔离 session。
+| 后端 | 调用方式 | 状态 |
+| --- | --- | --- |
+| Hermes | Unix Socket connector + 专用 Hermes Gateway | 已支持，默认后端 |
+| Codex `native-current` | `codex app-server --stdio` | 预览；使用本机当前 Codex runtime，不连接 Codex Desktop daemon |
+| Codex `private-api-key` | daemon 私有 `CODEX_HOME` | 兼容模式，需显式启用 |
+| Claude `native-current` | Claude Code `stream-json` | 预览；当前仅支持无工具、无持久会话的纯文本任务 |
 
-## 可靠性与安全特性
+daemon 只管理 LiViS OAuth。本地后端的账号和认证仍由各自客户端管理，本机当前是什么状态就按什么
+状态调用。详细说明见[本地后端文档](docs/LOCAL-BACKENDS.md)。
 
-- `(agent, job_id)` 幂等和 payload hash 冲突检测（一期单账号，account 维度固定为本地占位值）。
-- SQLite durable outbox；Agent 至多执行一次，ACK/结果至少投递一次。
-- `lease_id + run_generation` fencing，同 session 单活。
-- cancel/final 使用 CAS 决定唯一赢家；ambiguous execution 不自动重跑。
-- Hermes connector 只开放权限 `0600` 的 Unix socket，不监听 TCP。
-- `execution.backend` 固定为 Hermes/Codex/Claude 三选一；同一 daemon 只启动一个。任一 backend 失败都不会回退到其他 backend。
-- Codex 由 daemon 通过自有 stdio app-server 直接管理，Claude 则为每个 job 启动自有 CLI 进程组；JobStore schema v8 的不可变 `jobs.target_backend` 与 append-only attempt 账本继续以 `account-bound | local-state-opaque` 区分状态所有权。`jobs/outbox` 仍是业务状态真源。
-- 只有 `private-api-key` 会回读并固定 `account.type=apiKey`；`native-current` 不调用账号接口、不分类本地认证状态。具备完整 terminal 证据的本地错误只按普通 backend failed 结算；提交后没有完整 terminal 时仍按 ambiguous execution 隔离。
-- `private-api-key` 的 model provider 与 API key 属于 state directory 的不可变安全边界；provider/key 变化必须使用全新 state。`native-current` 不接受 provider/model/toolchain 配置。
-- `backend switch` 只在停服、JobStore v8、全 scope 零非终态 backlog/不兼容 session/quarantine 时原子替换配置，并生成不读取或迁移凭据的收据。`serve` 仍会在启动前拒绝异 backend 非终态 job。
-- Codex 只在完整 turn deadline 内的 terminal `turn/completed` 后返回一个 agent final；超时先请求 interrupt，再按固定 grace 失败关闭。工具网络关闭、workspace 是唯一可写根，审批请求默认拒绝。
-- `private-api-key` 完整编码态可显式配置经审核的 `toolchainReadRoots`；`native-current` 固定使用独立 native workspace 与当前 runtime 的清洗后工具环境。
-- 两种 Codex app-server 都由 daemon 作为独立 POSIX 进程组持有并负责收口；`native-current` 不连接、停止、重启或修改 Codex Desktop daemon。
-- Claude 子进程同样使用独立 POSIX 进程组；版本只作观察，`--version + --help` 必需参数和运行期 `system/init` 安全回读才裁决兼容性。
-- `private-api-key` 具备有界 idle recovery；`native-current` 的 active 断连进入持久 recovery/quarantine，idle 断开只降低 readiness，均绝不自动重放业务 job。
-- Hermes bridge 在建立 job 映射、发送 `accepted` 和进入 dispatcher 之前，拒绝全部斜杠命令及 Hermes 0.15.1 会归一化的自然语言重启别名；active session、blocking approval 或状态不可读时同样失败关闭。daemon 内部 cancel 生成的 `/stop` 仍走独立控制路径。
-- LiViS profile 按 SHA-256 固定；未知 wire protocol、版本或 artifact 漂移默认拒绝。
-- 正式部署可用 `deploy plan/install/upgrade/rollback/uninstall` 消费固定 manifest SHA 的
-  clean-git 发布归档，生成不可变 release 与私有收据；服务副作用必须显式确认，安装器
-  不读取、复制、迁移或判断 Hermes/Codex/Claude 原生认证状态。详见
-  [部署安装器架构与边界](docs/DEPLOYMENT-INSTALLER.md)。
-- `login/serve` 要求近期 supported proof；daemon 每 6 小时在线复核。
-- `wireContractRevision + credentialMode` 同时绑定 profile、runtime digest 与 supported proof；机器可读 registry、append-only 历史门禁和本地脱敏 probe artifact 防止 wire 代码静默漂移或覆写旧基线。
-- schema v1→v2 迁移采用固定 contract 人工确认、私有 PREPARED/备份、source→target 重建校验、持久化 guard、proof quarantine 和可自愈显式回滚；迁移命令不打开 SQLite。
-- Hermes runtime/bridge 与 Codex `private-api-key` CLI 必须位于各自审核版本区间；Codex
-  `native-current` 记录版本但由 initialize 协议握手裁决兼容性，不以固定版本窗阻断。
-
-## 机器可读能力
-
-[`capabilities.json`](capabilities.json) 是能力范围、证据等级、安全默认值、命令权限和发布产物的机器可读事实源。可只读输出并验证：
-
-```bash
-bun run src/index.ts capabilities
-bun run capabilities:check
-```
-
-JSON Schema 与证据等级规则见 [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md)。握手成功、离线测试或上游格式声明都不能自动提升为真实链路已验证。
-
-## 开发验证
+## 快速开始
 
 ### 环境要求
 
-- macOS 或 Linux；不支持 Windows。
-- Bun 1.3.14+；CI 与锁文件基线为 1.3.14。
-- uv 0.11+ 与 Python 3.11–3.13。
-- 使用 Hermes 时，本地 Hermes 版本须位于配置中的已审核范围。
-- 使用 Codex `private-api-key` 时，CLI 必须位于 `[0.145.0, 0.146.0)`，并为 daemon 专用
-  `CODEX_HOME` 单独登录；`native-current` 不登录或处理凭据，只要求可完成 app-server initialize。
-- 使用 Claude 时不设固定 CLI 版本窗；必须支持文档列出的安全参数与 `stream-json` 事件契约。当前仅支持纯文本，无工具和原生会话恢复。
+- macOS 或 Linux
+- Bun 1.3.14 或更高版本
+- Python 3.11–3.13 与 uv（Hermes plugin）
+- 获授权的 LiViS protocol profile
+- 所需的 Hermes、Codex 或 Claude Code runtime
 
-### 开发环境快速准备
-
-Bun 是本项目使用的 JavaScript/TypeScript 运行时和包管理器，uv 用来管理 Hermes plugin 的 Python 环境。请先从 [Git](https://git-scm.com/downloads)、[Bun](https://bun.sh/docs/installation) 和 [uv](https://docs.astral.sh/uv/getting-started/installation/) 官方安装说明准备这三个工具；项目不提供下载后立即执行的远程安装脚本。
-
-以下命令仅适用于已经安装 Homebrew 的 macOS；没有 Homebrew 或使用 Linux 时，请按上述官方说明分别安装 Git、Bun 和 uv：
+### 安装依赖
 
 ```bash
-brew install git oven-sh/bun/bun uv
+git clone https://github.com/Jassy930/livis-relay-daemon.git
+cd livis-relay-daemon
+bun install --frozen-lockfile
+(cd hermes-plugin && uv sync --frozen)
+bun run check
 ```
 
-确认 `git --version`、`bun --version` 和 `uv --version` 均能正常输出后，复制下面整行即可克隆仓库、按锁文件安装依赖并运行完整自检：
+### 初始化
+
+公开仓库不提供可直接连接服务的 live profile。取得获授权的 profile 后运行：
 
 ```bash
-git clone https://github.com/Jassy930/livis-relay-daemon.git && cd livis-relay-daemon && bun install --frozen-lockfile && (cd hermes-plugin && uv sync --frozen) && bun run check
+bun run src/index.ts init \
+  --profile '/绝对路径/authorized-profile.json' \
+  --acknowledge-unofficial-protocol
 ```
 
-这条命令只准备开发环境，不会安装常驻服务，也不会生成连接生产服务所需的 live profile。后续配置步骤见[运行手册](docs/OPERATIONS.md)。
+在 `~/.livis-relay/config.json` 中设置唯一允许的 `security.allowedNodeIds`，然后执行：
 
-`bun run check` 会依次检查版本、能力契约、文档链接、Git tracked files、发布归档、wire contract append-only 历史与本地 S2 protocol probe artifact，再执行 TypeScript 类型检查、全部 Bun 测试、`uv lock --check` 和 Hermes plugin pytest。其中公开发布、能力与 append-only 门禁审核 Git index；probe generator、类型检查和测试读取当前工作区。运行前应先用 `git add` 精确暂存候选文件，并保持 staged/worktree 一致。
+```bash
+bun run src/index.ts upstream check
+bun run src/index.ts login
+```
 
-验证结果必须绑定精确提交，不能沿用 README 中的固定测试数量或旧 canary 结论。当前候选应在精确 staged tree 上运行 `bun run check`；实际测试数量以该次输出为准。
+完整配置步骤见[运行手册](docs/OPERATIONS.md)。
 
-2026-07-18 曾在旧代码基线上留下 Hermes 0.15.1 前台纯文本闭环的高层人工摘要；同期 LaunchAgent 记录也只证明服务存活、online doctor、Relay handshake 与 connector ready。它们都早于后续 protocol profile v2、单设备边界、Relay 资源门禁和 JobStore v3，更早于当前 JobStore v8，且没有绑定当前最终提交的完整 receipt，因此只作历史参考，不能证明当前版本或 launchd 常驻消息闭环已经通过。证据边界和当前验收步骤见 [`docs/HERMES-CANARY.md`](docs/HERMES-CANARY.md)。
+### 选择后端
 
-Codex 0.145.0 的真实非临时、零模型 turn canary 已在 macOS 命中 workspace-only、
-凭据/宿主 HOME 读写拒绝、workspace 外同卷牺牲文件 hardlink 拒绝、command identity、
-系统 `nc -O` 原始 `connect` 的精确 `EPERM` 和审批关闭边界，并恢复同一零 turn thread。
-daemon 还会流式绑定 command 内容摘要与文件身份，并在启动、恢复和持久 session 间失败
-关闭。2026-07-23 早先的 API-key 单 turn 例外 canary 取得一次 turn 提交及 provider
-`401 invalid_api_key` 拒绝证据，并暴露 0.145.0 legacy `thread/read` 把 failed tail
-投影成 completed 的兼容缺口。提交 `65f00c1` 上的后续全新单 turn canary 误选了本机非默认
-凭据副本；app-server 运行态将其识别为 `account_type=chatgpt`，不属于项目支持的 API-key
-路径。provider 仍以 structured `unauthorized` 拒绝，但修复已把
-job 原子收口为 `Failed`、`Pending` outbox、`reserved → accepted → failed`、active clear、
-`recovery_required=false` 和单条凭据 quarantine，没有 assistant、工具或 token-count 记录。
-这只验证通用失败结算修复，不是 API-key 凭据 canary 或成功模型 turn；当前代码会在创建
-thread 前拒绝同类非 API-key 账号。随后在精确提交 `56a1d77` 上，以全新 state directory、
-标准输入登录的隔离 API key、显式 custom Responses provider 和固定模型完成了一个成功
-single turn：固定回复匹配，job 为 `Succeeded`，ledger 为
-`reserved → accepted → succeeded`，checkpoint 为 `completed/1`，无工具事件、无
-quarantine、无 active/recovery 残留，临时凭据已删除且其余 state 普通文件未命中该 API key。
-这把 API-key/custom 模型路径升级为当前 macOS/Codex 0.145.0 组合下的功能 canary GO；它
-仍不证明 endpoint 内部 HTTP 次数、请求层硬禁用工具、Linux/cgroup、资源配额或
-`Delivered → App 回显`。因此 Codex 仍是 Draft/受控开发功能，不应宣称生产上线，完整门禁见
-[`docs/CODEX-APPSERVER.md`](docs/CODEX-APPSERVER.md)。
+- Hermes 是默认后端，需要专用 profile 和 Hermes bridge。
+- Codex 使用 `codex probe-native-app-server` 检查本地接口，再通过 `backend switch codex` 切换。
+- Claude 使用 `claude probe-native-cli` 检查本地接口，再通过 `backend switch claude` 切换。
 
-随后在精确提交 `896091b` 上，以全新隔离 state、迁移至 schema v2 的隔离 profile、fresh
-LiViS Device Flow、标准输入登录的隔离 `CODEX_HOME`、Codex 0.145.0、固定
-`gpt-5.6-sol` 和显式 custom Responses provider 完成了人在环链路。获授权用户本人从唯一
-允许设备只发送一次 canonical nonce；唯一 job 到达 `Succeeded/Delivered`，
-`run_generation=1`，ledger 为 `reserved → accepted → succeeded`，checkpoint 为
-`completed/1`，只观察到一个 provider operation，且 active、recovery、quarantine 均为空。
-App 视觉确认只出现一个内容精确匹配的回复气泡。用户随后主动追加两条扩展消息，同一会话
-累计三 turn、三 assistant，rollout 仍为零 tool、approval、user input 和 unknown item；
-优雅停机后零句柄，原 Hermes/Relay 已恢复健康并排空。
+`backend switch` 默认只输出计划。实际切换需要先停止 daemon、备份 state directory，再显式使用
+`--apply`。具体命令见 [Codex native-current](docs/CODEX-NATIVE-AUTH.md)、
+[Claude native-current](docs/CLAUDE-NATIVE.md)和[运行手册](docs/OPERATIONS.md)。
 
-本次功能结论为 `E2E_FUNCTIONAL_GO`，但不把一次观察到的单投递升级为 exactly-once，也不
-证明 endpoint 内部 HTTP 请求恰好一次或请求 payload 未携带工具 schema。Codex 本地 auth
-已 logout；LiViS revoke 返回 HTTP 404，远端撤销未确认，因此 refresh token 与整个隔离
-state 按 fail-closed 保留，清理结论为 `CREDENTIAL_CLEANUP_BLOCKED`。Codex 仍是
-Draft/受控开发功能，不应宣称生产上线；完整复验与证据保留流程见
-[`docs/CODEX-E2E-CANARY.md`](docs/CODEX-E2E-CANARY.md)。
+### 启动
 
-随后在精确提交 `b10155f` 上完成一次完整编码态 canary：只读工具链根暴露 Bun，workspace
-保持唯一写根，真实 rollout 执行文件写入与 `bun test`，并与 SQLite 终态和 App 单 final
-一致。该回执只绑定当次 macOS/Codex/Bun/provider/model/profile 组合；它没有把认证模式改成
-用户日常 Codex 登录态，也不证明常驻重启、Linux/cgroup、长期刷新或生产可用。完整证据见
-[`docs/CODEX-E2E-CANARY.md`](docs/CODEX-E2E-CANARY.md)。
+```bash
+bun run src/index.ts serve
+```
 
-仓库提供 Relay LaunchAgent 模板、Hermes 双服务运行手册和 Codex 单服务边界，但安装、加载、
-启停与真实消息 canary 都是操作者在获授权环境中的显式步骤；除上述绑定精确提交的受控
-canary 外，合并文档或 `plutil -lint` 通过不代表用户服务已被修改，也不代表其他部署已完成
-`Succeeded → Delivered → App 回显` 闭环。
+另开终端查看状态：
 
-## 使用入口
+```bash
+bun run src/index.ts status
+bun run src/index.ts doctor --online
+```
 
-- [LiViS 服务端协议证据与支持边界](docs/LIVIS-RELAY-PROTOCOL-BOUNDARY.md)
-- [本地协议探针](docs/PROTOCOL-PROBES.md)
+Hermes 模式还需要启动专用 Hermes Gateway；Codex 和 Claude 模式只需启动 daemon。
+
+## 常用命令
+
+| 命令 | 说明 |
+| --- | --- |
+| `bun run src/index.ts capabilities` | 查看能力清单 |
+| `bun run src/index.ts init` | 初始化配置与 state directory |
+| `bun run src/index.ts login` | 登录 LiViS |
+| `bun run src/index.ts serve` | 启动 daemon |
+| `bun run src/index.ts status` | 查看运行状态 |
+| `bun run src/index.ts doctor --online` | 执行在线诊断 |
+| `bun run src/index.ts backend switch ...` | 切换执行后端 |
+| `bun run src/index.ts deploy ...` | 安装、升级、回滚或卸载 |
+
+运行 `bun run src/index.ts help` 查看完整参数。
+
+## 个人助手上下文
+
+Codex 和 Claude 可以读取由操作者维护的 `AGENTS.md` 与 Markdown 记忆文件：
+
+```json
+{
+  "assistantContext": {
+    "mode": "read-only-files",
+    "contextDir": "/绝对路径/assistant-scope",
+    "maxPromptChars": 20000
+  }
+}
+```
+
+`contextDir` 必须位于 daemon state directory 外。daemon 会生成 workspace 快照，但不会自动修改或
+写回原始文件。详见[个人助手上下文](docs/ASSISTANT-CONTEXT.md)。
+
+## 部署
+
+正式运行建议使用 `deploy` 安装器，而不是直接使用开发 checkout。安装器通过固定 SHA-256 的
+`release-manifest.json` 验证发布内容，并支持 `plan`、`install`、`upgrade`、`rollback` 和
+`uninstall`。
+
+```bash
+bun run src/index.ts deploy plan \
+  --manifest '/绝对路径/release-manifest.json' \
+  --manifest-sha256 '<manifest-sha256>' \
+  --config "$HOME/.livis-relay/config.json"
+```
+
+完整安装与回滚步骤见[部署说明](docs/DEPLOYMENT-INSTALLER.md)。
+
+## 当前限制
+
+- 一套 daemon 只支持一个 LiViS `node_id` 和一个执行后端。
+- 当前只支持纯文本输入和单个 final 文本回复。
+- 不支持在线多后端路由、自动 fallback 或跨后端会话迁移。
+- 不支持附件、流式回复、tool progress、远程审批和远程管理命令。
+- `status` 或 `doctor` 通过只表示服务就绪，不代表真实消息已完成端到端投递。
+
+完整能力范围以 [`capabilities.json`](capabilities.json) 为准。
+
+## 开发
+
+```bash
+bun run check
+```
+
+这是项目的统一检查入口，包含版本、能力、文档、类型、Bun 测试和 Hermes plugin 测试。
+参与开发前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 文档
+
 - [运行手册](docs/OPERATIONS.md)
-- [Codex app-server 执行后端](docs/CODEX-APPSERVER.md)
-- [Codex 原生当前状态、切换与认证边界](docs/CODEX-NATIVE-AUTH.md)
-- [Codex LiViS 人在环 E2E canary](docs/CODEX-E2E-CANARY.md)
-- [机器可读能力契约](docs/CAPABILITIES.md)
-- [Hermes 实网 canary](docs/HERMES-CANARY.md)
-- [官方升级与回滚](docs/UPSTREAM-UPGRADE.md)
-- [普通 profile 激活事务](docs/PROFILE-ACTIVATION.md)
-- [版本与发布流程](docs/RELEASING.md)
-- [架构与状态所有权](docs/ARCHITECTURE.md)
-- [本地多后端架构与状态边界](docs/LOCAL-BACKENDS.md)
-- [个人助手上下文与文件记忆](docs/ASSISTANT-CONTEXT.md)
+- [架构说明](docs/ARCHITECTURE.md)
+- [本地后端](docs/LOCAL-BACKENDS.md)
 - [安全边界](docs/SECURITY.md)
-- [参与贡献](CONTRIBUTING.md)
-- [漏洞报告政策](SECURITY.md)
-- [第三方与商标声明](NOTICE.md)
-
-初始化前先审阅安全文档；不要直接执行 LiViS 的 `curl | bash` 安装器来部署本项目。
+- [部署安装器](docs/DEPLOYMENT-INSTALLER.md)
+- [个人助手上下文](docs/ASSISTANT-CONTEXT.md)
+- [能力清单](docs/CAPABILITIES.md)
+- [LiViS 协议边界](docs/LIVIS-RELAY-PROTOCOL-BOUNDARY.md)
 
 ## 许可证
 
-本项目自主实现的代码采用 [MIT License](LICENSE)。LiViS、理想、Hermes、Codex、OpenAI、OpenClaw 等名称、服务、协议和商标不因本项目许可证而获得授权，详见 [NOTICE](NOTICE.md)。
+本项目自主实现的代码采用 [MIT License](LICENSE)。第三方服务、协议和商标不因本项目许可证而获得
+授权，详见 [NOTICE](NOTICE.md)。
