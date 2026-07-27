@@ -221,7 +221,7 @@ IDaaS token 响应可能直接包含 token 字段，也可能在 audience 键下
 - 只接受 `send_message` 中 `data.type=exec` 的非空纯文本；只向远端产生一个不同的纯文本 final；
 - 不支持附件、流式 token、tool progress、中间消息、远程审批、管理命令、多设备或跨设备 session；
 - job 执行目标为至多一次，ACK 与结果投递目标为至少一次；重复结果需要 Relay 消费方幂等；
-- `cancel_chat` 是 best effort，无法证明执行线程退出时进入 `CancelUnknown` 并隔离 session；
+- `cancel_chat` 是 best effort；只有本地 bridge 能按当前 lease 证明 Hermes execution 从未启动时才直接 `Cancelled`，其余无法证明执行线程退出的路径进入 `CancelUnknown` 并隔离 session；
 - malformed、越界输入、未知 protocol/profile/artifact 默认拒绝或失败关闭；
 - 服务器未记录或未验证的行为不能由客户端 artifact、类型定义或测试名称补齐。
 

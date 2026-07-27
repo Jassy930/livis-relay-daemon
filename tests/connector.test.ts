@@ -55,7 +55,12 @@ describe("Hermes connector Unix WebSocket", () => {
   let store: JobStore;
   let server: ConnectorServer;
   const token = "x".repeat(43);
-  const events: Array<{ type: string; jobId?: string; affected?: number }> = [];
+  const events: Array<{
+    type: string;
+    jobId?: string;
+    affected?: number;
+    executionDisposition?: "not_started";
+  }> = [];
 
   beforeEach(async () => {
     directory = await temporaryDirectory();
@@ -83,8 +88,18 @@ describe("Hermes connector Unix WebSocket", () => {
         }
       },
       onCancelled: async (message) => {
-        store.markCancelUnknown(message.jobId, message.leaseId, "connector reported cancellation");
-        events.push({ type: "cancelled", jobId: message.jobId });
+        if (message.executionDisposition === "not_started") {
+          store.finishHermesCancellationNotStarted(message.jobId, message.leaseId);
+        } else {
+          store.markCancelUnknown(message.jobId, message.leaseId, "connector reported cancellation");
+        }
+        events.push({
+          type: "cancelled",
+          jobId: message.jobId,
+          ...(message.executionDisposition
+            ? { executionDisposition: message.executionDisposition }
+            : {}),
+        });
       },
       onDisconnected: async (connectorId) => {
         const affected = store.markConnectorDisconnected(connectorId);
@@ -194,6 +209,33 @@ describe("Hermes connector Unix WebSocket", () => {
       leaseId: "lease-rejected",
     });
 
+    store.ingest(incomingJob("job-not-started"), "session-not-started", "hermes");
+    store.markAcked("job-not-started");
+    const notStarted = store.claimForDispatch(
+      "job-not-started",
+      "hermes-test",
+      "lease-not-started",
+    )!;
+    expect(server.sendJob(notStarted)).toBeTrue();
+    expect((await read()).type).toBe("job");
+    expect(store.requestCancel(notStarted.jobId)?.status).toBe("Cancelling");
+    client.send(JSON.stringify({
+      type: "cancelled",
+      jobId: notStarted.jobId,
+      leaseId: "lease-not-started",
+      executionDisposition: "not_started",
+    }));
+    await waitFor(
+      () => store.require(notStarted.jobId).status === "Cancelled",
+      "未进入 Hermes execution 的取消直接结算",
+    );
+    expect(store.getSessionQuarantine("session-not-started")).toBeNull();
+    expect(events.at(-1)).toEqual({
+      type: "cancelled",
+      jobId: notStarted.jobId,
+      executionDisposition: "not_started",
+    });
+
     client.close();
     await new Promise((resolve) => client.once("close", resolve));
     await waitFor(
@@ -222,6 +264,46 @@ describe("Hermes connector Unix WebSocket", () => {
     expect(error.type).toBe("error");
     expect(error.code).toBe("invalid_message");
     client.close();
+  });
+
+  test("拒绝未知的取消 executionDisposition", async () => {
+    const client = openWebSocket(server.socketPath, token);
+    const read = messageReader(client);
+    await new Promise<void>((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    await read();
+    client.send(JSON.stringify({
+      type: "hello",
+      protocolVersion: 1,
+      connectorId: "invalid-cancel-disposition",
+      backend: "hermes",
+      implementation: { name: "livis-hermes-bridge", version: "0.1.1", runtimeVersion: "0.15.1" },
+      capabilities: { cancel: true, finalResult: true },
+    }));
+    expect((await read()).type).toBe("hello_ack");
+    client.send(JSON.stringify({
+      type: "cancelled",
+      jobId: "job-invalid",
+      leaseId: "lease-invalid",
+      executionDisposition: "stopped",
+    }));
+    const error = await read();
+    expect(error.type).toBe("error");
+    expect(error.code).toBe("invalid_message");
+    if (client.readyState !== WebSocket.CLOSED) {
+      await new Promise((resolve) => {
+        client.once("close", resolve);
+        client.close();
+      });
+    }
+    await waitFor(
+      () => events.some((event) =>
+        event.type === "disconnected" && event.jobId === "invalid-cancel-disposition"
+      ),
+      "非法取消消息断开结算",
+    );
   });
 
   test("替换失活连接先结算旧 lease，并 fence 复用 ID 的旧 generation", async () => {

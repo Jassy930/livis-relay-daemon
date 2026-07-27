@@ -2023,6 +2023,29 @@ export class JobStore {
     return this.require(jobId);
   }
 
+  finishHermesCancellationNotStarted(jobId: string, leaseId: string): StoredJob | null {
+    const now = Date.now();
+    const transaction = this.database.transaction(() => {
+      const cancelled = this.database
+        .query(`UPDATE jobs
+                SET status='Cancelled', completed_at=?, updated_at=?
+                WHERE scope_key=? AND job_id=? AND target_backend='hermes'
+                  AND status='Cancelling' AND cancel_requested=1 AND lease_id=?`)
+        .run(now, now, this.scopeKey, jobId, leaseId);
+      if (cancelled.changes !== 1) return false;
+      this.appendExecutionAttemptEventLocked({
+        jobId,
+        runGeneration: this.require(jobId).runGeneration,
+        eventType: "cancelled_not_sent",
+        providerOperationId: null,
+        reason: "Hermes connector proved execution never started",
+        createdAt: now,
+      });
+      return true;
+    });
+    return transaction.immediate() ? this.require(jobId) : null;
+  }
+
   markConnectorDisconnected(connectorId: string): number {
     const now = Date.now();
     const transaction = this.database.transaction(() => {

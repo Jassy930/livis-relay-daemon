@@ -102,6 +102,13 @@ function parseConnectorMessage(raw: string): ConnectorInboundMessage {
     if (data.type === "failed" && typeof data.error !== "string") {
       throw new Error("failed.error 必须是字符串");
     }
+    if (
+      data.type === "cancelled" &&
+      data.executionDisposition !== undefined &&
+      data.executionDisposition !== "not_started"
+    ) {
+      throw new Error("cancelled.executionDisposition 不受支持");
+    }
     return data as unknown as ConnectorInboundMessage;
   }
   if (data.type === "pong") {

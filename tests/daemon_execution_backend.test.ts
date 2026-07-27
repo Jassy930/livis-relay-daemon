@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type {
   ExecutionAcceptedEvent,
   ExecutionBackend,
+  ExecutionCancelledEvent,
   ExecutionDisconnectedEvent,
   ExecutionFailedEvent,
   ExecutionReadyEvent,
@@ -61,6 +62,23 @@ class FakeClaudeBackend implements ExecutionBackend {
   }
 }
 
+class FakeHermesBackend implements ExecutionBackend {
+  readonly kind = "hermes" as const;
+  ready = true;
+  executionId: string | null = "hermes:test";
+  dispatched: StoredJob[] = [];
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  async dispatch(job: StoredJob): Promise<ExecutionSubmission> {
+    this.dispatched.push(job);
+    return "submitted";
+  }
+  async cancel(): Promise<ExecutionSubmission> { return "submitted"; }
+  status(): Record<string, unknown> {
+    return { kind: this.kind, ready: this.ready, executionId: this.executionId };
+  }
+}
+
 interface DaemonInternals {
   connector: { start(): void };
   executionBackend: ExecutionBackend;
@@ -71,6 +89,7 @@ interface DaemonInternals {
   onExecutionAccepted(event: ExecutionAcceptedEvent): Promise<void>;
   onExecutionResult(event: ExecutionResultEvent): Promise<void>;
   onExecutionFailed(event: ExecutionFailedEvent): Promise<void>;
+  onExecutionCancelled(event: ExecutionCancelledEvent): Promise<void>;
   onExecutionDisconnected(event: ExecutionDisconnectedEvent): Promise<void>;
 }
 
@@ -195,6 +214,57 @@ function seedInactiveHermesTerminal(
 }
 
 describe("RelayDaemon execution backend 接线", () => {
+  test("Hermes 未启动取消直接 Cancelled，缺少证明的 /stop 仍隔离", async () => {
+    const fixture = await daemonFixture("livis-daemon-hermes-not-started-");
+    try {
+      const backend = new FakeHermesBackend();
+      fixture.internals.executionBackend = backend;
+      for (const jobId of ["hermes-not-started", "hermes-next"]) {
+        fixture.internals.store.ingest(incomingJob(jobId), fixture.sessionKey, "hermes");
+        fixture.internals.store.markAcked(jobId);
+      }
+      const claimed = fixture.internals.store.claimForDispatch(
+        "hermes-not-started",
+        backend.executionId!,
+        "lease-not-started",
+      )!;
+      fixture.internals.store.requestCancel(claimed.jobId);
+
+      await fixture.internals.onExecutionCancelled({
+        kind: "hermes",
+        executionId: backend.executionId!,
+        jobId: claimed.jobId,
+        leaseId: "lease-not-started",
+        executionDisposition: "not_started",
+      });
+
+      expect(fixture.internals.store.require(claimed.jobId).status).toBe("Cancelled");
+      expect(fixture.internals.store.listQuarantinedSessions()).toHaveLength(0);
+      expect(backend.dispatched.map((job) => job.jobId)).toEqual(["hermes-next"]);
+
+      const ambiguousJobId = "hermes-stop-ambiguous";
+      fixture.internals.store.ingest(incomingJob(ambiguousJobId), "hermes-other-session", "hermes");
+      fixture.internals.store.markAcked(ambiguousJobId);
+      const ambiguous = fixture.internals.store.claimForDispatch(
+        ambiguousJobId,
+        backend.executionId!,
+        "lease-ambiguous",
+      )!;
+      fixture.internals.store.markRunning(ambiguous.jobId, backend.executionId!, "lease-ambiguous");
+      fixture.internals.store.requestCancel(ambiguous.jobId);
+      await fixture.internals.onExecutionCancelled({
+        kind: "hermes",
+        executionId: backend.executionId!,
+        jobId: ambiguous.jobId,
+        leaseId: "lease-ambiguous",
+      });
+      expect(fixture.internals.store.require(ambiguous.jobId).status).toBe("CancelUnknown");
+      expect(fixture.internals.store.getSessionQuarantine("hermes-other-session")).not.toBeNull();
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   test("Claude claim、accepted 与 final 复用 durable backend attempt 语义", async () => {
     const fixture = await daemonFixture("livis-daemon-claude-durable-");
     try {

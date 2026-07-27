@@ -57,6 +57,8 @@ export interface ExecutionFailedEvent extends ExecutionJobEvent {
 export interface ExecutionCancelledEvent extends ExecutionJobEvent {
   /** turn/start 尚未返回时可以为空；Hermes connector v1 不携带。 */
   turnId?: string | null;
+  /** Hermes bridge 能证明 job 从未进入 execution 时才允许携带。 */
+  executionDisposition?: "not_started";
 }
 
 export interface ExecutionDisconnectedEvent {

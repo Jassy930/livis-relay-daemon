@@ -68,7 +68,8 @@ refresh token 的流向固定为本地 SecretStore → daemon 的 IDaaS client �
 ```text
 job execution:
 Received → Acked → Dispatching → Running → Succeeded | Failed
-                              └→ Cancelling → CancelUnknown
+                              └→ Cancelling → Cancelled（可证明未启动）
+                                           └→ CancelUnknown（已启动或不确定）
 
 outbox delivery:
 Pending → Delivering → Delivered
@@ -147,7 +148,7 @@ backend 切换只允许发生在其他 backend 没有 `Received/Acked/Dispatchin
 `Succeeded/Failed/Cancelled/Rejected/Interrupted/CancelUnknown` 不阻止切换，残留 outbox
 仍由独立投递状态机继续处理。
 
-取消意图在 SQLite `IMMEDIATE` 事务内按当前状态原子转移：`Received/Acked` 可直接进入 `Cancelled`，`Dispatching/Running` 只能进入 `Cancelling`。重复 cancel 保持 `Cancelling`，迟到 cancel 不会回退 `Interrupted` 或任何终态；Hermes connector 确认已发出 `/stop`，或 Codex app-server 接受 `turn/interrupt`，都不能证明工具副作用已经停止，daemon 仍须记录 `CancelUnknown` 并隔离 session。
+取消意图在 SQLite `IMMEDIATE` 事务内按当前状态原子转移：`Received/Acked` 可直接进入 `Cancelled`，`Dispatching/Running` 只能进入 `Cancelling`。重复 cancel 保持 `Cancelling`，迟到 cancel 不会回退 `Interrupted` 或任何终态。Hermes bridge 只有在能够证明 `handle_message()` 从未开始时，才可在 `cancelled` 上携带 `executionDisposition=not_started`；daemon 以当前 lease 原子结算 `Cancelled`、记录 `cancelled_not_sent`，且不隔离 session。字段缺失、Hermes connector 已发出 `/stop`，或 Codex app-server 接受 `turn/interrupt`，都不能证明工具副作用已经停止，daemon 仍须记录 `CancelUnknown` 并隔离 session。
 
 ## Relay 入站门禁与提前取消
 
@@ -171,7 +172,7 @@ backend 切换只允许发生在其他 backend 没有 `Received/Acked/Dispatchin
 hello / hello_ack
 job → accepted → result|failed → result_stored
 job → failed → result_stored（前置门禁拒绝）
-cancel → cancelled
+cancel → cancelled（可选 executionDisposition=not_started）
 ping / pong
 ```
 
@@ -190,9 +191,9 @@ job
 
 `LIVIS_HOME_CHANNEL=livis:<agent_id>` 是本地 channel ID；Hermes 根据该 source 计算自己的 `agent:main:livis:dm:...` session key，两者不能混用。bridge 必须使用 bound message handler 所属 GatewayRunner 的 `_session_key_for_source()`，并以同一个 Hermes session key 读取 `_active_sessions` 与 blocking approval。stale owner task 可以先由 Hermes 自身 `_heal_stale_session_lock()` 清理；仍 active、仍有 blocking approval 或任一状态不可安全读取时都失败关闭。
 
-bridge 在收到 job frame 时先登记 `jobId + leaseId` offer tombstone，因此 cancel 即使抢在 job task 启动或 `accepted` 完成前到达，也只结算当前 lease，不会把尚未执行的远程输入转换成 Hermes `/stop`。门禁放行后，bridge 在任何 `await` 前为 Hermes session 建立 admission reservation；直到 `handle_message()` 已建立 Hermes 自身的 active-session 状态前，相邻 job 都会被拒绝。拒绝路径绑定收到该 job 的 websocket 实例，发送 v1 `failed` 后必须等 daemon 持久化失败与 outbox 并回 `result_stored`；ACK 超时或 lease 不匹配时只关闭原连接，不能误关等待期间建立的新 generation。远端 job timestamp 只作事件显示元数据；非有限、不可解析或超出平台日期范围的值会降级为 bridge 当前 UTC 时间，不能在门禁结算前中止 job task。
+bridge 在收到 job frame 时先登记 `jobId + leaseId` offer tombstone，因此 cancel 即使抢在 job task 启动或 `accepted` 完成前到达，也只结算当前 lease，不会把尚未执行的远程输入转换成 Hermes `/stop`。这类路径会在既有 v1 `cancelled` 上附加 `executionDisposition=not_started`；旧 daemon 会忽略附加字段并继续失败关闭，新 daemon 才会据此直接结算 `Cancelled`。门禁放行后，bridge 在任何 `await` 前为 Hermes session 建立 admission reservation；直到 `handle_message()` 已建立 Hermes 自身的 active-session 状态前，相邻 job 都会被拒绝。拒绝路径绑定收到该 job 的 websocket 实例，发送 v1 `failed` 后必须等 daemon 持久化失败与 outbox 并回 `result_stored`；ACK 超时或 lease 不匹配时只关闭原连接，不能误关等待期间建立的新 generation。远端 job timestamp 只作事件显示元数据；非有限、不可解析或超出平台日期范围的值会降级为 bridge 当前 UTC 时间，不能在门禁结算前中止 job task。
 
-daemon 的 cancel 不复用上述远程文本入口：`cancel` 在已有 lease/source 映射上由 `_handle_cancel()` 合成内部 `MessageType.COMMAND /stop`，随后回 `cancelled` 并进入既有 `CancelUnknown`/quarantine 裁决。这样既关闭远程控制命令，又不破坏 daemon 的 best-effort 中断通道。
+daemon 的 cancel 不复用上述远程文本入口：已经进入 execution 的 `cancel` 在已有 lease/source 映射上由 `_handle_cancel()` 合成内部 `MessageType.COMMAND /stop`，随后回不带 disposition 的 `cancelled` 并进入既有 `CancelUnknown`/quarantine 裁决。这样既关闭远程控制命令，又不把“已发出 `/stop`”误当成执行已经停止。
 
 daemon 会为每次接纳的 `hello` 分配仅存于本机进程的 connector generation。失活连接被 takeover 时，daemon 先 fence 旧 socket，并通过 `onDisconnected` 完整执行 `markConnectorDisconnected`：`Dispatching/Running` 转为 `Interrupted`，`Cancelling` 转为 `CancelUnknown`，同时隔离相关 session。只有这一次持久化结算完成后，新 generation 才会进入 ready 并触发派发；首次 SQLite/I/O 失败不会把 generation 永久标成已处理，takeover 或迟到 `close` 仍可重试。旧 socket 的延迟 `close` 或入站消息会同时按 socket 实例和 generation 拒绝，即使新旧连接复用同一 `connectorId` 也不会跨代影响。
 

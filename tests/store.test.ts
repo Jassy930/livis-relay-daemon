@@ -824,6 +824,24 @@ describe("durable jobs + outbox", () => {
     expect(store.listQuarantinedSessions().map((item) => item.sessionKey)).toContain("session-risk");
   });
 
+  test("Hermes connector 证明 execution 未启动时直接 Cancelled 且不隔离 session", () => {
+    for (const jobId of ["not-started-job", "next-job"]) {
+      store.ingest(incomingJob(jobId), "session-not-started", "hermes");
+      store.markAcked(jobId);
+    }
+    const claimed = store.claimForDispatch("not-started-job", "connector", "lease-not-started")!;
+    expect(store.requestCancel(claimed.jobId)?.status).toBe("Cancelling");
+    expect(store.finishHermesCancellationNotStarted(claimed.jobId, "stale-lease")).toBeNull();
+
+    const cancelled = store.finishHermesCancellationNotStarted(claimed.jobId, "lease-not-started")!;
+    expect(cancelled.status).toBe("Cancelled");
+    expect(cancelled.outbox).toBeNull();
+    expect(store.listQuarantinedSessions()).toHaveLength(0);
+    expect(store.listExecutionAttemptEvents(claimed.jobId).map((event) => event.eventType))
+      .toEqual(["reserved", "cancelled_not_sent"]);
+    expect(store.claimForDispatch("next-job", "connector", "lease-next")?.status).toBe("Dispatching");
+  });
+
   test("重启把 ambiguous execution 隔离，不自动重跑", () => {
     store.ingest(incomingJob("job-1"), "session-risk");
     store.markAcked("job-1");

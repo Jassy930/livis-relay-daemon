@@ -255,7 +255,13 @@ export type ConnectorInboundMessage =
   | { type: "accepted"; jobId: string; leaseId: string }
   | { type: "result"; jobId: string; leaseId: string; text: string }
   | { type: "failed"; jobId: string; leaseId: string; error: string; retryable?: boolean }
-  | { type: "cancelled"; jobId: string; leaseId: string }
+  | {
+      type: "cancelled";
+      jobId: string;
+      leaseId: string;
+      /** bridge 能证明 job 从未进入 Hermes execution 时才允许携带。 */
+      executionDisposition?: "not_started";
+    }
   | { type: "pong"; timestamp?: number };
 
 export type ConnectorOutboundMessage =

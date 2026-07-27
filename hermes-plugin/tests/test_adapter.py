@@ -507,6 +507,7 @@ async def test_cancel_while_accepted_is_blocked_never_enters_hermes(
         "leaseId": "lease-1",
     })
     assert [message["type"] for message in fake_ws.sent] == ["accepted", "cancelled"]
+    assert fake_ws.sent[1]["executionDisposition"] == "not_started"
 
     fake_ws.release_accepted.set()
     await task
@@ -541,6 +542,7 @@ async def test_cancel_racing_with_remote_rejection_never_dispatches_internal_sto
         "leaseId": "lease-1",
     })
     assert [message["type"] for message in fake_ws.sent] == ["failed", "cancelled"]
+    assert fake_ws.sent[1]["executionDisposition"] == "not_started"
     await adapter._handle_daemon_message({
         "type": "error",
         "code": "cancel_superseded",
@@ -619,7 +621,12 @@ async def test_buffered_cancel_before_job_task_runs_uses_offer_tombstone(
         await asyncio.gather(*pending)
 
     assert fake_ws.sent == [
-        {"type": "cancelled", "jobId": "job-1", "leaseId": "lease-1"}
+        {
+            "type": "cancelled",
+            "jobId": "job-1",
+            "leaseId": "lease-1",
+            "executionDisposition": "not_started",
+        }
     ]
     adapter.handle_message.assert_not_awaited()
     assert adapter._offered_job_leases == {}

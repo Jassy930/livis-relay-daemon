@@ -154,6 +154,7 @@ export class RelayDaemon {
         executionId: connectorId,
         jobId: message.jobId,
         leaseId: message.leaseId,
+        executionDisposition: message.executionDisposition,
       }),
       onDisconnected: (connectorId) => executionHandlers.onDisconnected({
         kind: "hermes",
@@ -656,6 +657,14 @@ export class RelayDaemon {
         event.turnId ?? null,
         `${backendLabel} cancel 已接受，但无法证明远端执行已经停止`,
       );
+      return;
+    }
+    if (event.executionDisposition === "not_started") {
+      const cancelled = this.store.finishHermesCancellationNotStarted(event.jobId, event.leaseId);
+      if (!cancelled && before.status === "Cancelling") {
+        throw new Error(`Hermes 未启动取消未能按当前 lease 结算：${event.jobId}`);
+      }
+      if (cancelled) await this.dispatchPending();
       return;
     }
     this.store.markCancelUnknown(event.jobId, event.leaseId, "Hermes /stop 已发出，但一期无法证明所有工具线程已经退出");

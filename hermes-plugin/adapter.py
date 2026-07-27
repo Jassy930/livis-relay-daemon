@@ -480,6 +480,7 @@ class LivisBridgeAdapter(BasePlatformAdapter):
                         "type": "cancelled",
                         "jobId": job_id,
                         "leaseId": lease_id,
+                        "executionDisposition": "not_started",
                     }, websocket=job_websocket)
             except LocalRelayUnavailable as exc:
                 logger.warning("LiViS 输入拒绝结果未获得 durable ACK：%s", exc)
@@ -592,11 +593,21 @@ class LivisBridgeAdapter(BasePlatformAdapter):
         lease_id = str(message.get("leaseId", ""))
         if self._rejected_job_leases.get(job_id) == lease_id:
             self._rejection_cancelled_jobs.add(job_id)
-            await self._send_local({"type": "cancelled", "jobId": job_id, "leaseId": lease_id})
+            await self._send_local({
+                "type": "cancelled",
+                "jobId": job_id,
+                "leaseId": lease_id,
+                "executionDisposition": "not_started",
+            })
             return
         if self._offered_job_leases.get(job_id) == lease_id:
             self._offered_job_cancels.add(job_id)
-            await self._send_local({"type": "cancelled", "jobId": job_id, "leaseId": lease_id})
+            await self._send_local({
+                "type": "cancelled",
+                "jobId": job_id,
+                "leaseId": lease_id,
+                "executionDisposition": "not_started",
+            })
             return
         if self._lease_by_job.get(job_id) != lease_id:
             return
