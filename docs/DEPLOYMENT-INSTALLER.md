@@ -108,6 +108,8 @@ workspace 约束仍由各 backend adapter 持有。
 
 只能使用当前部署链中的安装或升级收据。执行前重查 `current.json` 与已安装 release 身份，拒绝覆盖部署后的人工改动；恢复上一份指针与服务定义。Hermes bridge 仅通过对应 bridge 安装收据回滚。
 
+rollback 横跨 Hermes home、服务管理器、`current.json` 与部署收据，不能伪装成单文件原子提交。Hermes bridge 回滚前会保留当前插件和 config 的私有快照；如果后续服务 reload/start、指针或最终收据提交失败，安装器会在同一部署锁内恢复操作前部署收据和指针、撤销 bridge 回滚，再恢复原服务定义与 active 状态。每一步补偿都校验当前文件仍精确等于本次回滚产物；检测到人工或并发修改时拒绝覆盖，并聚合原始错误、补偿错误和人工恢复收据路径。补偿完整时原 bridge 收据恢复为 `installed`，同一 rollback 可以安全重试。
+
 ### uninstall
 
 卸载只移除当前 daemon 服务定义和活动部署指针，保留 release、收据、config、state directory、Hermes bridge、Codex/Claude workspace、个人助手上下文及所有原生认证状态。进一步清理必须由操作者单独审阅和执行。
@@ -123,5 +125,7 @@ workspace 约束仍由各 backend adapter 持有。
 5. `current.json` 提交点与目标部署完全一致；
 6. 最终收据状态读回为期望终态；
 7. 若要求安装器管理服务，精确 label/unit 的最终状态读回通过。
+
+rollback 命令失败不能仅凭退出码判断当前版本。若错误明确表示“已精确恢复操作前状态”，仍须读回 `current.json`、部署收据、Hermes bridge 收据、插件/config 和服务状态后再重试；若报告“补偿未完整完成”，必须保持 daemon 与 Hermes Gateway 停止，保留全部收据和 `preRollbackBackupPath`，按错误中的路径人工判定，禁止直接删除锁、备份或强行再次回滚。
 
 这些证据不等于 LiViS 登录、upstream supported proof、backend readiness 或真实消息 canary。部署后仍必须按运维手册执行 `status`、`doctor --online` 和对应 backend 的真实闭环验证。

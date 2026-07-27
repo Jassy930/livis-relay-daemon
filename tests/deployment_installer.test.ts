@@ -195,6 +195,18 @@ class FakeServiceController implements DeploymentServiceController {
   }
 }
 
+class FailOnceReloadServiceController extends FakeServiceController {
+  failNextReload = false;
+
+  override async reload(): Promise<void> {
+    await super.reload();
+    if (this.failNextReload) {
+      this.failNextReload = false;
+      throw new Error("injected rollback reload failure");
+    }
+  }
+}
+
 async function baseOptions(serviceManager: "none" | "launchd" = "none") {
   const release = await formalReleaseFixture();
   const config = await configFixture("codex");
@@ -470,6 +482,26 @@ describe("部署安装器事务", () => {
     expect(await Bun.file(join(hermes.path, "plugins/livis-bridge/adapter.py")).exists()).toBeTrue();
     expect(await readFile(join(hermes.path, "config.yaml"), "utf8")).toContain("livis-bridge");
 
+    await expect(rollbackDeployment({
+      installRoot: join(target.path, "install"),
+      receiptPath: receipt.receiptPath,
+      apply: true,
+      acknowledgeHermesStopped: true,
+      acknowledgeStateCompatibility: true,
+      transactionHooks: {
+        afterPointerCommit: () => {
+          throw new Error("injected after pointer commit");
+        },
+      },
+    })).rejects.toThrow("已精确恢复操作前状态");
+    const currentAfterCompensation = await Bun.file(
+      join(target.path, "install/current.json"),
+    ).json();
+    expect(currentAfterCompensation.receiptPath).toBe(receipt.receiptPath);
+    expect((await Bun.file(receipt.hermesInstallReceiptPath!).json()).status).toBe("installed");
+    expect(await Bun.file(join(hermes.path, "plugins/livis-bridge/adapter.py")).exists()).toBeTrue();
+    expect(await readFile(join(hermes.path, "config.yaml"), "utf8")).toContain("livis-bridge");
+
     const rolledBack = await rollbackDeployment({
       installRoot: join(target.path, "install"),
       receiptPath: receipt.receiptPath,
@@ -478,6 +510,78 @@ describe("部署安装器事务", () => {
       acknowledgeStateCompatibility: true,
     });
     expect(rolledBack.status).toBe("rolled-back");
+    expect(await Bun.file(join(hermes.path, "plugins/livis-bridge")).exists()).toBeFalse();
+    expect(await readFile(join(hermes.path, "config.yaml"), "utf8")).toBe(originalConfig);
+  });
+
+  test("Hermes 回滚的服务 reload 失败会精确补偿并允许重试", async () => {
+    const release = await formalReleaseFixture();
+    const config = await configFixture("hermes");
+    const target = await temporaryDirectory("livis-deploy-hermes-service-target-");
+    const hermes = await temporaryDirectory("livis-deploy-hermes-service-runtime-");
+    cleanups.push(target.cleanup, hermes.cleanup);
+    await mkdir(join(hermes.path, "plugins"), { mode: 0o700 });
+    const originalConfig = "# dedicated profile\nplugins:\n  enabled: []\n";
+    await writeFile(join(hermes.path, "config.yaml"), originalConfig, { mode: 0o600 });
+    const deploymentOptions = {
+      manifestPath: release.manifestPath,
+      manifestSha256: release.manifestSha256,
+      configPath: config.configPath,
+      installRoot: join(target.path, "install"),
+      serviceManager: "launchd" as const,
+      manageService: true,
+      bunPath: process.execPath,
+      hermesHome: hermes.path,
+      platform: "darwin" as const,
+    };
+    const plan = await planDeployment(deploymentOptions);
+    const controller = new FailOnceReloadServiceController(plan.service.definitionPath!);
+    const receipt = await applyDeployment({
+      ...deploymentOptions,
+      apply: true,
+      acknowledgeHermesStopped: true,
+      acknowledgeServiceRestart: true,
+      commandRunner: new FakeCommandRunner(),
+      serviceController: controller,
+    });
+    const installedDefinition = controller.definitionText;
+    expect(installedDefinition).not.toBeNull();
+    expect(controller.active).toBeTrue();
+
+    controller.failNextReload = true;
+    await expect(rollbackDeployment({
+      installRoot: deploymentOptions.installRoot,
+      receiptPath: receipt.receiptPath,
+      apply: true,
+      manageService: true,
+      acknowledgeHermesStopped: true,
+      acknowledgeServiceRestart: true,
+      acknowledgeStateCompatibility: true,
+      serviceController: controller,
+    })).rejects.toThrow("已精确恢复操作前状态");
+
+    expect(controller.definitionText).toBe(installedDefinition);
+    expect(controller.active).toBeTrue();
+    expect(await Bun.file(join(deploymentOptions.installRoot, "current.json")).json()).toEqual(
+      receipt.installedDeployment,
+    );
+    expect((await Bun.file(receipt.hermesInstallReceiptPath!).json()).status).toBe("installed");
+    expect(await Bun.file(join(hermes.path, "plugins/livis-bridge/adapter.py")).exists()).toBeTrue();
+    expect(await readFile(join(hermes.path, "config.yaml"), "utf8")).toContain("livis-bridge");
+
+    const rolledBack = await rollbackDeployment({
+      installRoot: deploymentOptions.installRoot,
+      receiptPath: receipt.receiptPath,
+      apply: true,
+      manageService: true,
+      acknowledgeHermesStopped: true,
+      acknowledgeServiceRestart: true,
+      acknowledgeStateCompatibility: true,
+      serviceController: controller,
+    });
+    expect(rolledBack.status).toBe("rolled-back");
+    expect(controller.definitionText).toBeNull();
+    expect(controller.active).toBeFalse();
     expect(await Bun.file(join(hermes.path, "plugins/livis-bridge")).exists()).toBeFalse();
     expect(await readFile(join(hermes.path, "config.yaml"), "utf8")).toBe(originalConfig);
   });

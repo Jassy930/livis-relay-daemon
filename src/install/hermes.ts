@@ -47,6 +47,13 @@ export interface RollbackHermesBridgeOptions {
   hermesHome: string;
   receiptPath: string;
   acknowledgeRollback: boolean;
+  beforeReceiptCommit?: () => void | Promise<void>;
+}
+
+export interface CompensateHermesBridgeRollbackOptions {
+  hermesHome: string;
+  receiptPath: string;
+  acknowledgeCompensation: boolean;
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -157,13 +164,9 @@ async function copyDirectoryTree(source: string, target: string): Promise<void> 
   await fsyncDirectory(target);
 }
 
-async function bridgeDigest(directory: string): Promise<string> {
+async function directoryDigestFromFiles(directory: string, files: readonly string[]): Promise<string> {
   const parts: Uint8Array[] = [];
   const encoder = new TextEncoder();
-  const files = await digestFiles(directory);
-  for (const file of HERMES_BRIDGE_FILES) {
-    if (!files.includes(file)) throw new Error(`已安装 Hermes bridge 缺少文件：${file}`);
-  }
   for (const file of files) {
     const path = join(directory, file);
     await assertRegularFile(path, `已安装 Hermes bridge 文件 ${file}`);
@@ -177,6 +180,18 @@ async function bridgeDigest(directory: string): Promise<string> {
     offset += part.byteLength;
   }
   return sha256(joined);
+}
+
+async function directoryDigest(directory: string): Promise<string> {
+  return directoryDigestFromFiles(directory, await digestFiles(directory));
+}
+
+async function bridgeDigest(directory: string): Promise<string> {
+  const files = await digestFiles(directory);
+  for (const file of HERMES_BRIDGE_FILES) {
+    if (!files.includes(file)) throw new Error(`已安装 Hermes bridge 缺少文件：${file}`);
+  }
+  return directoryDigestFromFiles(directory, files);
 }
 
 async function digestFiles(root: string, current = root): Promise<string[]> {
@@ -389,6 +404,7 @@ export async function rollbackHermesBridge(
     }
     if (receipt.priorPluginPresent) {
       if (!receipt.backupPluginPath) throw new Error("收据缺少旧插件备份路径");
+      assertContained(backupRoot, receipt.backupPluginPath, "旧插件备份");
       await assertDirectory(receipt.backupPluginPath, "旧插件备份");
     }
 
@@ -418,25 +434,170 @@ export async function rollbackHermesBridge(
       await chmod(configPath, 0o600);
       await fsyncDirectory(dirname(pluginPath));
       await fsyncDirectory(dirname(configPath));
+      const updated: HermesInstallReceipt = {
+        ...receipt,
+        status: "rolled-back",
+        rolledBackAt: new Date().toISOString(),
+        preRollbackBackupPath: preRollbackRoot,
+      };
+      await options.beforeReceiptCommit?.();
+      await atomicWritePrivate(receiptPath, `${JSON.stringify(updated, null, 2)}\n`);
+      return updated;
     } catch (error) {
-      if (priorPluginRestored) await rm(pluginPath, { recursive: true, force: true });
-      if (currentPluginMoved) await rename(currentPluginBackup, pluginPath);
-      await copyPrivateFile(currentConfigBackup, configStaging).catch(() => undefined);
-      if (await exists(configStaging)) await rename(configStaging, configPath);
-      throw error;
+      const compensationErrors: unknown[] = [];
+      const configCompensationStaging = join(
+        dirname(configPath),
+        `.${basename(configPath)}.rollback-compensation-${crypto.randomUUID()}`,
+      );
+      try {
+        if (priorPluginRestored) await rm(pluginPath, { recursive: true, force: true });
+        if (currentPluginMoved) await rename(currentPluginBackup, pluginPath);
+        await copyPrivateFile(currentConfigBackup, configCompensationStaging);
+        await rename(configCompensationStaging, configPath);
+        await chmod(configPath, 0o600);
+        await fsyncDirectory(dirname(pluginPath));
+        await fsyncDirectory(dirname(configPath));
+      } catch (compensationError) {
+        compensationErrors.push(compensationError);
+      } finally {
+        await rm(configCompensationStaging, { force: true }).catch(() => undefined);
+      }
+      try {
+        await atomicWritePrivate(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
+      } catch (compensationError) {
+        compensationErrors.push(compensationError);
+      }
+      if (compensationErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...compensationErrors],
+          `Hermes bridge 回滚失败且补偿未完整完成；保留操作前备份：${preRollbackRoot}`,
+        );
+      }
+      throw new Error(`Hermes bridge 回滚失败，已精确恢复操作前状态：${String(error)}`, {
+        cause: error,
+      });
     } finally {
       await rm(restoreStaging, { recursive: true, force: true });
       await rm(configStaging, { force: true });
     }
+  });
+}
 
-    const updated: HermesInstallReceipt = {
-      ...receipt,
-      status: "rolled-back",
-      rolledBackAt: new Date().toISOString(),
-      preRollbackBackupPath: preRollbackRoot,
-    };
-    await atomicWritePrivate(receiptPath, `${JSON.stringify(updated, null, 2)}\n`);
-    return updated;
+export async function compensateHermesBridgeRollback(
+  options: CompensateHermesBridgeRollbackOptions,
+): Promise<HermesInstallReceipt> {
+  if (!options.acknowledgeCompensation) {
+    throw new Error("撤销 Hermes bridge 回滚必须显式确认内部补偿");
+  }
+  const hermesHome = await canonicalHermesHome(options.hermesHome);
+  const receiptPath = resolve(options.receiptPath);
+  const backupRoot = join(hermesHome, "backups", HERMES_BRIDGE_NAME);
+  assertContained(backupRoot, receiptPath, "安装收据");
+  await assertRegularFile(receiptPath, "安装收据");
+
+  return withInstallLock(hermesHome, async () => {
+    const receipt = parseReceipt(await readFile(receiptPath, "utf8"), receiptPath);
+    if (receipt.status !== "rolled-back" || !receipt.preRollbackBackupPath) {
+      throw new Error("只有已完成的 Hermes bridge 回滚可以执行补偿");
+    }
+    if (resolve(receipt.hermesHome) !== hermesHome) throw new Error("安装收据属于不同 HERMES_HOME");
+    if (resolve(receipt.receiptPath) !== receiptPath) throw new Error("安装收据路径与内容不一致");
+    const preRollbackRoot = resolve(receipt.preRollbackBackupPath);
+    assertContained(backupRoot, preRollbackRoot, "回滚前备份");
+    await assertDirectory(preRollbackRoot, "回滚前备份");
+
+    const pluginPath = join(hermesHome, "plugins", HERMES_BRIDGE_NAME);
+    const configPath = join(hermesHome, "config.yaml");
+    const installedPluginBackup = join(preRollbackRoot, "plugin.current");
+    const installedConfigBackup = join(preRollbackRoot, "config.current.yaml");
+    await assertDirectory(installedPluginBackup, "回滚前 bridge 备份");
+    await assertRegularFile(installedConfigBackup, "回滚前 config 备份");
+    if (await bridgeDigest(installedPluginBackup) !== receipt.installedDigest) {
+      throw new Error("回滚前 bridge 备份哈希不匹配，拒绝补偿");
+    }
+    if (sha256(await readFile(installedConfigBackup)) !== receipt.configAfterSha256) {
+      throw new Error("回滚前 config 备份哈希不匹配，拒绝补偿");
+    }
+    await assertRegularFile(configPath, "当前 Hermes config.yaml");
+    if (sha256(await readFile(configPath)) !== receipt.configBeforeSha256) {
+      throw new Error("Hermes config 在回滚后发生变化，拒绝自动补偿");
+    }
+    if (receipt.priorPluginPresent) {
+      if (!receipt.backupPluginPath) throw new Error("收据缺少旧插件备份路径");
+      assertContained(backupRoot, receipt.backupPluginPath, "旧插件备份");
+      await assertDirectory(receipt.backupPluginPath, "旧插件备份");
+      await assertDirectory(pluginPath, "当前已回滚 bridge");
+      if (await directoryDigest(pluginPath) !== await directoryDigest(receipt.backupPluginPath)) {
+        throw new Error("Hermes bridge 在回滚后发生变化，拒绝自动补偿");
+      }
+    } else if (await exists(pluginPath)) {
+      throw new Error("Hermes bridge 在回滚后被重新创建，拒绝自动补偿");
+    }
+
+    const compensationRoot = join(preRollbackRoot, `compensation-${crypto.randomUUID()}`);
+    await mkdir(compensationRoot, { recursive: false, mode: 0o700 });
+    const rolledBackPluginBackup = join(compensationRoot, "plugin.rolled-back");
+    const rolledBackConfigBackup = join(compensationRoot, "config.rolled-back.yaml");
+    await copyPrivateFile(configPath, rolledBackConfigBackup);
+    const pluginStaging = join(dirname(pluginPath), `.${HERMES_BRIDGE_NAME}.compensation-${crypto.randomUUID()}`);
+    const configStaging = join(dirname(configPath), `.${basename(configPath)}.compensation-${crypto.randomUUID()}`);
+    await copyDirectoryTree(installedPluginBackup, pluginStaging);
+    await copyPrivateFile(installedConfigBackup, configStaging);
+
+    let rolledBackPluginMoved = false;
+    let installedPluginMoved = false;
+    try {
+      if (receipt.priorPluginPresent) {
+        await rename(pluginPath, rolledBackPluginBackup);
+        rolledBackPluginMoved = true;
+      }
+      await rename(pluginStaging, pluginPath);
+      installedPluginMoved = true;
+      await rename(configStaging, configPath);
+      await chmod(configPath, 0o600);
+      await fsyncDirectory(dirname(pluginPath));
+      await fsyncDirectory(dirname(configPath));
+
+      const restored: HermesInstallReceipt = { ...receipt, status: "installed" };
+      delete restored.rolledBackAt;
+      delete restored.preRollbackBackupPath;
+      await atomicWritePrivate(receiptPath, `${JSON.stringify(restored, null, 2)}\n`);
+      return restored;
+    } catch (error) {
+      const compensationErrors: unknown[] = [];
+      const configRestoreStaging = join(
+        dirname(configPath),
+        `.${basename(configPath)}.compensation-restore-${crypto.randomUUID()}`,
+      );
+      try {
+        if (installedPluginMoved) await rm(pluginPath, { recursive: true, force: true });
+        if (rolledBackPluginMoved) await rename(rolledBackPluginBackup, pluginPath);
+        await copyPrivateFile(rolledBackConfigBackup, configRestoreStaging);
+        await rename(configRestoreStaging, configPath);
+        await chmod(configPath, 0o600);
+        await fsyncDirectory(dirname(pluginPath));
+        await fsyncDirectory(dirname(configPath));
+      } catch (compensationError) {
+        compensationErrors.push(compensationError);
+      } finally {
+        await rm(configRestoreStaging, { force: true }).catch(() => undefined);
+      }
+      try {
+        await atomicWritePrivate(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
+      } catch (compensationError) {
+        compensationErrors.push(compensationError);
+      }
+      if (compensationErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...compensationErrors],
+          `Hermes bridge 回滚补偿失败且无法恢复已回滚状态；保留备份：${compensationRoot}`,
+        );
+      }
+      throw error;
+    } finally {
+      await rm(pluginStaging, { recursive: true, force: true });
+      await rm(configStaging, { force: true });
+    }
   });
 }
 

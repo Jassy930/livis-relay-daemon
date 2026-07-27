@@ -44,7 +44,11 @@ import {
   defaultServiceDefinitionPath,
   renderDeploymentServiceDefinition,
 } from "./deployment-service.ts";
-import { installHermesBridge, rollbackHermesBridge } from "./hermes.ts";
+import {
+  compensateHermesBridgeRollback,
+  installHermesBridge,
+  rollbackHermesBridge,
+} from "./hermes.ts";
 
 const CURRENT_POINTER_FILE = "current.json";
 const RELEASE_METADATA_FILE = ".livis-release.json";
@@ -94,6 +98,12 @@ export interface RollbackDeploymentOptions {
   acknowledgeServiceRestart?: boolean;
   acknowledgeStateCompatibility?: boolean;
   serviceController?: DeploymentServiceController;
+  transactionHooks?: {
+    afterHermesRollback?: () => void | Promise<void>;
+    afterServiceRollback?: () => void | Promise<void>;
+    afterPointerCommit?: () => void | Promise<void>;
+    beforeReceiptCommit?: () => void | Promise<void>;
+  };
 }
 
 export interface UninstallDeploymentOptions {
@@ -1053,33 +1063,97 @@ export async function rollbackDeployment(options: RollbackDeploymentOptions): Pr
     }
     assertCurrentServiceDefinition(receipt, serviceState.definitionText);
     const previousDefinition = await readServiceBackup(receipt);
-    if (controller && options.manageService && serviceState.active) await controller.stop();
-    if (receipt.hermesInstallReceiptPath && receipt.plan.hermesHome) {
-      await rollbackHermesBridge({
-        hermesHome: receipt.plan.hermesHome,
-        receiptPath: receipt.hermesInstallReceiptPath,
-        acknowledgeRollback: true,
-      });
-    }
-    if (controller) {
-      if (previousDefinition === null) await controller.removeDefinition();
-      else await controller.writeDefinition(previousDefinition);
-      if (options.manageService) {
-        await controller.reload();
-        if (receipt.previousServiceActive && previousDefinition !== null) await controller.start();
-      }
-    }
     const pointerPath = join(installRoot, CURRENT_POINTER_FILE);
-    if (receipt.previousDeployment) await writePointer(pointerPath, receipt.previousDeployment);
-    else await durableUnlink(pointerPath);
     const updated: DeploymentReceipt = {
       ...receipt,
       status: "rolled-back",
       rolledBackAt: new Date().toISOString(),
       serviceRestartPerformed: Boolean(options.manageService),
     };
-    await writeReceipt(updated);
-    return updated;
+    let serviceTouched = false;
+    let hermesRollbackCommitted = false;
+    let pointerTouched = false;
+    let receiptTouched = false;
+    try {
+      if (controller && options.manageService && serviceState.active) {
+        serviceTouched = true;
+        await controller.stop();
+      }
+      if (receipt.hermesInstallReceiptPath && receipt.plan.hermesHome) {
+        await rollbackHermesBridge({
+          hermesHome: receipt.plan.hermesHome,
+          receiptPath: receipt.hermesInstallReceiptPath,
+          acknowledgeRollback: true,
+        });
+        hermesRollbackCommitted = true;
+        await options.transactionHooks?.afterHermesRollback?.();
+      }
+      if (controller) {
+        serviceTouched = true;
+        if (previousDefinition === null) await controller.removeDefinition();
+        else await controller.writeDefinition(previousDefinition);
+        if (options.manageService) {
+          await controller.reload();
+          if (receipt.previousServiceActive && previousDefinition !== null) await controller.start();
+        }
+      }
+      await options.transactionHooks?.afterServiceRollback?.();
+      pointerTouched = true;
+      if (receipt.previousDeployment) await writePointer(pointerPath, receipt.previousDeployment);
+      else await durableUnlink(pointerPath);
+      await options.transactionHooks?.afterPointerCommit?.();
+      receiptTouched = true;
+      await options.transactionHooks?.beforeReceiptCommit?.();
+      await writeReceipt(updated);
+      return updated;
+    } catch (error) {
+      const compensationErrors: unknown[] = [];
+      const rollbackCompensationIncomplete = error instanceof AggregateError;
+      if (receiptTouched) {
+        try {
+          await writeReceipt(receipt);
+        } catch (compensationError) {
+          compensationErrors.push(compensationError);
+        }
+      }
+      if (pointerTouched) {
+        try {
+          await writePointer(pointerPath, pointer);
+        } catch (compensationError) {
+          compensationErrors.push(compensationError);
+        }
+      }
+      if (hermesRollbackCommitted && receipt.hermesInstallReceiptPath && receipt.plan.hermesHome) {
+        try {
+          await compensateHermesBridgeRollback({
+            hermesHome: receipt.plan.hermesHome,
+            receiptPath: receipt.hermesInstallReceiptPath,
+            acknowledgeCompensation: true,
+          });
+        } catch (compensationError) {
+          compensationErrors.push(compensationError);
+        }
+      }
+      if (serviceTouched) {
+        try {
+          await restoreService({
+            controller,
+            previousDefinition: serviceState.definitionText,
+            previousActive: serviceState.active,
+            manageService: Boolean(options.manageService),
+          });
+        } catch (compensationError) {
+          compensationErrors.push(compensationError);
+        }
+      }
+      if (rollbackCompensationIncomplete || compensationErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...compensationErrors],
+          `部署回滚失败且补偿未完整完成；保留部署收据人工恢复：${receipt.receiptPath}`,
+        );
+      }
+      throw new Error(`部署回滚失败，已精确恢复操作前状态：${String(error)}`, { cause: error });
+    }
   });
 }
 

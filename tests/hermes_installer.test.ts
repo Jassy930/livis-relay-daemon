@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
+  compensateHermesBridgeRollback,
   HERMES_BRIDGE_FILES,
   installHermesBridge,
   listHermesInstallReceipts,
@@ -100,6 +101,63 @@ describe("Hermes bridge 原子安装", () => {
       receiptPath: receipt.receiptPath,
       acknowledgeRollback: true,
     })).rejects.toThrow("已经回滚");
+
+    const compensated = await compensateHermesBridgeRollback({
+      hermesHome: home,
+      receiptPath: receipt.receiptPath,
+      acknowledgeCompensation: true,
+    });
+    expect(compensated.status).toBe("installed");
+    expect(await readFile(join(oldPlugin, "adapter.py"), "utf8")).toBe(
+      await readFile(resolve(import.meta.dir, "../hermes-plugin/adapter.py"), "utf8"),
+    );
+    expect(await readFile(join(home, "config.yaml"), "utf8")).toContain("livis-bridge");
+
+    const retried = await rollbackHermesBridge({
+      hermesHome: home,
+      receiptPath: receipt.receiptPath,
+      acknowledgeRollback: true,
+    });
+    expect(retried.status).toBe("rolled-back");
+    expect(await readFile(join(oldPlugin, "operator-note.txt"), "utf8")).toBe("must survive rollback\n");
+  });
+
+  test("回滚收据提交前失败会恢复已安装 bridge 且允许重试", async () => {
+    const { home } = await profileFixture();
+    const receipt = await installHermesBridge({
+      hermesHome: home,
+      sourceDirectory: resolve(import.meta.dir, "../hermes-plugin"),
+    });
+    const installedConfig = await readFile(join(home, "config.yaml"), "utf8");
+
+    await expect(rollbackHermesBridge({
+      hermesHome: home,
+      receiptPath: receipt.receiptPath,
+      acknowledgeRollback: true,
+      beforeReceiptCommit: () => {
+        throw new Error("injected receipt failure");
+      },
+    })).rejects.toThrow("已精确恢复操作前状态");
+
+    expect(await Bun.file(join(home, "plugins/livis-bridge/adapter.py")).exists()).toBeTrue();
+    expect(await readFile(join(home, "config.yaml"), "utf8")).toBe(installedConfig);
+    expect((await Bun.file(receipt.receiptPath).json()).status).toBe("installed");
+
+    const rolledBack = await rollbackHermesBridge({
+      hermesHome: home,
+      receiptPath: receipt.receiptPath,
+      acknowledgeRollback: true,
+    });
+    expect(rolledBack.status).toBe("rolled-back");
+
+    const restored = await compensateHermesBridgeRollback({
+      hermesHome: home,
+      receiptPath: receipt.receiptPath,
+      acknowledgeCompensation: true,
+    });
+    expect(restored.status).toBe("installed");
+    expect(await Bun.file(join(home, "plugins/livis-bridge/adapter.py")).exists()).toBeTrue();
+    expect(await readFile(join(home, "config.yaml"), "utf8")).toBe(installedConfig);
   });
 
   test("安装后的人工改动会阻断回滚", async () => {
