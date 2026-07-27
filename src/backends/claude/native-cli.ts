@@ -342,9 +342,13 @@ export async function prepareClaudeNativeCli(options: {
 export function buildClaudeNativeInvocationCommand(
   command: PinnedClaudeCommand,
   maxBudgetUsd: number,
+  systemPrompt = CLAUDE_NATIVE_SYSTEM_PROMPT,
 ): readonly string[] {
   if (!Number.isFinite(maxBudgetUsd) || maxBudgetUsd <= 0) {
     throw new Error("Claude maxBudgetUsd 必须是正数");
+  }
+  if (systemPrompt.trim() === "") {
+    throw new Error("Claude system prompt 不能为空");
   }
   return [
     command.path,
@@ -370,7 +374,7 @@ export function buildClaudeNativeInvocationCommand(
     "--max-budget-usd",
     String(maxBudgetUsd),
     "--system-prompt",
-    CLAUDE_NATIVE_SYSTEM_PROMPT,
+    systemPrompt,
   ];
 }
 

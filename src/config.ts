@@ -22,6 +22,7 @@ export interface RelayConfig {
   profile: string;
   profileSha256: string;
   stateDir: string;
+  assistantContext: AssistantContextConfig | null;
   relay: {
     nodeName: string;
     handshakeTimeoutMs: number;
@@ -90,6 +91,12 @@ export interface RelayConfig {
   };
 }
 
+export interface AssistantContextConfig {
+  mode: "read-only-files";
+  contextDir: string;
+  maxPromptChars: number;
+}
+
 export const DEFAULT_CONFIG_PATH = "~/.livis-relay/config.json";
 export const DEFAULT_RELAY_MAX_FRAME_BYTES = 1_048_576;
 export const MAX_RELAY_MAX_FRAME_BYTES = 16_777_216;
@@ -103,6 +110,8 @@ export const DEFAULT_CLAUDE_REQUEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_CLAUDE_TURN_TIMEOUT_MS = 15 * 60 * 1_000;
 export const DEFAULT_CLAUDE_SHUTDOWN_TIMEOUT_MS = 5_000;
 export const DEFAULT_CLAUDE_MAX_BUDGET_USD = 0.05;
+export const DEFAULT_ASSISTANT_CONTEXT_MAX_PROMPT_CHARS = 20_000;
+export const MAX_ASSISTANT_CONTEXT_MAX_PROMPT_CHARS = 100_000;
 export const MINIMUM_SAFE_BRIDGE_VERSION = "0.1.1";
 const MINIMUM_SAFE_BRIDGE_VERSION_TRIPLET: [number, number, number] = [0, 1, 1];
 
@@ -147,6 +156,59 @@ function stringArray(value: unknown, label: string): string[] {
     throw new Error(`${label} 必须是非空字符串数组`);
   }
   return [...value] as string[];
+}
+
+function parseAssistantContext(
+  value: unknown,
+  stateDir: string,
+): AssistantContextConfig | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("config.assistantContext 必须是对象或 null");
+  }
+  const context = value as Record<string, unknown>;
+  const unexpected = Object.keys(context).filter((key) =>
+    !["mode", "contextDir", "maxPromptChars"].includes(key)
+  );
+  if (unexpected.length > 0) {
+    throw new Error(`config.assistantContext 包含未审核字段：${unexpected.sort().join(",")}`);
+  }
+  if (context.mode !== "read-only-files") {
+    throw new Error("config.assistantContext.mode 只支持 read-only-files");
+  }
+  const rawContextDir = asNonEmptyString(
+    context.contextDir,
+    "config.assistantContext.contextDir",
+  );
+  if (
+    rawContextDir !== rawContextDir.trim() || !isAbsolute(rawContextDir) ||
+    resolve(rawContextDir) !== rawContextDir || resolve(rawContextDir) === dirname(resolve(rawContextDir))
+  ) {
+    throw new Error("config.assistantContext.contextDir 必须是 canonical 绝对非根目录路径");
+  }
+  const contextDir = resolve(rawContextDir);
+  const resolvedStateDir = resolve(stateDir);
+  const relativeToState = relative(resolvedStateDir, contextDir);
+  const relativeToContext = relative(contextDir, resolvedStateDir);
+  if (
+    relativeToState === "" ||
+    (!relativeToState.startsWith("..") && !isAbsolute(relativeToState)) ||
+    (!relativeToContext.startsWith("..") && !isAbsolute(relativeToContext))
+  ) {
+    throw new Error("config.assistantContext.contextDir 与 stateDir 必须互不包含");
+  }
+  const maxPromptChars = context.maxPromptChars === undefined
+    ? DEFAULT_ASSISTANT_CONTEXT_MAX_PROMPT_CHARS
+    : asPositiveInteger(
+        context.maxPromptChars,
+        "config.assistantContext.maxPromptChars",
+      );
+  if (maxPromptChars > MAX_ASSISTANT_CONTEXT_MAX_PROMPT_CHARS) {
+    throw new Error(
+      `config.assistantContext.maxPromptChars 不能超过 ${MAX_ASSISTANT_CONTEXT_MAX_PROMPT_CHARS}`,
+    );
+  }
+  return { mode: "read-only-files", contextDir, maxPromptChars };
 }
 
 function parseCodexProvider(codex: Record<string, unknown> | undefined): CodexProviderConfig {
@@ -215,6 +277,9 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
   const hermes = objectAt(root, "hermes");
   const codex = optionalObjectAt(root, "codex");
   const claude = optionalObjectAt(root, "claude");
+  const stateDirRaw = asNonEmptyString(root.stateDir, "config.stateDir");
+  const stateDir = expandHome(stateDirRaw);
+  const assistantContext = parseAssistantContext(root.assistantContext, stateDir);
   const executionBackend = execution?.backend ?? "hermes";
   if (executionBackend !== "hermes" && executionBackend !== "codex" && executionBackend !== "claude") {
     throw new Error("config.execution.backend 只支持 hermes、codex 或 claude");
@@ -329,7 +394,6 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
   if (executionBackend === "codex" && codexProvider.type === "custom" && codexModel === null) {
     throw new Error("Codex custom provider 必须显式设置 config.codex.model");
   }
-  const stateDirRaw = asNonEmptyString(root.stateDir, "config.stateDir");
   const hermesMinimumVersion = asNonEmptyString(hermes.minimumVersion, "config.hermes.minimumVersion");
   const hermesMaximumVersion = asNonEmptyString(
     hermes.maximumExclusiveVersion,
@@ -363,7 +427,8 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
     schemaVersion: 1,
     profile: asNonEmptyString(root.profile, "config.profile"),
     profileSha256: asSha256(root.profileSha256, "config.profileSha256"),
-    stateDir: expandHome(stateDirRaw),
+    stateDir,
+    assistantContext,
     relay: {
       nodeName: asNonEmptyString(relay.nodeName, "config.relay.nodeName"),
       handshakeTimeoutMs: asPositiveInteger(relay.handshakeTimeoutMs, "config.relay.handshakeTimeoutMs"),
@@ -486,6 +551,7 @@ export async function initializeConfig(options: {
     profile: installedProfile,
     profileSha256: sha256(profileText),
     stateDir,
+    assistantContext: null,
     relay: {
       nodeName: "我的电脑",
       handshakeTimeoutMs: 15_000,

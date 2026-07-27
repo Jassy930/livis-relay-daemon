@@ -27,6 +27,7 @@ flowchart LR
 - 不支持多设备同时接入、跨设备共享后端会话或原地换设备；稳定 session key 固定为 `livis:<agentId>`。
 - Hermes 必须使用专用 profile、专用工作区和只读工具集。Codex `native-current` 只调用当前本地 runtime，账号和认证错误对 daemon 不透明；`private-api-key` 使用 state directory 内的专用 `CODEX_HOME`、API key 和 workspace，并可选择默认 OpenAI 或经确认的 custom Responses provider。
 - Claude `native-current` 从白名单环境调用本地 Claude Code 当前状态；不读取账号信息，并固定 `safe-mode`、空 tools/MCP/skills/slash commands 与 `--no-session-persistence`。
+- 可选 `assistantContext` 让 Codex/Claude 共用 stateDir 外的只读 `AGENTS.md + memory/*.md` 长期真源；backend workspace 只保存每轮恢复的快照，不自动写回记忆。
 - 不支持远程审批、附件、token stream、tool progress、管理命令和远程 `/update`。
 - Hermes home channel 只能由本地 `LIVIS_HOME_CHANNEL=livis:<agent_id>` 固定；远程 `/sethome` 不属于初始化步骤。
 - 取消语义为 `best_effort`；无法证明工具线程退出时进入 `CancelUnknown` 并隔离 session。
@@ -168,6 +169,7 @@ canary 外，合并文档或 `plutil -lint` 通过不代表用户服务已被修
 - [版本与发布流程](docs/RELEASING.md)
 - [架构与状态所有权](docs/ARCHITECTURE.md)
 - [本地多后端架构与状态边界](docs/LOCAL-BACKENDS.md)
+- [个人助手上下文与文件记忆](docs/ASSISTANT-CONTEXT.md)
 - [安全边界](docs/SECURITY.md)
 - [参与贡献](CONTRIBUTING.md)
 - [漏洞报告政策](SECURITY.md)

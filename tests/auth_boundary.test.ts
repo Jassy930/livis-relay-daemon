@@ -8,7 +8,7 @@ async function backendRuntimeFiles(): Promise<string[]> {
     resolve(PROJECT_ROOT, "src/daemon.ts"),
     resolve(PROJECT_ROOT, "src/connector/server.ts"),
   ];
-  for (const pattern of ["src/backend/**/*.ts", "src/backends/**/*.ts"]) {
+  for (const pattern of ["src/backend/**/*.ts", "src/backends/**/*.ts", "src/context/**/*.ts"]) {
     const glob = new Bun.Glob(pattern);
     for await (const path of glob.scan({ cwd: PROJECT_ROOT, absolute: true, onlyFiles: true })) {
       files.push(path);
@@ -18,7 +18,7 @@ async function backendRuntimeFiles(): Promise<string[]> {
 }
 
 describe("本地后端认证所有权边界", () => {
-  test("daemon 与 backend adapter 不读取原生凭据库或调用登录命令", async () => {
+  test("daemon、backend adapter 与 assistant context 不读取原生凭据库或调用登录命令", async () => {
     const forbidden: Array<{ label: string; pattern: RegExp }> = [
       { label: "Codex auth.json", pattern: /\.codex[/\\]auth\.json/i },
       { label: "Claude 凭据文件", pattern: /\.claude[/\\]\.credentials\.json/i },
@@ -42,7 +42,7 @@ describe("本地后端认证所有权边界", () => {
 
   test("backend adapter 不能复用 LiViS OAuth 或 daemon SecretStore", async () => {
     const forbiddenImports = [/auth[/\\]idaas\.ts/, /from\s+["'][^"']*secrets\.ts["']/];
-    for (const globPattern of ["src/backend/**/*.ts", "src/backends/**/*.ts"]) {
+    for (const globPattern of ["src/backend/**/*.ts", "src/backends/**/*.ts", "src/context/**/*.ts"]) {
       const glob = new Bun.Glob(globPattern);
       for await (const path of glob.scan({ cwd: PROJECT_ROOT, absolute: true, onlyFiles: true })) {
         const source = await Bun.file(path).text();
@@ -64,6 +64,7 @@ describe("本地后端认证所有权边界", () => {
       "src/backends/codex/native-execution-backend.ts",
       "src/backends/claude/native-cli.ts",
       "src/backends/claude/native-execution-backend.ts",
+      "src/context/assistant-context.ts",
     ]) {
       const source = await Bun.file(resolve(PROJECT_ROOT, path)).text();
       expect(source, `${path} 不得读取或绑定账号状态`).not.toMatch(

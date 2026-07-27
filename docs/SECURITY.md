@@ -39,6 +39,10 @@
   init 暴露的 plugins/agents 目录只校验数组结构，不把非空目录误判为可执行能力；后续 stream
   中的实际 tool/hook/user 回注事件会再次失败关闭。本地错误不分类账号状态，断连和收口不确定
   进入 quarantine。
+- 可选 `assistantContext` 只读取 stateDir 外的 `0700` canonical 目录、`0600` 单 link UTF-8 文件，
+  不自动写回。它不是凭据库或脱敏器；AGENTS/memory 正文会成为发给当前模型 provider 的 prompt，
+  因此不得保存 token、私钥、cookie、恢复码或其他不应出站的数据。完整边界见
+  [个人助手上下文与文件记忆](ASSISTANT-CONTEXT.md)。
 - `codex.mode=private-api-key` 的 CLI 审核范围固定为 `[0.145.0, 0.146.0)`；必须使用 daemon
   state directory 内通过标准输入单独写入 API key 的 `CODEX_HOME`，不得复用 `~/.codex`。
   该模式只接受 `account.type=apiKey`；OAuth/ChatGPT、Bedrock、空账号和未知类型都必须在

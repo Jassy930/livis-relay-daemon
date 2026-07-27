@@ -634,6 +634,7 @@ export interface CodexThreadBindingInspection {
   effectiveModel: string;
   modelProvider: string;
   instructionSourcesSha256: string;
+  instructionSources: readonly string[];
 }
 
 export interface CodexThreadPolicyExpectation {
@@ -731,6 +732,7 @@ export function inspectCodexThreadPolicyResponse(
     effectiveModel: nonEmptyString(response.model, "Codex thread response.model"),
     modelProvider,
     instructionSourcesSha256: sha256(JSON.stringify(instructionSources)),
+    instructionSources: [...instructionSources] as string[],
   };
 }
 

@@ -263,6 +263,19 @@ Codex 0.145.0 的 failed turn 可留下 `thread.status=systemError`，它不是 
 分类，并在同一事务中提交 `Failed`、ledger、outbox、active clear 与 quarantine，随后关闭
 backend。只有非认证失败才允许下一次 `turn/start` 按上游语义清状态。
 
+## 个人助手 context contract
+
+可选 `assistantContext` 是 backend session 之外的独立状态域。canonical
+`AGENTS.md + memory/*.md` 由操作者维护在 stateDir 外；daemon 只读并生成内容确定的 generation，
+Codex/Claude 私有 workspace 只保存可恢复快照。Codex 在 harness 前与每轮 dispatch 前恢复文件，
+并要求 thread 回读 workspace `AGENTS.md` instruction source；Claude 在每轮 spawn 前把同一快照显式
+装配到 system prompt，因为 safe mode 不依赖 `CLAUDE.md`/auto-memory 自动发现。
+
+context 加载、权限、UTF-8、预算或双遍一致性失败都发生在 backend 提交前并返回 `not_sent`；不会
+自动切换后端或写回 canonical 文件。它不携带 backend 凭据，也不改变 Codex 持久 thread、Claude
+stateless-per-job 或 JobStore fencing 语义。完整契约见
+[个人助手上下文与文件记忆](ASSISTANT-CONTEXT.md)。
+
 ## 官方更新分层
 
 LiViS 与执行后端使用不同门禁：

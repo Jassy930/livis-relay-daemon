@@ -34,10 +34,14 @@ connector 已实现；Codex 现在有显式 `native-current` 与 `private-api-ke
 | Hermes | daemon → UDS connector → 专用 Hermes Gateway | Hermes 专用 profile | 已实现；远程输入门禁与 canary 已落地 |
 | Codex `native-current` | daemon → 自有 stdio JSON-RPC → `codex app-server` | Codex 当前本地 runtime；对 daemon 不透明 | `operator-only`；已接入 `serve` 并完成真实 LiViS 文本闭环，异常路径/长时并发待验证 |
 | Codex `private-api-key` | daemon → stdio JSON-RPC → `codex app-server` | `<stateDir>/backends/codex/home` 中由 Codex 管理的专用 API key | 已实现的旧兼容路径；必须显式选择 |
-| Claude `native-current` | daemon → 每 job 独立 CLI `stream-json` 进程组 | Claude Code 当前本地 runtime；对 daemon 不透明 | `operator-only`；纯文本生产接线、离线门禁和原子切换已完成，真实 LiViS canary 待验证 |
+| Claude `native-current` | daemon → 每 job 独立 CLI `stream-json` 进程组 | Claude Code 当前本地 runtime；对 daemon 不透明 | `operator-only`；纯文本生产接线、离线门禁、原子切换与真实 LiViS 单条文本闭环已完成，异常路径/长跑待验证 |
 
 当前 `execution.backend` 是 daemon 级三选一配置；切换需要停服、排空异 backend 非终态 job
 并重启。它不是“同一 daemon 在线同时连接三个后端、每次请求只切路由”的最终形态。
+
+Codex/Claude 现在还可以显式启用同一份 stateDir 外只读 assistant context。长期真源由操作者维护，
+workspace 只保存确定性快照；它不改变 backend 认证所有权，也不是原生 session 文件共享。目录、权限、
+装配和失败边界见[个人助手上下文与文件记忆](ASSISTANT-CONTEXT.md)。
 
 ## 3. 目标进程与状态所有权
 
@@ -84,7 +88,7 @@ daemon 和 backend adapter 必须遵守以下规则：
 [`src/backend/contract.ts`](../src/backend/contract.ts) 公开实现状态、认证集成状态和无凭据的
 概念 payload，[`tests/local_backend_contract.test.ts`](../tests/local_backend_contract.test.ts)
 检查这些声明；[`tests/auth_boundary.test.ts`](../tests/auth_boundary.test.ts) 扫描
-`daemon.ts`、`connector/server.ts` 和 `src/backend(s)`，拒绝已知凭据路径、认证环境变量、
+`daemon.ts`、`connector/server.ts`、`src/backend(s)` 和 `src/context`，拒绝已知凭据路径、认证环境变量、
 Keychain 读取与登录命令字面量。
 
 这不是完整的运行时强制：`contract.ts` 尚未被生产执行路径导入，源码扫描也不覆盖
@@ -128,6 +132,8 @@ adapter 还必须提供断连事件通道；在这些字段和映射测试落地
 - 切换后端默认新建原生 session；若要延续上下文，必须由操作者对本次切换或固定路由显式授权，
   才能传递经过长度和内容限制的文本摘要。摘要属于跨后端数据流，不能作为默认能力或静默 fallback。
 - 不复制 Codex、Claude 或 Hermes 的原生 session 文件，也不伪造其 session ID。
+- 跨 Codex/Claude 共享的只能是操作者显式配置的有界文件 context；它作为同一份文本数据分别发送给
+  所选 provider，不赋予跨后端执行权，也不允许 backend 自动写回。
 - backend 断开、取消不确定或结果状态不明时，沿用现有 ambiguous execution 隔离，不自动换后端重跑。
 - 自动 fallback 必须单独设计和授权；任何本地 backend 错误都不能静默换后端重跑。
 

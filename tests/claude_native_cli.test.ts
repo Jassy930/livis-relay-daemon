@@ -54,6 +54,8 @@ describe("Claude native CLI 安全协议", () => {
       expect(invocation).toContain("--no-session-persistence");
       expect(invocation).not.toContain("--bare");
       expect(invocation).not.toContain("--setting-sources");
+      const customPrompt = buildClaudeNativeInvocationCommand(report.command, 0.05, "受控提示");
+      expect(customPrompt[customPrompt.indexOf("--system-prompt") + 1]).toBe("受控提示");
     } finally {
       await Promise.all([state.cleanup(), external.cleanup()]);
     }

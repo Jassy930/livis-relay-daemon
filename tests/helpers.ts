@@ -28,6 +28,7 @@ export function testConfig(stateDir: string): RelayConfig {
     profile: "profile.json",
     profileSha256: sha256("test-profile"),
     stateDir,
+    assistantContext: null,
     relay: {
       nodeName: "测试电脑",
       handshakeTimeoutMs: 1000,

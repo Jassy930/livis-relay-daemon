@@ -30,6 +30,7 @@ export interface CodexNativeSessionCoordinatorOptions {
   sessionKey: string;
   sessionHash: string;
   workspace: string;
+  requiredInstructionSource?: string | null;
   cliVersion: string;
   requestedModel: string | null;
   expectedModelProvider: string | null;
@@ -184,6 +185,7 @@ export class CodexNativeSessionCoordinator {
     try {
       threadReceipt = await prepareCodexNativeThread(dependencies.client, {
         workspace: options.workspace,
+        requiredInstructionSource: options.requiredInstructionSource,
         cliVersion: options.cliVersion,
         requestedModel: options.requestedModel,
         expectedModelProvider: options.expectedModelProvider,

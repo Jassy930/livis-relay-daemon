@@ -3,6 +3,7 @@
   "profile": "./protocol-profiles/livis-authorized.example.json",
   "profileSha256": "f9130d064d21d1d90b2a542cbbaae742fb90cedfbad4f84ae6311655d7e38f10",
   "stateDir": "~/.livis-relay",
+  "assistantContext": null,
   "relay": {
     "nodeName": "我的电脑",
     "handshakeTimeoutMs": 15000,

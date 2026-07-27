@@ -218,6 +218,26 @@ describe("Codex native thread 离线安全策略", () => {
     });
   });
 
+  test("启用受控 context 时必须回读 workspace AGENTS instruction source", async () => {
+    const client = new FakeNativeThreadClient();
+    client.threadResponseOverride = {
+      instructionSources: ["/test/native-workspace/AGENTS.md", "/Users/test/.codex/AGENTS.md"],
+    };
+    await expect(prepareCodexNativeThread(client, options({
+      requiredInstructionSource: "/test/native-workspace/AGENTS.md",
+    }))).resolves.toMatchObject({ memoryMode: "disabled" });
+
+    client.threadResponseOverride = {
+      instructionSources: ["/Users/test/.codex/AGENTS.md"],
+    };
+    await expect(prepareCodexNativeThread(client, options({
+      requiredInstructionSource: "/test/native-workspace/AGENTS.md",
+    }))).rejects.toMatchObject({
+      code: "native_thread_policy_incompatible",
+      sessionDisposition: "quarantine_required",
+    });
+  });
+
   test("permission profile 或全局 feature 不满足时在创建 thread 前失败关闭", async () => {
     for (const variant of ["profile", "feature"] as const) {
       const client = new FakeNativeThreadClient();

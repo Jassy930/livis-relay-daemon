@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { join, resolve } from "node:path";
 import {
   DEFAULT_RELAY_MAX_FRAME_BYTES,
+  DEFAULT_ASSISTANT_CONTEXT_MAX_PROMPT_CHARS,
   initializeConfig,
   loadRelayConfig,
   MAX_RELAY_MAX_FRAME_BYTES,
+  MAX_ASSISTANT_CONTEXT_MAX_PROMPT_CHARS,
   MINIMUM_SAFE_BRIDGE_VERSION,
   parseRelayConfig,
 } from "../src/config.ts";
@@ -158,6 +160,7 @@ describe("配置与协议 profile", () => {
     expect(parsedLegacy.codex.acknowledgeRemoteExecution).toBeFalse();
     expect(parsedLegacy.codex.provider).toEqual({ type: "openai" });
     expect(parsedLegacy.codex.toolchainReadRoots).toEqual([]);
+    expect(parsedLegacy.assistantContext).toBeNull();
 
     const codex = parseRelayConfig(JSON.stringify({
       ...config,
@@ -370,6 +373,46 @@ describe("配置与协议 profile", () => {
         },
       },
     }), "/tmp/config.json")).toThrow("custom provider 必须显式设置");
+  });
+
+  test("assistant context 默认关闭，启用时只接受 stateDir 外的有界只读文件配置", () => {
+    const base = testConfig("/tmp/livis-context-config-state");
+    expect(parseRelayConfig(JSON.stringify(base), "/tmp/config.json").assistantContext).toBeNull();
+    const parsed = parseRelayConfig(JSON.stringify({
+      ...base,
+      assistantContext: {
+        mode: "read-only-files",
+        contextDir: "/tmp/livis-assistant-context",
+      },
+    }), "/tmp/config.json");
+    expect(parsed.assistantContext).toEqual({
+      mode: "read-only-files",
+      contextDir: "/tmp/livis-assistant-context",
+      maxPromptChars: DEFAULT_ASSISTANT_CONTEXT_MAX_PROMPT_CHARS,
+    });
+
+    for (const assistantContext of [
+      { mode: "write-back", contextDir: "/tmp/livis-assistant-context" },
+      { mode: "read-only-files", contextDir: "relative/context" },
+      { mode: "read-only-files", contextDir: "/tmp/livis-context-config-state/context" },
+      { mode: "read-only-files", contextDir: "/tmp" },
+      { mode: "read-only-files", contextDir: "/tmp/livis-assistant-context", maxPromptChars: 0 },
+      {
+        mode: "read-only-files",
+        contextDir: "/tmp/livis-assistant-context",
+        maxPromptChars: MAX_ASSISTANT_CONTEXT_MAX_PROMPT_CHARS + 1,
+      },
+      {
+        mode: "read-only-files",
+        contextDir: "/tmp/livis-assistant-context",
+        credentialPath: "/tmp/secret",
+      },
+    ]) {
+      expect(() => parseRelayConfig(JSON.stringify({
+        ...base,
+        assistantContext,
+      }), "/tmp/config.json")).toThrow();
+    }
   });
 
   test("旧配置兼容 relay 帧默认上限，并拒绝无效或过大的显式值", () => {

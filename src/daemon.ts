@@ -193,6 +193,7 @@ export class RelayDaemon {
             turnTimeoutMs: dependencies.config.codex.turnTimeoutMs,
             shutdownTimeoutMs: dependencies.config.codex.shutdownTimeoutMs,
             clientVersion: DAEMON_VERSION,
+            assistantContext: dependencies.config.assistantContext,
           }, {
             store,
             handlers: executionHandlers,
@@ -228,6 +229,7 @@ export class RelayDaemon {
             shutdownTimeoutMs: dependencies.config.claude.shutdownTimeoutMs,
             maxOutputChars: dependencies.config.security.maxOutputChars,
             maxBudgetUsd: dependencies.config.claude.maxBudgetUsd,
+            assistantContext: dependencies.config.assistantContext,
           }, {
             store,
             handlers: executionHandlers,

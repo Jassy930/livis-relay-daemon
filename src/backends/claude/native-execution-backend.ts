@@ -1,5 +1,11 @@
 import { realpath } from "node:fs/promises";
 import { join } from "node:path";
+import type { AssistantContextConfig } from "../../config.ts";
+import {
+  assistantContextFailureStatus,
+  loadAssistantContextSnapshot,
+  materializeAssistantContextSnapshot,
+} from "../../context/assistant-context.ts";
 import type {
   ExecutionBackend,
   ExecutionBackendHandlers,
@@ -12,6 +18,7 @@ import { durableMkdirPrivate, sha256 } from "../../util.ts";
 import {
   assertPinnedClaudeCommand,
   buildClaudeNativeInvocationCommand,
+  CLAUDE_NATIVE_SYSTEM_PROMPT,
   consumeClaudeNativeStderr,
   consumeClaudeNativeStream,
   errnoIsMissingProcess,
@@ -81,6 +88,7 @@ export interface ClaudeNativeExecutionBackendOptions {
   shutdownTimeoutMs: number;
   maxOutputChars: number;
   maxBudgetUsd: number;
+  assistantContext?: AssistantContextConfig | null;
 }
 
 export interface ClaudeNativeExecutionBackendDependencies {
@@ -233,6 +241,8 @@ export class ClaudeNativeExecutionBackend implements ExecutionBackend {
   private currentExecutionId: string | null = null;
   private lastFailure: string | null = null;
   private failed = false;
+  private contextGeneration: string | null = null;
+  private lastContextFailure: string | null = null;
 
   constructor(
     private readonly options: ClaudeNativeExecutionBackendOptions,
@@ -257,6 +267,9 @@ export class ClaudeNativeExecutionBackend implements ExecutionBackend {
 
   private async startInternal(): Promise<void> {
     const layout = await ensureClaudeLayout(this.options);
+    if ((this.options.assistantContext ?? null) !== null) {
+      await this.syncAssistantContext(layout.workspace);
+    }
     const prepare = this.dependencies.prepare ?? prepareClaudeNativeCli;
     const preparation = await prepare({
       command: this.options.command,
@@ -363,11 +376,31 @@ export class ClaudeNativeExecutionBackend implements ExecutionBackend {
     ) {
       return "not_sent";
     }
+    let contextPrompt: string | null;
+    try {
+      contextPrompt = await this.syncAssistantContext(layout.workspace);
+    } catch (error) {
+      const message = assistantContextFailureStatus(error);
+      this.lastContextFailure = message;
+      this.lastFailure = message;
+      return "not_sent";
+    }
+    if (
+      pending.cancelled || !this.ready || this.preparation !== preparation || this.layout !== layout
+    ) {
+      return "not_sent";
+    }
     let child: ClaudeNativeProcess;
     try {
       const spawn = this.dependencies.spawn ?? defaultSpawn;
       child = spawn(
-        buildClaudeNativeInvocationCommand(preparation.command, this.options.maxBudgetUsd),
+        buildClaudeNativeInvocationCommand(
+          preparation.command,
+          this.options.maxBudgetUsd,
+          contextPrompt === null
+            ? undefined
+            : `${CLAUDE_NATIVE_SYSTEM_PROMPT}\n\n${contextPrompt}`,
+        ),
         {
           cwd: layout.workspace,
           env: preparation.environment,
@@ -375,7 +408,8 @@ export class ClaudeNativeExecutionBackend implements ExecutionBackend {
         },
       );
     } catch (error) {
-      this.lastFailure = error instanceof Error ? error.message : "Claude 子进程 spawn 失败";
+      const message = error instanceof Error ? error.message : "Claude 子进程 spawn 失败";
+      this.lastFailure = message;
       return "not_sent";
     }
     let resolveDone!: () => void;
@@ -406,6 +440,19 @@ export class ClaudeNativeExecutionBackend implements ExecutionBackend {
         .finally(active.resolveDone);
     }, 0);
     return "submitted";
+  }
+
+  private async syncAssistantContext(workspace: string): Promise<string | null> {
+    const config = this.options.assistantContext ?? null;
+    if (config === null) return null;
+    const snapshot = await loadAssistantContextSnapshot({
+      config,
+      stateDir: this.options.stateDir,
+    });
+    await materializeAssistantContextSnapshot(snapshot, workspace);
+    this.contextGeneration = snapshot.generation;
+    this.lastContextFailure = null;
+    return snapshot.prompt;
   }
 
   async cancel(job: StoredJob): Promise<ExecutionSubmission> {
@@ -743,6 +790,12 @@ export class ClaudeNativeExecutionBackend implements ExecutionBackend {
       safeMode: true,
       activeJobId: this.active?.job.jobId ?? null,
       credentialStateInspected: false,
+      assistantContext: {
+        enabled: (this.options.assistantContext ?? null) !== null,
+        mode: this.options.assistantContext?.mode ?? null,
+        generation: this.contextGeneration,
+        lastFailure: this.lastContextFailure,
+      },
       lastFailure: this.lastFailure,
       failed: this.failed,
       experimental: true,

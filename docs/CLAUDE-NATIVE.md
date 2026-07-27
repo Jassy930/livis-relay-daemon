@@ -41,7 +41,7 @@ JobStore 中的 `claude-stateless:<hash>` 只是本地 durable fencing 锚点，
 --no-session-persistence
 --prompt-suggestions false
 --max-budget-usd <显式上限>
---system-prompt <固定最小提示>
+--system-prompt <固定最小提示 + 可选的有界 assistant context>
 ```
 
 `--bare` 不在允许参数中，因为它会绕过当前本地 OAuth/keychain 状态；`--setting-sources ''`
@@ -55,6 +55,11 @@ JobStore 中的 `claude-stateless:<hash>` 只是本地 durable fencing 锚点，
 
 首版因此只支持单次纯文本问答，不支持 Claude 工具调用、编码工具、MCP、Chrome、skills、
 slash command、Hook、resume 或跨 job 上下文。
+
+可选 `assistantContext` 不依赖 safe mode 下已关闭的 `CLAUDE.md`/auto-memory 自动发现。Relay 在每次
+spawn 前读取并双遍确认同一个 `AGENTS.md + memory/*.md` 快照，显式装配进 system prompt；Claude
+仍是每 job 新会话且不能写回。完整文件和权限边界见
+[个人助手上下文与文件记忆](ASSISTANT-CONTEXT.md)。
 
 ## 3. 兼容性与提交状态
 
@@ -79,6 +84,11 @@ slash command、Hook、resume 或跨 job 上下文。
 
 ```json
 {
+  "assistantContext": {
+    "mode": "read-only-files",
+    "contextDir": "/绝对路径/assistant-scope",
+    "maxPromptChars": 20000
+  },
   "execution": { "backend": "claude" },
   "claude": {
     "mode": "native-current",
@@ -146,6 +156,7 @@ Desktop daemon。`status` 至少应显示：
 - `transport=cli-stream-json`、`compatibilityBasis=capability-probe`；
 - `stateOwnership=local-state-opaque`、`sessionPersistence=false`；
 - `credentialStateInspected=false`；
+- 若已启用文件记忆，`assistantContext.enabled=true` 且 generation 为 64 位 SHA-256；
 - backend backlog 与 quarantine 均为空。
 
 这些只证明服务就绪。真实闭环必须由操作者从 LiViS App 发送唯一文本 canary，并对同一 job

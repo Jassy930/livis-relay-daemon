@@ -32,6 +32,7 @@ export type CodexNativeThreadMode =
 
 export interface CodexNativeThreadPolicyOptions {
   workspace: string;
+  requiredInstructionSource?: string | null;
   cliVersion: string;
   requestedModel: string | null;
   expectedModelProvider: string | null;
@@ -114,6 +115,13 @@ export async function prepareCodexNativeThread(
   options: CodexNativeThreadPolicyOptions,
 ): Promise<CodexNativeThreadPolicyReceipt> {
   if (!isAbsolute(options.workspace)) throw new Error("workspace 必须是绝对路径");
+  if (
+    options.requiredInstructionSource !== undefined &&
+    options.requiredInstructionSource !== null &&
+    !isAbsolute(options.requiredInstructionSource)
+  ) {
+    throw new Error("requiredInstructionSource 必须是绝对路径");
+  }
   if (options.cliVersion.trim() === "") throw new Error("cliVersion 不能为空");
   if (options.expectedModelProvider !== null && options.expectedModelProvider.trim() === "") {
     throw new Error("expectedModelProvider 不能为空");
@@ -194,6 +202,13 @@ export async function prepareCodexNativeThread(
       permissionProfile: CODEX_NATIVE_PERMISSION_PROFILE,
       instructionSourcePolicy: "local-opaque",
     });
+    if (
+      options.requiredInstructionSource !== undefined &&
+      options.requiredInstructionSource !== null &&
+      !binding.instructionSources.includes(options.requiredInstructionSource)
+    ) {
+      throw new Error("required instruction source missing");
+    }
     if (
       options.requestedModel !== null && binding.effectiveModel !== options.requestedModel
     ) {

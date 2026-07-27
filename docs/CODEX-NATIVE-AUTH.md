@@ -12,6 +12,11 @@ daemon。
 也已通过；但真实 session resume、取消/超时/断线、工具执行和 Desktop 长时并发
 仍未通过，因此不能把整项能力提升为 `live-canary-verified`。
 
+可选的个人助手文件记忆与认证状态完全分离：Relay 从 stateDir 外的操作者私有目录读取
+`AGENTS.md + memory/*.md`，在 harness 前和每轮派发前恢复到 private workspace，并要求 thread
+回读包含 workspace `AGENTS.md` instruction source。Codex 内建 memory 仍固定关闭，canonical 文件
+不写回。完整边界见[个人助手上下文与文件记忆](ASSISTANT-CONTEXT.md)。
+
 ## 1. 显式模式与原子切换
 
 Codex 后端必须显式选择模式；缺少 `codex.mode` 时配置解析和 `serve` 都失败关闭：
