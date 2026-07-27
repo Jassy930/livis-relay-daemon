@@ -126,6 +126,26 @@ describe("Claude native CLI 安全协议", () => {
       terminalSubtype: "success",
     });
 
+    const catalogResult = await consumeClaudeNativeStream({
+      stream: stream([
+        JSON.stringify({
+          ...init,
+          plugins: [{ type: "catalog-entry" }],
+          agents: [{ type: "catalog-entry" }],
+        }),
+        JSON.stringify({
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          session_id: "session-1",
+          result: "目录不可执行",
+        }),
+      ].join("\n") + "\n"),
+      maxOutputChars: 100,
+      onInit: async () => undefined,
+    });
+    expect(catalogResult.text).toBe("目录不可执行");
+
     await expect(consumeClaudeNativeStream({
       stream: stream([
         JSON.stringify({ ...init, tools: ["Bash"] }),
@@ -139,7 +159,7 @@ describe("Claude native CLI 安全协议", () => {
       ].join("\n")),
       maxOutputChars: 100,
       onInit: async () => undefined,
-    })).rejects.toThrow("未证明禁用工具");
+    })).rejects.toThrow("未证明禁用可执行工具");
 
     await expect(consumeClaudeNativeStream({
       stream: stream([
@@ -163,5 +183,21 @@ describe("Claude native CLI 安全协议", () => {
       maxOutputChars: 100,
       onInit: async () => undefined,
     })).rejects.toThrow("tool_use");
+
+    await expect(consumeClaudeNativeStream({
+      stream: stream([
+        JSON.stringify(init),
+        JSON.stringify({ type: "system", subtype: "hook_started" }),
+        JSON.stringify({
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          session_id: "session-1",
+          result: "不应接受",
+        }),
+      ].join("\n")),
+      maxOutputChars: 100,
+      onInit: async () => undefined,
+    })).rejects.toThrow("Hook");
   });
 });

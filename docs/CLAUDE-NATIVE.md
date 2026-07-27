@@ -46,10 +46,12 @@ JobStore 中的 `claude-stateless:<hash>` 只是本地 durable fencing 锚点，
 `--bare` 不在允许参数中，因为它会绕过当前本地 OAuth/keychain 状态；`--setting-sources ''`
 也不使用，因为实测会切断本机当前设置来源。`--safe-mode` 保留 Claude Code 自己读取当前状态的
 能力，同时禁用插件、Hook 和自定义组件执行。Relay 还会验证 `system/init` 回读的
-`tools`、`mcp_servers`、`skills` 和 `slash_commands` 均为空；若当前 CLI 回传
-`plugins` 或 `agents`，它们也必须为空；`permissionMode` 必须为 `dontAsk`。后续 stream
-一旦出现 Hook、`tool_use`、`tool_result`、MCP tool 或用户回注事件同样失败关闭，不能只凭
-启动参数宣称工具已禁用。
+`tools`、`mcp_servers`、`skills` 和 `slash_commands` 均为空，`permissionMode` 必须为
+`dontAsk`。当前实测版本（Claude Code 2.1.220）即使在 safe mode 下仍会通过 `plugins` 和
+`agents` 返回目录；
+这些目录不等于可执行 plugin 或 Agent tool，因此 Relay 只验证两者在出现时仍为数组，不要求
+为空。后续 stream 一旦出现 Hook、`tool_use`、`tool_result`、MCP tool 或用户回注事件同样
+失败关闭，不能只凭启动参数或目录字段宣称工具已禁用。
 
 首版因此只支持单次纯文本问答，不支持 Claude 工具调用、编码工具、MCP、Chrome、skills、
 slash command、Hook、resume 或跨 job 上下文。

@@ -377,16 +377,16 @@ export function buildClaudeNativeInvocationCommand(
 function safeInitSessionId(record: Record<string, unknown>): string {
   const sessionId = record.session_id;
   const emptyArray = (value: unknown): boolean => Array.isArray(value) && value.length === 0;
-  const optionalEmptyArray = (value: unknown): boolean => value === undefined || emptyArray(value);
+  const optionalArray = (value: unknown): boolean => value === undefined || Array.isArray(value);
   if (
     typeof sessionId !== "string" || sessionId.length === 0 || sessionId.length > 128 ||
     !emptyArray(record.tools) || !emptyArray(record.mcp_servers) || !emptyArray(record.skills) ||
-    !emptyArray(record.slash_commands) || !optionalEmptyArray(record.plugins) ||
-    !optionalEmptyArray(record.agents) || record.permissionMode !== "dontAsk"
+    !emptyArray(record.slash_commands) || !optionalArray(record.plugins) ||
+    !optionalArray(record.agents) || record.permissionMode !== "dontAsk"
   ) {
     throw new ClaudeNativeCliError(
       "native_stream_incompatible",
-      "Claude system/init 未证明禁用工具、MCP、技能、插件、子代理和斜杠命令",
+      "Claude system/init 未证明禁用可执行工具、MCP、技能和斜杠命令",
     );
   }
   return sessionId;

@@ -36,8 +36,9 @@
 - `claude.mode=native-current` 从空环境按白名单构造 HOME、PATH、TMPDIR 和 locale/terminal，
   不整体继承 daemon 环境。版本只作观察；必需 CLI 参数和 `system/init` 回读共同裁决兼容性。
   执行固定 safe-mode、空 tools/MCP/skills/slash commands、`dontAsk` 与无 session persistence；
-  若 init 暴露 plugins/agents 也必须为空，后续 stream 中的实际 tool/hook/user 回注事件会再次
-  失败关闭。本地错误不分类账号状态，断连和收口不确定进入 quarantine。
+  init 暴露的 plugins/agents 目录只校验数组结构，不把非空目录误判为可执行能力；后续 stream
+  中的实际 tool/hook/user 回注事件会再次失败关闭。本地错误不分类账号状态，断连和收口不确定
+  进入 quarantine。
 - `codex.mode=private-api-key` 的 CLI 审核范围固定为 `[0.145.0, 0.146.0)`；必须使用 daemon
   state directory 内通过标准输入单独写入 API key 的 `CODEX_HOME`，不得复用 `~/.codex`。
   该模式只接受 `account.type=apiKey`；OAuth/ChatGPT、Bedrock、空账号和未知类型都必须在

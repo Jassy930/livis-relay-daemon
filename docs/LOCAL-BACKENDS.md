@@ -257,7 +257,8 @@ Codex Desktop 生命周期或状态、日常 Codex 仍可用，并核对同一 j
 3. 建立 `<stateDir>/backends/claude/native-sessions/<hash>` 私有 layout；spawn 环境从空对象按
    HOME、PATH、TMPDIR 和固定 locale/terminal 白名单重建，不整体继承 `process.env`。
 4. 固定 `safe-mode`、空 tools/MCP/skills/slash commands、`dontAsk` 与
-   `no-session-persistence`，并在 `system/init` 回读中再次验证。
+   `no-session-persistence`，并在 `system/init` 回读中再次验证；plugins/agents 只作为目录校验，
+   非空目录不等于可执行能力，实际 tool/hook/user 回注事件仍失败关闭。
 5. 把每次真实 `session_id` 映射为 attempt operation ID；job、lease、run generation、提交状态、
    append-only ledger、取消和 disconnect 继续使用 JobStore v8 durable 语义。
 6. `backend switch claude`、`doctor` 和 `claude probe-native-cli` 已接入；dry-run/apply SHA 一致，
