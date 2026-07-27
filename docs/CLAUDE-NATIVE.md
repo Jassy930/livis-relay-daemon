@@ -1,8 +1,9 @@
 # Claude Code 原生当前状态后端
 
 本文记录 `execution.backend=claude` 的首版生产接线、安全边界和人工验收步骤。该能力当前为
-`operator-only`：代码、离线状态机、doctor 和原子切换已实现，但尚未完成真实 LiViS App
-消息闭环，因此不能标记为 `live-canary-verified`。
+`operator-only`：代码、离线状态机、doctor、原子切换和真实 LiViS App 单条文本闭环已完成，
+但错误态、取消/超时/崩溃、长时运行、工具执行和会话恢复尚未闭合，因此不提升为
+`live-canary-verified`。
 
 ## 1. 状态所有权
 
@@ -48,10 +49,9 @@ JobStore 中的 `claude-stateless:<hash>` 只是本地 durable fencing 锚点，
 能力，同时禁用插件、Hook 和自定义组件执行。Relay 还会验证 `system/init` 回读的
 `tools`、`mcp_servers`、`skills` 和 `slash_commands` 均为空，`permissionMode` 必须为
 `dontAsk`。当前实测版本（Claude Code 2.1.220）即使在 safe mode 下仍会通过 `plugins` 和
-`agents` 返回目录；
-这些目录不等于可执行 plugin 或 Agent tool，因此 Relay 只验证两者在出现时仍为数组，不要求
-为空。后续 stream 一旦出现 Hook、`tool_use`、`tool_result`、MCP tool 或用户回注事件同样
-失败关闭，不能只凭启动参数或目录字段宣称工具已禁用。
+`agents` 返回目录；这些目录不等于可执行 plugin 或 Agent tool，因此 Relay 只验证两者在出现时
+仍为数组，不要求为空。后续 stream 一旦出现 Hook、`tool_use`、`tool_result`、MCP tool 或用户
+回注事件同样失败关闭，不能只凭启动参数或目录字段宣称工具已禁用。
 
 首版因此只支持单次纯文本问答，不支持 Claude 工具调用、编码工具、MCP、Chrome、skills、
 slash command、Hook、resume 或跨 job 上下文。
@@ -149,12 +149,44 @@ Desktop daemon。`status` 至少应显示：
 - backend backlog 与 quarantine 均为空。
 
 这些只证明服务就绪。真实闭环必须由操作者从 LiViS App 发送唯一文本 canary，并对同一 job
-同时确认 `Succeeded`、outbox `Delivered`、LiViS ACK 和 App 唯一回显。完成前能力保持
-`operator-only`，文档不得写成真实消息链路已验证。
+同时确认 `Succeeded`、outbox `Delivered`、LiViS ACK 和 App 唯一回显。本轮回执见下一节；
+后续版本或环境仍必须重新执行同样的完整闭环，不能只沿用历史 ready 状态。
 
-## 7. 当前未验证项
+## 7. 2026-07-27 真实文本 canary 回执
 
-- 真实 LiViS App 文本 canary；
+首次真实消息 `20260727113956-a9f267d5-d3fb-4c2a-9d2a-cbab7056d7ed` 在
+`system/init` 安全回读阶段失败关闭：job 为 `Interrupted`、无 outbox，attempt 为
+`reserved → interrupted`，`provider_operation_id=NULL`。只输出结构计数的受控探针证明
+`tools/mcp_servers/skills/slash_commands` 均为空、`permissionMode=dontAsk`，但当前 Claude Code
+仍回报 1 个 plugin 目录项和 4 个 agent 目录项。两者是目录而非可执行能力；修复提交
+`8ee46a04c0cf729b7db1342374ec1ca0970d669e` 因此只放宽目录非空，继续要求所有可执行面为空，
+并保留对实际 Hook、`tool_use`、`tool_result`、MCP tool 和用户回注事件的运行期失败关闭。
+
+重试前停止 Relay，并把完整 state directory（含 SQLite/WAL/SHM）备份到
+`/Users/jassy/.livis-relay-backups/20260727T034718Z-pre-claude-catalog-fix`。正式
+`session release` 回执为 `retiredBackendSessions=["claude"]`、
+`codexBackendSessionRetired=false`；它只退役失败的 Claude recovery，没有删除 idle Codex
+session。随后 `doctor --online` 全绿，稳定运行目录固定到上述完整提交，Relay 恢复为
+`execution.kind=claude`、`ready=true`、LiViS connected/handshake complete、零 backlog 和零
+quarantine。
+
+第二条唯一消息形成完整闭环：
+
+- job：`20260727115354-17875e81-3860-493c-9b4f-7c5185993d00`；
+- backend/status/generation：`claude` / `Succeeded` / `1`；
+- append-only attempt：`reserved → accepted → succeeded`，operation 在 accepted 后绑定；
+- outbox：`Delivered`、`retry_count=0`、仅 1 条 delivery attempt，`delivered_at` 与
+  `acked_at` 均为 `2026-07-27T03:54:01Z`；
+- 终态后无非终态 job、无 quarantine，Claude backend 保持 ready；
+- 操作者确认 LiViS App 只看到一条正常回复。
+
+整轮没有读取、复制、分类、刷新或迁移 Claude/Codex 原生账号状态；状态继续为
+`local-state-opaque`，`credentialStateInspected=false`。Codex Desktop 的既有 daemon PID
+`72289` 及其原启动时间在切换、修复和 canary 期间保持不变。本回执只证明本机当前 Claude Code
+2.1.220、当前配置与单条纯文本路径，不覆盖下一节的未验证能力。
+
+## 8. 当前未验证项
+
 - Claude 本地错误状态经完整 Relay 链路的表现；
 - 用户取消、deadline、进程崩溃和长时运行的真实 canary；
 - 工具/编码能力、原生会话恢复与跨 job 上下文；

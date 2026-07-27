@@ -264,9 +264,12 @@ Codex Desktop 生命周期或状态、日常 Codex 仍可用，并核对同一 j
 6. `backend switch claude`、`doctor` 和 `claude probe-native-cli` 已接入；dry-run/apply SHA 一致，
    收据保持 `credentialsReadOrMigrated=false`。
 
-当前 `claude_execution=operator-only`。尚未闭合的是：真实 LiViS App 文本 canary、本地错误态、
+2026-07-27 的真实 LiViS App 单条文本 canary 已闭合：job
+`20260727115354-17875e81-3860-493c-9b4f-7c5185993d00` 为 `Succeeded`，attempt 为
+`reserved → accepted → succeeded`，outbox `Delivered` 且仅投递一次，LiViS ACK 与 App 唯一
+回显均已确认。当前 `claude_execution` 仍为 `operator-only`；尚未闭合的是本地错误态、
 取消/超时/崩溃长跑 canary，以及工具/编码和原生会话恢复。首版明确不提供 resume，因此不能用
-“单条命令返回文本”推导会话能力；详细边界和操作步骤见
+“单条命令返回文本”推导会话能力；详细边界、失败现场和运行回执见
 [Claude Code 原生当前状态后端](CLAUDE-NATIVE.md)。
 
 ### 7.5 阶段 D：稳定本地 CLI 与可观测面

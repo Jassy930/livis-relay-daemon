@@ -114,7 +114,7 @@
       "status": "operator-only",
       "evidenceRefs": ["docs/LOCAL-BACKENDS.md", "docs/CLAUDE-NATIVE.md"],
       "testRefs": ["tests/local_backend_contract.test.ts", "tests/auth_boundary.test.ts", "tests/claude_native_cli.test.ts", "tests/claude_native_execution_backend.test.ts", "tests/daemon_execution_backend.test.ts", "tests/backend_switch.test.ts", "tests/codex_cli_doctor.test.ts"],
-      "notes": "显式 claude.mode=native-current 已接入 Claude Code --print/stream-json 的单任务纯文本安全路径。Relay 从空环境构造白名单，只把 HOME 作为当前 runtime 选择器交给 Claude，自身不读取、复制、分类或刷新账号状态。版本只作观察，readiness 由 version/help 必需参数与 system/init 安全回读裁决。工具、MCP、skills、Hook、Chrome、slash command 和 session persistence 均禁用；提交状态、断连、取消和 ambiguous execution 已映射到 JobStore v8。真实 LiViS App canary 尚未完成，因此保持 operator-only。"
+      "notes": "显式 claude.mode=native-current 已接入 Claude Code --print/stream-json 的单任务纯文本安全路径。Relay 从空环境构造白名单，只把 HOME 作为当前 runtime 选择器交给 Claude，自身不读取、复制、分类或刷新账号状态。版本只作观察，readiness 由 version/help 必需参数与 system/init 安全回读裁决。工具、MCP、skills、Hook、Chrome、slash command 和 session persistence 均禁用；提交状态、断连、取消和 ambiguous execution 已映射到 JobStore v8。真实 LiViS App 单条文本闭环已有回执；错误态、取消/超时/崩溃、长时运行、工具执行和原生会话恢复尚未完成，因此保持 operator-only。"
     },
     {
       "id": "online_multi_backend_routing",
