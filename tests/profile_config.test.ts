@@ -241,8 +241,49 @@ describe("配置与协议 profile", () => {
     const claude = parseRelayConfig(JSON.stringify({
       ...config,
       execution: { backend: "claude" },
+      claude: {
+        mode: "native-current",
+        command: "/Users/test/.local/bin/claude",
+        requestTimeoutMs: 12_000,
+        turnTimeoutMs: 45_000,
+        shutdownTimeoutMs: 4_000,
+        maxBudgetUsd: 0.05,
+        acknowledgeRemoteExecution: true,
+      },
     }), "/tmp/config.json");
     expect(claude.execution.backend).toBe("claude");
+    expect(claude.claude).toEqual({
+      mode: "native-current",
+      command: "/Users/test/.local/bin/claude",
+      requestTimeoutMs: 12_000,
+      turnTimeoutMs: 45_000,
+      shutdownTimeoutMs: 4_000,
+      maxBudgetUsd: 0.05,
+      acknowledgeRemoteExecution: true,
+    });
+    expect(() => parseRelayConfig(JSON.stringify({
+      ...config,
+      execution: { backend: "claude" },
+    }), "/tmp/config.json")).toThrow("config.claude.mode=native-current");
+    expect(() => parseRelayConfig(JSON.stringify({
+      ...config,
+      execution: { backend: "claude" },
+      claude: {
+        mode: "native-current",
+        command: "claude",
+        acknowledgeRemoteExecution: true,
+      },
+    }), "/tmp/config.json")).toThrow("必须是绝对路径");
+    expect(() => parseRelayConfig(JSON.stringify({
+      ...config,
+      execution: { backend: "claude" },
+      claude: {
+        mode: "native-current",
+        command: "/Users/test/.local/bin/claude",
+        model: "claude-future",
+        acknowledgeRemoteExecution: true,
+      },
+    }), "/tmp/config.json")).toThrow("未审核字段");
     expect(() => parseRelayConfig(JSON.stringify({
       ...config,
       execution: { backend: "gemini" },
@@ -263,6 +304,15 @@ describe("配置与协议 profile", () => {
       ...config,
       execution: { backend: "codex" },
       codex: { ...config.codex, acknowledgeRemoteExecution: "yes" },
+    }), "/tmp/config.json")).toThrow("必须是布尔值");
+    expect(() => parseRelayConfig(JSON.stringify({
+      ...config,
+      execution: { backend: "claude" },
+      claude: {
+        mode: "native-current",
+        command: "/Users/test/.local/bin/claude",
+        acknowledgeRemoteExecution: "yes",
+      },
     }), "/tmp/config.json")).toThrow("必须是布尔值");
     for (const security of [
       { ...config.security, allowAllNodes: true },

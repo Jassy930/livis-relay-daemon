@@ -1,9 +1,9 @@
-# LiViS 共享 Relay Daemon（一期：Hermes 默认，Codex 实验后端）
+# LiViS 共享 Relay Daemon（一期：Hermes 默认，Codex / Claude 实验后端）
 
 [![CI](https://github.com/Jassy930/livis-relay-daemon/actions/workflows/ci.yml/badge.svg)](https://github.com/Jassy930/livis-relay-daemon/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-这是一个独立于 LiViS 官方 OpenClaw 插件、Hermes core 与 Codex 的本地 relay daemon。当前协议实现基于对 LiViS v2.0.0 wire 行为的静态观察，由 daemon 持有消息、执行租约和 durable outbox，再把请求交给默认 Hermes backend 或显式启用的 Codex app-server backend。Codex 必须显式选择本机当前 runtime 的 `native-current`，或使用专用 API key 的 `private-api-key` 兼容模式；二者不会自动 fallback。服务端事实、历史 canary 与未知项以[协议证据边界](docs/LIVIS-RELAY-PROTOCOL-BOUNDARY.md)为准。
+这是一个独立于 LiViS 官方 OpenClaw 插件、Hermes core、Codex 与 Claude Code 的本地 relay daemon。当前协议实现基于对 LiViS v2.0.0 wire 行为的静态观察，由 daemon 持有消息、执行租约和 durable outbox，再把请求交给默认 Hermes backend，或显式启用 Codex / Claude backend。Codex 必须显式选择本机当前 runtime 的 `native-current`，或使用专用 API key 的 `private-api-key` 兼容模式；Claude 首版只支持本机当前状态的无会话纯文本安全路径。三者不会自动 fallback。服务端事实、历史 canary 与未知项以[协议证据边界](docs/LIVIS-RELAY-PROTOCOL-BOUNDARY.md)为准。
 
 > 当前属于实验性的第三方兼容实现，不是理想、Hermes、Codex 或 OpenAI 官方组件，也不代表任何官方背书。本仓库不包含或再分发官方 bundle；使用者在连接相关服务前，应自行确认适用的服务条款、协议权限和数据合规要求。
 
@@ -16,15 +16,17 @@ flowchart LR
     B <-->|"UDS WebSocket\nBearer + lease"| P["Hermes livis-bridge plugin"]
     P <--> H["专用 Hermes Gateway\n只读工具配置"]
     B <-->|"stdio JSON-RPC\nthread / turn"| C["daemon 自管 Codex app-server\nnative-current 或 private-api-key"]
+    B -->|"CLI stream-json\nstateless text"| A["daemon 自管 Claude Code 子进程\nnative-current / safe-mode"]
 ```
 
 ## 一期边界
 
-- 默认只接 Hermes；Codex 必须显式配置并确认远程执行，Claude Code 尚未实现。
+- 默认只接 Hermes；Codex 与 Claude 都必须显式配置并确认远程执行。Claude 当前只开放无工具、无持久会话的单任务纯文本路径。
 - 只支持纯文本、单个 final result。
 - 一期暂将 LiViS `node_id` 视为设备来源标识；每套 daemon、config 与 state directory 只允许一个预先配置的 `node_id`。
 - 不支持多设备同时接入、跨设备共享后端会话或原地换设备；稳定 session key 固定为 `livis:<agentId>`。
 - Hermes 必须使用专用 profile、专用工作区和只读工具集。Codex `native-current` 只调用当前本地 runtime，账号和认证错误对 daemon 不透明；`private-api-key` 使用 state directory 内的专用 `CODEX_HOME`、API key 和 workspace，并可选择默认 OpenAI 或经确认的 custom Responses provider。
+- Claude `native-current` 从白名单环境调用本地 Claude Code 当前状态；不读取账号信息，并固定 `safe-mode`、空 tools/MCP/skills/slash commands 与 `--no-session-persistence`。
 - 不支持远程审批、附件、token stream、tool progress、管理命令和远程 `/update`。
 - Hermes home channel 只能由本地 `LIVIS_HOME_CHANNEL=livis:<agent_id>` 固定；远程 `/sethome` 不属于初始化步骤。
 - 取消语义为 `best_effort`；无法证明工具线程退出时进入 `CancelUnknown` 并隔离 session。
@@ -36,14 +38,15 @@ flowchart LR
 - `lease_id + run_generation` fencing，同 session 单活。
 - cancel/final 使用 CAS 决定唯一赢家；ambiguous execution 不自动重跑。
 - Hermes connector 只开放权限 `0600` 的 Unix socket，不监听 TCP。
-- `execution.backend` 固定为 Hermes/Codex/Claude 三选一；Claude 尚未实现并在 `doctor`/`serve` 失败关闭，不会回退到其他 backend。
-- Codex 由 daemon 通过自有 stdio app-server 直接管理；JobStore schema v8 的不可变 `jobs.target_backend` 与 append-only attempt 账本继续以 `account-bound | local-state-opaque` 区分两种状态所有权。`jobs/outbox` 仍是业务状态真源。
-- 只有 `private-api-key` 会回读并固定 `account.type=apiKey`；`native-current` 不调用账号接口、不分类本地认证状态，任意本地错误只按普通 backend failed 结算。
+- `execution.backend` 固定为 Hermes/Codex/Claude 三选一；同一 daemon 只启动一个。任一 backend 失败都不会回退到其他 backend。
+- Codex 由 daemon 通过自有 stdio app-server 直接管理，Claude 则为每个 job 启动自有 CLI 进程组；JobStore schema v8 的不可变 `jobs.target_backend` 与 append-only attempt 账本继续以 `account-bound | local-state-opaque` 区分状态所有权。`jobs/outbox` 仍是业务状态真源。
+- 只有 `private-api-key` 会回读并固定 `account.type=apiKey`；`native-current` 不调用账号接口、不分类本地认证状态。具备完整 terminal 证据的本地错误只按普通 backend failed 结算；提交后没有完整 terminal 时仍按 ambiguous execution 隔离。
 - `private-api-key` 的 model provider 与 API key 属于 state directory 的不可变安全边界；provider/key 变化必须使用全新 state。`native-current` 不接受 provider/model/toolchain 配置。
 - `backend switch` 只在停服、JobStore v8、全 scope 零非终态 backlog/不兼容 session/quarantine 时原子替换配置，并生成不读取或迁移凭据的收据。`serve` 仍会在启动前拒绝异 backend 非终态 job。
 - Codex 只在完整 turn deadline 内的 terminal `turn/completed` 后返回一个 agent final；超时先请求 interrupt，再按固定 grace 失败关闭。工具网络关闭、workspace 是唯一可写根，审批请求默认拒绝。
 - `private-api-key` 完整编码态可显式配置经审核的 `toolchainReadRoots`；`native-current` 固定使用独立 native workspace 与当前 runtime 的清洗后工具环境。
 - 两种 Codex app-server 都由 daemon 作为独立 POSIX 进程组持有并负责收口；`native-current` 不连接、停止、重启或修改 Codex Desktop daemon。
+- Claude 子进程同样使用独立 POSIX 进程组；版本只作观察，`--version + --help` 必需参数和运行期 `system/init` 安全回读才裁决兼容性。
 - `private-api-key` 具备有界 idle recovery；`native-current` 的 active 断连进入持久 recovery/quarantine，idle 断开只降低 readiness，均绝不自动重放业务 job。
 - Hermes bridge 在建立 job 映射、发送 `accepted` 和进入 dispatcher 之前，拒绝全部斜杠命令及 Hermes 0.15.1 会归一化的自然语言重启别名；active session、blocking approval 或状态不可读时同样失败关闭。daemon 内部 cancel 生成的 `/stop` 仍走独立控制路径。
 - LiViS profile 按 SHA-256 固定；未知 wire protocol、版本或 artifact 漂移默认拒绝。
@@ -74,6 +77,7 @@ JSON Schema 与证据等级规则见 [`docs/CAPABILITIES.md`](docs/CAPABILITIES.
 - 使用 Hermes 时，本地 Hermes 版本须位于配置中的已审核范围。
 - 使用 Codex `private-api-key` 时，CLI 必须位于 `[0.145.0, 0.146.0)`，并为 daemon 专用
   `CODEX_HOME` 单独登录；`native-current` 不登录或处理凭据，只要求可完成 app-server initialize。
+- 使用 Claude 时不设固定 CLI 版本窗；必须支持文档列出的安全参数与 `stream-json` 事件契约。当前仅支持纯文本，无工具和原生会话恢复。
 
 ### 开发环境快速准备
 

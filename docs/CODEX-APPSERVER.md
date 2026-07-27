@@ -6,9 +6,9 @@
 显式选择且不会自动 fallback。
 
 Codex 当前是显式选择的实验后端；默认执行后端仍是 Hermes。配置枚举固定为
-`hermes | codex | claude` 且一套 daemon 同时只选一个。Claude Code 尚未实现；选择
-`claude` 时 `doctor`/`serve` 失败关闭，不得通过复用 Codex 配置、Hermes socket 或
-手工改数据库来接入。
+`hermes | codex | claude` 且一套 daemon 同时只选一个。Claude 使用独立的 CLI stream-json
+adapter，不能复用 Codex 配置、Hermes socket 或手工改数据库接入；其边界见
+[Claude Code 原生当前状态后端](CLAUDE-NATIVE.md)。
 
 ## 支持范围
 
@@ -693,7 +693,7 @@ macOS/Codex 0.145.0/model/provider/profile 与未知 Relay build，不能外推�
 
 当前代码实际实现的是：一个 daemon、一个获准 `node_id`、一个固定隔离空 workspace、
 一个长期 Codex thread，所有纯文本 job 串行执行；一套配置只能在 Hermes、Codex、
-Claude 中选择一个 backend，Claude 未实现时失败关闭。
+Claude 中选择一个 backend。Claude 首版无原生会话，不改变本节 Codex thread 语义。
 这足以验证第一条 Codex 功能链，但以下语义尚未定型：
 
 - LiViS 每次新对话是否创建新 thread，还是一台设备永久复用一个 thread；

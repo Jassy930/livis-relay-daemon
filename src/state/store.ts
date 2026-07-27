@@ -2278,7 +2278,7 @@ export class JobStore {
         `)
         .get(this.scopeKey, input.jobId, input.runGeneration) !== null;
     if (
-      context.target_backend === "codex" && !allowsLegacyMetadata &&
+      context.target_backend !== "hermes" && !allowsLegacyMetadata &&
       (!context.thread_id || !context.cli_version || !context.effective_model ||
         !context.model_provider || !context.state_ownership ||
         (context.state_ownership === "account-bound" && !context.account_type) ||
@@ -2286,7 +2286,7 @@ export class JobStore {
           (context.account_type !== null || context.account_subject_sha256 !== null)) ||
         !context.security_config_sha256 || !context.feature_snapshot_sha256)
     ) {
-      throw new Error(`Codex execution attempt 缺少 immutable session 元数据：${input.jobId}`);
+      throw new Error(`持久 backend execution attempt 缺少 immutable session 元数据：${input.jobId}`);
     }
     const sequence = (this.database
       .query<{ sequence: number | null }, [string, string, number]>(`
@@ -2314,7 +2314,7 @@ export class JobStore {
         context.session_key,
         context.lease_id,
         context.connector_id,
-        context.target_backend === "codex" ? context.thread_id : null,
+        context.target_backend === "hermes" ? null : context.thread_id,
         providerOperationId,
         context.cli_version,
         context.requested_model,
@@ -3828,10 +3828,10 @@ export class JobStore {
       throw new Error(`SQLite v8 有 ${activeWithoutAudit} 个 active attempt 缺少审计事件`);
     }
 
-    const malformedCodexEvents = this.database
+    const malformedDurableBackendEvents = this.database
       .query<{ count: number }, []>(`
         SELECT COUNT(*) AS count FROM execution_attempt_events
-        WHERE backend='codex' AND (
+        WHERE backend<>'hermes' AND (
           provider_session_id IS NULL
           OR ((
             runtime_version IS NULL OR effective_model IS NULL OR model_provider IS NULL
@@ -3851,8 +3851,10 @@ export class JobStore {
         )
       `)
       .get()?.count ?? 0;
-    if (malformedCodexEvents !== 0) {
-      throw new Error(`SQLite v8 有 ${malformedCodexEvents} 个 Codex 审计事件缺少 session 锚点`);
+    if (malformedDurableBackendEvents !== 0) {
+      throw new Error(
+        `SQLite v8 有 ${malformedDurableBackendEvents} 个持久 backend 审计事件缺少 session 锚点`,
+      );
     }
 
     const sequenceGaps = this.database

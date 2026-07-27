@@ -12,7 +12,7 @@ export type LocalBackendImplementationState =
 export const LOCAL_BACKEND_IMPLEMENTATION_STATE = {
   hermes: "implemented",
   codex: "implemented-experimental",
-  claude: "contract-only",
+  claude: "implemented-experimental",
 } as const satisfies Record<LocalBackendKind, LocalBackendImplementationState>;
 
 export type LocalBackendAuthenticationIntegration =
@@ -27,7 +27,7 @@ export type LocalBackendAuthenticationIntegration =
 export const LOCAL_BACKEND_AUTH_INTEGRATION = {
   hermes: "native-profile-owned",
   codex: "native-current-state-opaque",
-  claude: "not-implemented",
+  claude: "native-current-state-opaque",
 } as const satisfies Record<LocalBackendKind, LocalBackendAuthenticationIntegration>;
 
 export const LOCAL_BACKEND_AUTH_POLICY = {

@@ -78,6 +78,16 @@ export interface RelayConfig {
     shutdownTimeoutMs: number;
     acknowledgeRemoteExecution: boolean;
   };
+  claude: {
+    /** 只调用 Claude Code 当前本地状态，不读取或管理其账号状态。 */
+    mode: "native-current" | null;
+    command: string;
+    requestTimeoutMs: number;
+    turnTimeoutMs: number;
+    shutdownTimeoutMs: number;
+    maxBudgetUsd: number;
+    acknowledgeRemoteExecution: boolean;
+  };
 }
 
 export const DEFAULT_CONFIG_PATH = "~/.livis-relay/config.json";
@@ -89,6 +99,10 @@ export const DEFAULT_CODEX_REQUEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_CODEX_TURN_TIMEOUT_MS = 15 * 60 * 1_000;
 export const DEFAULT_CODEX_INTERRUPT_GRACE_MS = 5_000;
 export const DEFAULT_CODEX_SHUTDOWN_TIMEOUT_MS = 5_000;
+export const DEFAULT_CLAUDE_REQUEST_TIMEOUT_MS = 30_000;
+export const DEFAULT_CLAUDE_TURN_TIMEOUT_MS = 15 * 60 * 1_000;
+export const DEFAULT_CLAUDE_SHUTDOWN_TIMEOUT_MS = 5_000;
+export const DEFAULT_CLAUDE_MAX_BUDGET_USD = 0.05;
 export const MINIMUM_SAFE_BRIDGE_VERSION = "0.1.1";
 const MINIMUM_SAFE_BRIDGE_VERSION_TRIPLET: [number, number, number] = [0, 1, 1];
 
@@ -119,6 +133,13 @@ function optionalObjectAt(
 function optionalNonEmptyString(value: unknown, label: string): string | null {
   if (value === undefined || value === null) return null;
   return asNonEmptyString(value, label);
+}
+
+function positiveFiniteNumber(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new Error(`${label} 必须是正数`);
+  }
+  return value;
 }
 
 function stringArray(value: unknown, label: string): string[] {
@@ -193,6 +214,7 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
   const security = objectAt(root, "security");
   const hermes = objectAt(root, "hermes");
   const codex = optionalObjectAt(root, "codex");
+  const claude = optionalObjectAt(root, "claude");
   const executionBackend = execution?.backend ?? "hermes";
   if (executionBackend !== "hermes" && executionBackend !== "codex" && executionBackend !== "claude") {
     throw new Error("config.execution.backend 只支持 hermes、codex 或 claude");
@@ -208,6 +230,10 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
   if (codex?.acknowledgeRemoteExecution !== undefined &&
       typeof codex.acknowledgeRemoteExecution !== "boolean") {
     throw new Error("config.codex.acknowledgeRemoteExecution 必须是布尔值");
+  }
+  if (claude?.acknowledgeRemoteExecution !== undefined &&
+      typeof claude.acknowledgeRemoteExecution !== "boolean") {
+    throw new Error("config.claude.acknowledgeRemoteExecution 必须是布尔值");
   }
   if (typeof security.acknowledgeUnofficialProtocol !== "boolean") {
     throw new Error("config.security.acknowledgeUnofficialProtocol 必须是布尔值");
@@ -235,10 +261,22 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
   ) {
     throw new Error("config.codex.mode 只支持 native-current 或 private-api-key");
   }
+  const claudeCommand = claude?.command === undefined
+    ? "claude"
+    : asNonEmptyString(claude.command, "config.claude.command");
+  const claudeMode = claude?.mode === undefined || claude.mode === null
+    ? null
+    : asNonEmptyString(claude.mode, "config.claude.mode");
+  if (claudeMode !== null && claudeMode !== "native-current") {
+    throw new Error("config.claude.mode 只支持 native-current");
+  }
   if (executionBackend === "codex" && codexMode === null) {
     throw new Error(
       "Codex backend 必须显式设置 config.codex.mode；禁止在 native-current 与 private-api-key 之间静默选择",
     );
+  }
+  if (executionBackend === "claude" && claudeMode !== "native-current") {
+    throw new Error("Claude backend 必须显式设置 config.claude.mode=native-current");
   }
   if (executionBackend === "codex" && codexMode === "native-current") {
     if (codex?.provider !== undefined || codexModel !== null || codexToolchainReadRoots.length > 0) {
@@ -252,8 +290,31 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
       "Codex backend 只支持单设备：config.security.allowAllNodes 必须为 false，且 allowedNodeIds 必须恰好包含一个 nodeId",
     );
   }
+  if (executionBackend === "claude" && (allowAllNodes || allowedNodeIds.length !== 1)) {
+    throw new Error(
+      "Claude backend 只支持单设备：config.security.allowAllNodes 必须为 false，且 allowedNodeIds 必须恰好包含一个 nodeId",
+    );
+  }
   if (executionBackend === "codex" && !isAbsolute(codexCommand)) {
     throw new Error("Codex backend 的 config.codex.command 必须是绝对路径");
+  }
+  if (executionBackend === "claude" && !isAbsolute(claudeCommand)) {
+    throw new Error("Claude backend 的 config.claude.command 必须是绝对路径");
+  }
+  if (executionBackend === "claude" && claude) {
+    const allowed = new Set([
+      "mode",
+      "command",
+      "requestTimeoutMs",
+      "turnTimeoutMs",
+      "shutdownTimeoutMs",
+      "maxBudgetUsd",
+      "acknowledgeRemoteExecution",
+    ]);
+    const unexpected = Object.keys(claude).filter((key) => !allowed.has(key));
+    if (unexpected.length > 0) {
+      throw new Error(`config.claude 包含未审核字段：${unexpected.sort().join(",")}`);
+    }
   }
   if (
     executionBackend === "codex" &&
@@ -366,6 +427,23 @@ export function parseRelayConfig(text: string, configPath: string): RelayConfig 
         : asPositiveInteger(codex.shutdownTimeoutMs, "config.codex.shutdownTimeoutMs"),
       acknowledgeRemoteExecution: codex?.acknowledgeRemoteExecution === true,
     },
+    claude: {
+      mode: claudeMode,
+      command: claudeCommand,
+      requestTimeoutMs: claude?.requestTimeoutMs === undefined
+        ? DEFAULT_CLAUDE_REQUEST_TIMEOUT_MS
+        : asPositiveInteger(claude.requestTimeoutMs, "config.claude.requestTimeoutMs"),
+      turnTimeoutMs: claude?.turnTimeoutMs === undefined
+        ? DEFAULT_CLAUDE_TURN_TIMEOUT_MS
+        : asPositiveInteger(claude.turnTimeoutMs, "config.claude.turnTimeoutMs"),
+      shutdownTimeoutMs: claude?.shutdownTimeoutMs === undefined
+        ? DEFAULT_CLAUDE_SHUTDOWN_TIMEOUT_MS
+        : asPositiveInteger(claude.shutdownTimeoutMs, "config.claude.shutdownTimeoutMs"),
+      maxBudgetUsd: claude?.maxBudgetUsd === undefined
+        ? DEFAULT_CLAUDE_MAX_BUDGET_USD
+        : positiveFiniteNumber(claude.maxBudgetUsd, "config.claude.maxBudgetUsd"),
+      acknowledgeRemoteExecution: claude?.acknowledgeRemoteExecution === true,
+    },
   };
 }
 
@@ -450,6 +528,15 @@ export async function initializeConfig(options: {
       turnTimeoutMs: DEFAULT_CODEX_TURN_TIMEOUT_MS,
       interruptGraceMs: DEFAULT_CODEX_INTERRUPT_GRACE_MS,
       shutdownTimeoutMs: DEFAULT_CODEX_SHUTDOWN_TIMEOUT_MS,
+      acknowledgeRemoteExecution: false,
+    },
+    claude: {
+      mode: null,
+      command: "claude",
+      requestTimeoutMs: DEFAULT_CLAUDE_REQUEST_TIMEOUT_MS,
+      turnTimeoutMs: DEFAULT_CLAUDE_TURN_TIMEOUT_MS,
+      shutdownTimeoutMs: DEFAULT_CLAUDE_SHUTDOWN_TIMEOUT_MS,
+      maxBudgetUsd: DEFAULT_CLAUDE_MAX_BUDGET_USD,
       acknowledgeRemoteExecution: false,
     },
   };

@@ -4,9 +4,10 @@
 
 当前契约明确区分 Codex app-server 私有兼容路径的受控 canary 与原生当前状态调用：前者已有证据，
 后者要求账号状态对 relay 完全不透明，生产接线、停服切换与真实 LiViS 文本闭环已有证据；
-由于 resume/异常、工具执行和长时 Desktop 并发尚未闭合，当前仍为 `operator-only`。Claude 和同一
-daemon 在线多后端路由仍保持 `unsupported`，不能因
-类型契约或配置枚举存在而提升状态。
+由于 resume/异常、工具执行和长时 Desktop 并发尚未闭合，当前仍为 `operator-only`。Claude
+无状态纯文本 adapter、doctor、JobStore attempt 和原子切换已有离线证据，也提升为
+`operator-only`；真实 LiViS App canary、错误态和异常路径尚未闭合。同一 daemon 在线多后端路由
+仍保持 `unsupported`，不能因三个 adapter 分别存在而提升状态。
 
 ## 证据等级
 

@@ -9,6 +9,7 @@ import { incomingJob, temporaryDirectory, testConfig } from "./helpers.ts";
 
 const PROJECT_ROOT = resolve(import.meta.dir, "..");
 const CODEX_COMMAND = "/opt/homebrew/bin/codex";
+const CLAUDE_COMMAND = "/Users/test/.local/bin/claude";
 
 async function fixture(prefix: string): Promise<{
   state: Awaited<ReturnType<typeof temporaryDirectory>>;
@@ -153,8 +154,70 @@ describe("backend switch 原子切换", () => {
     }
   });
 
-  test("非终态 backlog、account-bound session 与 quarantine 均拒绝 apply", async () => {
-    for (const blockedBy of ["backlog", "account-bound", "quarantine"] as const) {
+  test("Claude native-current dry-run 与 apply 原子目标完全一致", async () => {
+    const current = await fixture("livis-backend-switch-claude-");
+    try {
+      const args = [
+        "backend",
+        "switch",
+        "claude",
+        "--mode",
+        "native-current",
+        "--command",
+        CLAUDE_COMMAND,
+        "--config",
+        current.configPath,
+      ];
+      const dryRun = await runCli(args);
+      expect(dryRun.exitCode).toBe(0);
+      const plan = JSON.parse(dryRun.stdout) as { configSha256: string };
+      expect(plan).toMatchObject({
+        targetBackend: "claude",
+        claudeMode: "native-current",
+        codexMode: null,
+        applied: false,
+      });
+      expect(await Bun.file(current.configPath).text()).toBe(current.initialText);
+
+      const applied = await runCli([
+        ...args.slice(0, -2),
+        "--apply",
+        "--acknowledge-daemon-stopped",
+        "--acknowledge-remote-execution",
+        "--config",
+        current.configPath,
+      ]);
+      expect(applied.exitCode).toBe(0);
+      const result = JSON.parse(applied.stdout) as {
+        configSha256: string;
+        receiptPath: string;
+      };
+      expect(result.configSha256).toBe(plan.configSha256);
+      expect(await Bun.file(result.receiptPath).json()).toMatchObject({
+        targetBackend: "claude",
+        claudeMode: "native-current",
+        credentialsReadOrMigrated: false,
+      });
+      const loaded = await loadRelayConfig(current.configPath);
+      expect(loaded.config.execution.backend).toBe("claude");
+      expect(loaded.config.claude).toMatchObject({
+        mode: "native-current",
+        command: CLAUDE_COMMAND,
+        maxBudgetUsd: 0.05,
+        acknowledgeRemoteExecution: true,
+      });
+    } finally {
+      await current.state.cleanup();
+    }
+  });
+
+  test("backlog、account-bound、不兼容 Claude anchor 与 quarantine 均拒绝 apply", async () => {
+    for (const blockedBy of [
+      "backlog",
+      "account-bound",
+      "incompatible-claude",
+      "quarantine",
+    ] as const) {
       const current = await fixture(`livis-backend-switch-${blockedBy}-`);
       try {
         const store = new JobStore(
@@ -185,6 +248,25 @@ describe("backend switch 原子切换", () => {
             checkpointTurnsSha256: sha256("[]"),
             checkpointedAt: 1,
           });
+        } else if (blockedBy === "incompatible-claude") {
+          store.createLocalOpaqueBackendSession({
+            backend: "claude",
+            sessionKey: "session-incompatible-claude",
+            sessionHash: "d".repeat(64),
+            threadId: "legacy-claude-session",
+            cwd: join(current.state.path, "legacy-claude-workspace"),
+            cliVersion: "claude-native-stateless-v1",
+            requestedModel: null,
+            effectiveModel: "native-current-opaque",
+            modelProvider: "claude-code-native-opaque",
+            securityConfigSha256: "e".repeat(64),
+            featureSnapshotSha256: "f".repeat(64),
+            checkpointTurnId: null,
+            checkpointTurnStatus: null,
+            checkpointTurnCount: 0,
+            checkpointTurnsSha256: sha256("[]"),
+            checkpointedAt: 1,
+          });
         } else {
           store.quarantineSession("session-quarantined", "保留测试证据");
         }
@@ -192,9 +274,11 @@ describe("backend switch 原子切换", () => {
 
         await expect(switchBackend({
           configPath: current.configPath,
-          targetBackend: "codex",
-          codexMode: "native-current",
-          codexCommand: CODEX_COMMAND,
+          targetBackend: blockedBy === "incompatible-claude" ? "claude" : "codex",
+          codexMode: blockedBy === "incompatible-claude" ? undefined : "native-current",
+          codexCommand: blockedBy === "incompatible-claude" ? undefined : CODEX_COMMAND,
+          claudeMode: blockedBy === "incompatible-claude" ? "native-current" : undefined,
+          claudeCommand: blockedBy === "incompatible-claude" ? CLAUDE_COMMAND : undefined,
           apply: true,
           acknowledgeDaemonStopped: true,
           acknowledgeRemoteExecution: true,
@@ -203,7 +287,9 @@ describe("backend switch 原子切换", () => {
             ? "存在非终态 backend backlog"
             : blockedBy === "account-bound"
               ? "account-bound Codex session"
-              : "quarantined session",
+              : blockedBy === "incompatible-claude"
+                ? "不兼容 Claude session anchor"
+                : "quarantined session",
         );
         if (blockedBy === "quarantine") {
           await expect(switchBackend({

@@ -190,8 +190,9 @@ describe("Codex doctor 启动前安全门禁", () => {
     }
   });
 
-  test("Claude 可配置但 doctor 与 serve 都清晰失败关闭", async () => {
-    const state = await temporaryDirectory("livis-claude-unimplemented-state-");
+  test("Claude doctor 只做 version/help 能力探针且不发送模型 turn", async () => {
+    const state = await temporaryDirectory("livis-claude-doctor-state-");
+    const external = await temporaryDirectory("livis-claude-doctor-external-");
     try {
       await chmod(state.path, 0o700);
       const profile = await testProfile();
@@ -200,26 +201,52 @@ describe("Codex doctor 启动前安全门禁", () => {
       await atomicWritePrivate(profilePath, profileText);
       await new SecretStore(state.path).initialize();
       await new IdentityStore(state.path, profile).initialize();
+      const command = join(external.path, "claude");
+      const sentinel = join(external.path, "model-turn-sent");
+      await writeFile(command, [
+        "#!/bin/sh",
+        "if [ \"$1\" = \"--version\" ]; then",
+        "  printf '%s\\n' '99.0.0 (Claude Code)'",
+        "  exit 0",
+        "fi",
+        "if [ \"$1\" = \"--help\" ]; then",
+        "  printf '%s\\n' '--print --input-format --output-format --verbose --safe-mode --no-chrome --disable-slash-commands --strict-mcp-config --mcp-config --tools --permission-mode --no-session-persistence --prompt-suggestions --max-budget-usd --system-prompt'",
+        "  exit 0",
+        "fi",
+        `printf sent > ${JSON.stringify(sentinel)}`,
+        "exit 2",
+        "",
+      ].join("\n"), { mode: 0o700 });
       const configPath = join(state.path, "config.json");
       await atomicWritePrivate(configPath, `${JSON.stringify({
         ...testConfig(state.path),
         profile: profilePath,
         profileSha256: sha256(profileText),
         execution: { backend: "claude" },
+        claude: {
+          mode: "native-current",
+          command,
+          requestTimeoutMs: 1_000,
+          turnTimeoutMs: 2_000,
+          shutdownTimeoutMs: 1_000,
+          maxBudgetUsd: 0.05,
+          acknowledgeRemoteExecution: true,
+        },
       }, null, 2)}\n`);
 
-      const run = async (command: "doctor" | "serve") => {
+      const run = async () => {
         const child = Bun.spawn([
           process.execPath,
           "run",
           "src/index.ts",
-          command,
+          "doctor",
           "--config",
           configPath,
         ], {
           cwd: PROJECT_ROOT,
           env: {
             ...process.env,
+            HOME: external.path,
             LIVIS_RELAY_CONFIG: undefined,
             LIVIS_RELAY_STATE_DIR: undefined,
           },
@@ -235,26 +262,27 @@ describe("Codex doctor 启动前安全门禁", () => {
         return { stdout, stderr, exitCode };
       };
 
-      const doctor = await run("doctor");
+      const doctor = await run();
       expect(doctor.exitCode).toBe(1);
       expect(doctor.stderr).toBe("");
       const report = JSON.parse(doctor.stdout) as {
         ok: boolean;
         checks: Array<{ name: string; ok: boolean; detail: string }>;
       };
-      expect(report.ok).toBeFalse();
       expect(report.checks.find((check) => check.name === "execution_backend"))
-        .toMatchObject({ ok: false });
-      expect(report.checks.find((check) => check.name === "execution_backend")?.detail)
-        .toContain("尚未实现");
-
-      const serve = await run("serve");
-      expect(serve.exitCode).toBe(1);
-      expect(serve.stdout).toBe("");
-      expect(serve.stderr).toContain("Claude backend 尚未实现");
-      expect(serve.stderr).toContain("不会退回 Hermes 或 Codex");
+        .toMatchObject({ ok: true, detail: "claude" });
+      const native = report.checks.find((check) => check.name === "claude_native_cli");
+      expect(native).toMatchObject({ ok: true });
+      expect(JSON.parse(native!.detail)).toMatchObject({
+        compatibilityBasis: "capability-probe",
+        cliVersion: "99.0.0 (Claude Code)",
+        versionsAreObservational: true,
+        sentModelTurn: false,
+        credentialStateInspected: false,
+      });
+      expect(await Bun.file(sentinel).exists()).toBeFalse();
     } finally {
-      await state.cleanup();
+      await Promise.all([state.cleanup(), external.cleanup()]);
     }
   });
 

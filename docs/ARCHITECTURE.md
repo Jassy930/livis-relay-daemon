@@ -12,20 +12,19 @@
   经过 Hermes connector，也不把 thread 当作 job 状态真源。`codex.mode` 必须显式选择
   `native-current | private-api-key`，两个 adapter 互不 fallback。`codex` 是 execution backend；
   其下的默认 OpenAI 或显式 custom Responses 是 model provider，不是第四种 backend。
+- 显式 Claude backend 为每个 job 启动一个独立 `claude --print` 进程组，以安全
+  `stream-json` 事件映射 attempt；首版不持有 Claude 原生会话，也不经过 Hermes connector。
 - Hermes 模式下 daemon 与专用 Hermes Gateway 分别由 launchd/systemd 管理；Codex
   模式只管理 daemon 服务，app-server 随 daemon 启停。
 
 这种边界允许以后评审新的执行后端，而不复制 LiViS 登录、协议和 durable outbox。
 `execution.backend` 的配置值固定为 `hermes | codex | claude`，一套 daemon 同时只选择
-一个。Claude Code 当前尚未实现：配置解析会接受该枚举值，但 `doctor` 会明确报错，
-`serve` 会在启动任何执行 backend 前失败关闭，绝不退回 Hermes 或 Codex。
+一个。Claude Code 首版必须显式选择 `claude.mode=native-current`；失败绝不退回 Hermes 或 Codex。
 
-当前抽象还不是完整的 provider-neutral managed-session 层：事件中的 `turnId`、SQLite
-中的 `thread_id/active_turn_id` 以及 daemon 多处 `kind === "codex"` 分支都带 Codex
-语义。引入 Claude Code 前，应先抽出 backend registry、托管目录/session 生命周期、
-attempt fencing、terminal/cancel 能力和 provider session/execution 标识；Codex 的
-JSON-RPC stdio 与 Claude 的 SDK/CLI stream-json 必须保留为两个独立 transport，不能
-为了复用代码把它们伪装成同一协议。当前产品边界已经固定为 Hermes、Codex、Claude
+当前抽象仍不是完整的 provider-neutral managed-session 层：SQLite 的 `thread_id` 对 Claude
+只表示 durable fencing 锚点，不表示 conversation。Codex JSON-RPC stdio 与 Claude CLI
+stream-json 保留为两个独立 transport，只在 `ExecutionBackend` 的提交状态、事件与 JobStore
+attempt 层汇合，不能伪装成同一协议。当前产品边界已经固定为 Hermes、Codex、Claude
 三选一，不支持同一 daemon 同时承载多个 execution backend；选择 Codex 后也只能固定一个
 model provider。
 
@@ -39,12 +38,12 @@ model provider。
 backend 和恰好一个获准 `node_id`。Hermes 模式额外对应一个专用 profile；Codex
 `private-api-key` 对应 daemon 私有 `CODEX_HOME`，Codex `native-current` 则只把当前
 HOME/CODEX_HOME 当 runtime 选择器，并把工具 workspace 放在 state directory 内；两种模式
-各自持有一个持久 thread。两种已实现 backend 不得在同一 daemon 中同时启用或共享会话；未来 Claude
-实现后也必须遵守同一三选一边界。
+各自持有一个持久 thread。Claude 的 `claude-stateless:<hash>` 仅为 JobStore anchor，每个 job
+使用 `--no-session-persistence`。三种 backend 不得在同一 daemon 中同时启用或共享会话。
 
 `security.allowedNodeIds` 的数组形式和 Hermes `LIVIS_ALLOWED_USERS` 的逗号列表形式只是
 配置格式，不代表一期支持多个设备；`allowAllNodes` 与 `LIVIS_ALLOW_ALL_USERS` 必须
-保持关闭。Codex 模式进一步在代码级要求 `allowAllNodes=false` 且 allowlist 恰好一个。
+保持关闭。Codex 与 Claude 模式进一步在代码级要求 `allowAllNodes=false` 且 allowlist 恰好一个。
 
 当前 backend session、单 session 执行锁、quarantine、job 和 outbox 的状态所有权都
 只在“唯一来源设备”前提下成立。稳定 session key 为 `livis:<agentId>`；Codex 的
@@ -54,8 +53,9 @@ immutable session hash 还绑定唯一获准 `node_id`，因此同一 state dire
 
 目标架构要求 Hermes、Codex 与 Claude 分别使用各自原生本地运行时的当前状态，daemon
 只持有 LiViS OAuth，不读取或复制后端 token。Codex `native-current` 已按该边界接入生产路由，
-当前证据等级为 `operator-only`；旧 `private-api-key` 仍是必须显式选择的兼容路径。Claude 仍只有
-中立调用契约。迁移计划与门禁见[本地多后端架构与认证边界](LOCAL-BACKENDS.md)。
+当前证据等级为 `operator-only`；旧 `private-api-key` 仍是必须显式选择的兼容路径。Claude
+纯文本生产接线与离线门禁已完成，同样保持 `operator-only`，等待真实 LiViS App canary。
+迁移计划与门禁见[本地多后端架构与认证边界](LOCAL-BACKENDS.md)。
 
 ## OAuth 凭据边界
 

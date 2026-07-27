@@ -56,12 +56,12 @@ describe("本地后端中立契约", () => {
     expect(LOCAL_BACKEND_IMPLEMENTATION_STATE).toEqual({
       hermes: "implemented",
       codex: "implemented-experimental",
-      claude: "contract-only",
+      claude: "implemented-experimental",
     });
     expect(LOCAL_BACKEND_AUTH_INTEGRATION).toEqual({
       hermes: "native-profile-owned",
       codex: "native-current-state-opaque",
-      claude: "not-implemented",
+      claude: "native-current-state-opaque",
     });
     expect(isLocalBackendKind("hermes")).toBeTrue();
     expect(isLocalBackendKind("codex")).toBeTrue();

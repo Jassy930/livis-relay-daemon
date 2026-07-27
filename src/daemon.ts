@@ -12,6 +12,7 @@ import type {
 import { HermesExecutionBackend } from "./backends/hermes-backend.ts";
 import { CodexExecutionBackend } from "./backends/codex/codex-execution-backend.ts";
 import { CodexNativeExecutionBackend } from "./backends/codex/native-execution-backend.ts";
+import { ClaudeNativeExecutionBackend } from "./backends/claude/native-execution-backend.ts";
 import type { RelayConfig } from "./config.ts";
 import { ConnectorServer, type ConnectorServerHandlers } from "./connector/server.ts";
 import { IdaasClient } from "./auth/idaas.ts";
@@ -85,18 +86,13 @@ export class RelayDaemon {
   static create(dependencies: RelayDaemonDependencies): RelayDaemon {
     const logger = dependencies.logger ?? new Logger("livis-relayd");
     const scopeKey = IdentityStore.scopeKey(dependencies.identity);
-    if (dependencies.config.execution.backend === "claude") {
-      throw new Error(
-        "Claude backend 尚未实现；execution.backend=claude 只用于固化三选一配置边界，serve 拒绝启动",
-      );
-    }
     if (
-      dependencies.config.execution.backend === "codex" &&
+      dependencies.config.execution.backend !== "hermes" &&
       (dependencies.config.security.allowAllNodes ||
         dependencies.config.security.allowedNodeIds.length !== 1)
     ) {
       throw new Error(
-        "Codex backend 只支持单设备：必须关闭 allowAllNodes 并配置唯一 allowedNodeId",
+        `${dependencies.config.execution.backend} backend 只支持单设备：必须关闭 allowAllNodes 并配置唯一 allowedNodeId`,
       );
     }
     if (
@@ -104,6 +100,12 @@ export class RelayDaemon {
       dependencies.config.codex.mode === null
     ) {
       throw new Error("Codex backend 必须显式选择 native-current 或 private-api-key 模式");
+    }
+    if (
+      dependencies.config.execution.backend === "claude" &&
+      dependencies.config.claude.mode !== "native-current"
+    ) {
+      throw new Error("Claude backend 必须显式选择 native-current 模式");
     }
     const store = new JobStore(join(dependencies.config.stateDir, "relay.db"), scopeKey, {
       legacyV4JobBackend: dependencies.config.execution.legacyV4JobBackend ?? undefined,
@@ -214,7 +216,23 @@ export class RelayDaemon {
             handlers: executionHandlers,
             logger: logger.child("codex"),
           })
-      : new HermesExecutionBackend(connector);
+      : dependencies.config.execution.backend === "claude"
+        ? new ClaudeNativeExecutionBackend({
+            stateDir: dependencies.config.stateDir,
+            scopeKey,
+            sessionKey,
+            remoteNodeId: dependencies.config.security.allowedNodeIds[0]!,
+            command: dependencies.config.claude.command,
+            requestTimeoutMs: dependencies.config.claude.requestTimeoutMs,
+            turnTimeoutMs: dependencies.config.claude.turnTimeoutMs,
+            shutdownTimeoutMs: dependencies.config.claude.shutdownTimeoutMs,
+            maxOutputChars: dependencies.config.security.maxOutputChars,
+            maxBudgetUsd: dependencies.config.claude.maxBudgetUsd,
+          }, {
+            store,
+            handlers: executionHandlers,
+          })
+        : new HermesExecutionBackend(connector);
 
     const relayHandlers: RelayClientHandlers = {
       onIncoming: (envelope) => daemon.onRelayIncoming(envelope),
@@ -257,6 +275,11 @@ export class RelayDaemon {
         "尚未确认通过 Codex 远程执行 LiViS 请求；请审阅安全边界后设置 codex.acknowledgeRemoteExecution=true",
       );
     }
+    if (this.executionBackend.kind === "claude" && !this.config.claude.acknowledgeRemoteExecution) {
+      throw new Error(
+        "尚未确认通过 Claude Code 远程执行 LiViS 请求；请审阅安全边界后设置 claude.acknowledgeRemoteExecution=true",
+      );
+    }
     const inactiveBacklog = this.store
       .listBackendBacklog()
       .filter((item) => item.backend !== this.executionBackend.kind);
@@ -269,8 +292,8 @@ export class RelayDaemon {
     }
     const recovery = this.store.recoverAfterRestart();
     this.logger.info("SQLite 恢复完成", recovery);
-    if (this.executionBackend.kind === "codex") {
-      // Codex 不接 Hermes WS，但仍用同一私有 UDS 提供 health/status 控制面。
+    if (this.executionBackend.kind !== "hermes") {
+      // 原生 backend 不接 Hermes WS，但仍用同一私有 UDS 提供 health/status 控制面。
       this.connector.start();
     }
     await this.executionBackend.start();
@@ -298,7 +321,7 @@ export class RelayDaemon {
     this.stopPromise = (async () => {
       const results = await Promise.allSettled([
         Promise.resolve().then(() => this.executionBackend.stop()),
-        ...(this.executionBackend.kind === "codex"
+        ...(this.executionBackend.kind !== "hermes"
           ? [Promise.resolve().then(() => this.connector.stop())]
           : []),
         Promise.resolve().then(() => this.relay.stop()),
@@ -435,7 +458,7 @@ export class RelayDaemon {
         return;
       }
       if (submission === "not_sent") {
-        if (this.executionBackend.kind === "codex") {
+        if (this.executionBackend.kind !== "hermes") {
           const cancelled = this.store.finishUnsentBackendCancellation(
             job.jobId,
             this.executionBackend.kind,
@@ -448,7 +471,7 @@ export class RelayDaemon {
           job,
           this.executionBackend.kind === "hermes"
             ? "cancel could not be delivered to connector"
-            : "cancel could not be delivered to Codex app-server",
+            : `cancel could not be delivered to ${this.executionBackend.kind} native backend`,
         );
       }
     }
@@ -468,8 +491,8 @@ export class RelayDaemon {
 
   private async onExecutionAccepted(event: ExecutionAcceptedEvent): Promise<void> {
     this.assertConfiguredBackend(event.kind);
-    if (event.kind === "codex") {
-      const { runGeneration, turnId } = this.requireCodexTurn(event);
+    if (event.kind !== "hermes") {
+      const { runGeneration, turnId } = this.requireDurableTurn(event);
       const job = this.store.markBackendRunning(
         event.jobId,
         event.kind,
@@ -478,7 +501,7 @@ export class RelayDaemon {
         turnId,
       );
       if (!job) {
-        throw new Error(`Codex accepted 使用了失效 attempt：${event.jobId}`);
+        throw new Error(`${event.kind} accepted 使用了失效 attempt：${event.jobId}`);
       }
       return;
     }
@@ -495,17 +518,18 @@ export class RelayDaemon {
         this.rejectHermesEvent(event.jobId, "output_too_large", "Hermes 输出超过 daemon 上限");
         return;
       }
-      const { runGeneration, turnId } = this.requireCodexTurn(event);
+      const { runGeneration, turnId } = this.requireDurableTurn(event);
+      const backendLabel = event.kind === "codex" ? "Codex" : "Claude";
       const failed = this.store.finishBackendFailure(
         event.jobId,
         event.kind,
         event.leaseId,
         runGeneration,
         turnId,
-        serializeResult("Codex 输出超过 daemon 上限，已拒绝返回。"),
-        "Codex output exceeded daemon maxOutputChars",
+        serializeResult(`${backendLabel} 输出超过 daemon 上限，已拒绝返回。`),
+        `${backendLabel} output exceeded daemon maxOutputChars`,
       );
-      if (!failed) throw new Error(`Codex 超限结果未能按当前 attempt 结算：${event.jobId}`);
+      if (!failed) throw new Error(`${backendLabel} 超限结果未能按当前 attempt 结算：${event.jobId}`);
       await this.relay.notifyOutboxPending();
       this.deferDispatchPending();
       return;
@@ -517,17 +541,17 @@ export class RelayDaemon {
         this.rejectHermesEvent(event.jobId, "stale_lease", "result 使用了失效 lease");
         return;
       }
-      throw new Error(`Codex result 使用了失效 lease：${event.jobId}`);
+      throw new Error(`${event.kind} result 使用了失效 lease：${event.jobId}`);
     }
     if (before.cancelRequested) {
       if (event.kind === "hermes") {
         this.rejectHermesEvent(event.jobId, "cancel_superseded", "cancel 已获胜，final result 被丢弃");
         return;
       }
-      throw new Error(`Codex result 到达时 cancel 已获胜：${event.jobId}`);
+      throw new Error(`${event.kind} result 到达时 cancel 已获胜：${event.jobId}`);
     }
-    if (event.kind === "codex") {
-      const { runGeneration, turnId } = this.requireCodexTurn(event);
+    if (event.kind !== "hermes") {
+      const { runGeneration, turnId } = this.requireDurableTurn(event);
       const job = this.store.finishBackendSuccess(
         event.jobId,
         event.kind,
@@ -536,7 +560,7 @@ export class RelayDaemon {
         turnId,
         resultJson,
       );
-      if (!job) throw new Error(`Codex result 未能按当前 attempt 结算：${event.jobId}`);
+      if (!job) throw new Error(`${event.kind} result 未能按当前 attempt 结算：${event.jobId}`);
       await this.relay.notifyOutboxPending();
       this.deferDispatchPending();
       return;
@@ -553,27 +577,32 @@ export class RelayDaemon {
 
   private async onExecutionFailed(event: ExecutionFailedEvent): Promise<void> {
     this.assertConfiguredBackend(event.kind);
+    if (event.kind === "claude" && event.sessionDisposition !== undefined) {
+      throw new Error("Claude native-current 不得分类或上报本地认证状态");
+    }
     const before = this.store.get(event.jobId);
     if (!before || before.leaseId !== event.leaseId) {
       if (event.kind === "hermes") {
         this.rejectHermesEvent(event.jobId, "stale_lease", "failed 使用了失效 lease");
         return;
       }
-      throw new Error(`Codex failed 使用了失效 lease：${event.jobId}`);
+      throw new Error(`${event.kind} failed 使用了失效 lease：${event.jobId}`);
     }
     if (before.cancelRequested) {
       if (event.kind === "hermes") {
         this.rejectHermesEvent(event.jobId, "cancel_superseded", "cancel 已获胜，failed 上报被丢弃");
         return;
       }
-      throw new Error(`Codex failed 到达时 cancel 已获胜：${event.jobId}`);
+      throw new Error(`${event.kind} failed 到达时 cancel 已获胜：${event.jobId}`);
     }
     const userMessage = event.kind === "hermes"
       ? "Hermes 暂时无法完成该请求，请稍后重试。"
-      : "Codex 暂时无法完成该请求，请稍后重试。";
-    if (event.kind === "codex") {
-      const { runGeneration, turnId } = this.requireCodexTurn(event);
-      const job = event.sessionDisposition === "credential_rejected"
+      : event.kind === "codex"
+        ? "Codex 暂时无法完成该请求，请稍后重试。"
+        : "Claude Code 暂时无法完成该请求，请稍后重试。";
+    if (event.kind !== "hermes") {
+      const { runGeneration, turnId } = this.requireDurableTurn(event);
+      const job = event.kind === "codex" && event.sessionDisposition === "credential_rejected"
         ? this.store.finishBackendCredentialFailure(
             event.jobId,
             event.kind,
@@ -593,7 +622,7 @@ export class RelayDaemon {
             serializeResult(userMessage),
             event.error,
           );
-      if (!job) throw new Error(`Codex failed 未能按当前 attempt 结算：${event.jobId}`);
+      if (!job) throw new Error(`${event.kind} failed 未能按当前 attempt 结算：${event.jobId}`);
       await this.relay.notifyOutboxPending();
       if (event.sessionDisposition !== "credential_rejected") {
         this.deferDispatchPending();
@@ -614,15 +643,16 @@ export class RelayDaemon {
     if (!before || before.leaseId !== event.leaseId) {
       return;
     }
-    if (event.kind === "codex") {
-      const runGeneration = this.requireCodexRunGeneration(event);
+    if (event.kind !== "hermes") {
+      const runGeneration = this.requireDurableRunGeneration(event);
+      const backendLabel = event.kind === "codex" ? "Codex" : "Claude Code";
       this.store.markBackendCancelUnknown(
         event.jobId,
         event.kind,
         event.leaseId,
         runGeneration,
         event.turnId ?? null,
-        "Codex turn/interrupt 已接受，但无法证明工具副作用已经停止",
+        `${backendLabel} cancel 已接受，但无法证明远端执行已经停止`,
       );
       return;
     }
@@ -638,7 +668,7 @@ export class RelayDaemon {
       affected = this.store.markBackendDisconnected(
         event.kind,
         event.executionId,
-        event.reason ?? "Codex app-server disconnected during active execution",
+        event.reason ?? `${event.kind} native backend disconnected during active execution`,
       );
     }
     if (affected > 0) {
@@ -678,7 +708,7 @@ export class RelayDaemon {
       const leaseId = crypto.randomUUID();
       const executionId = this.executionBackend.executionId;
       if (!executionId) break;
-      const claimed = this.executionBackend.kind === "codex"
+      const claimed = this.executionBackend.kind !== "hermes"
         ? this.store.claimForBackendDispatch(candidate.jobId, this.executionBackend.kind, executionId, leaseId)
         : this.store.claimForDispatch(candidate.jobId, executionId, leaseId);
       if (!claimed) continue;
@@ -697,7 +727,7 @@ export class RelayDaemon {
 
   private resetUnsentExecution(job: StoredJob): void {
     if (!job.leaseId) throw new Error(`待 reset 的 execution 缺少 lease：${job.jobId}`);
-    if (this.executionBackend.kind === "codex") {
+    if (this.executionBackend.kind !== "hermes") {
       const current = this.store.get(job.jobId);
       if (current?.status === "Cancelling") {
         const cancelled = this.store.finishUnsentBackendCancellation(
@@ -706,7 +736,7 @@ export class RelayDaemon {
           job.leaseId,
           job.runGeneration,
         );
-        if (!cancelled) throw new Error(`Codex 未发送 cancel attempt 无法安全结算：${job.jobId}`);
+        if (!cancelled) throw new Error(`${this.executionBackend.kind} 未发送 cancel attempt 无法安全结算：${job.jobId}`);
         return;
       }
       if (current?.status !== "Dispatching") {
@@ -719,7 +749,7 @@ export class RelayDaemon {
         job.leaseId,
         job.runGeneration,
       );
-      if (!reset) throw new Error(`Codex 未发送 attempt 无法安全 reset：${job.jobId}`);
+      if (!reset) throw new Error(`${this.executionBackend.kind} 未发送 attempt 无法安全 reset：${job.jobId}`);
       return;
     }
     this.store.resetUnsentDispatch(job.jobId, job.leaseId);
@@ -731,24 +761,24 @@ export class RelayDaemon {
     }
   }
 
-  private requireCodexRunGeneration(event: {
+  private requireDurableRunGeneration(event: {
     jobId: string;
     runGeneration?: number;
   }): number {
     if (!Number.isSafeInteger(event.runGeneration) || (event.runGeneration ?? 0) < 1) {
-      throw new Error(`Codex 事件缺少有效 runGeneration：${event.jobId}`);
+      throw new Error(`持久 backend 事件缺少有效 runGeneration：${event.jobId}`);
     }
     return event.runGeneration!;
   }
 
-  private requireCodexTurn(event: {
+  private requireDurableTurn(event: {
     jobId: string;
     runGeneration?: number;
     turnId?: string | null;
   }): { runGeneration: number; turnId: string } {
-    const runGeneration = this.requireCodexRunGeneration(event);
+    const runGeneration = this.requireDurableRunGeneration(event);
     if (typeof event.turnId !== "string" || event.turnId.length === 0) {
-      throw new Error(`Codex 事件缺少有效 turnId：${event.jobId}`);
+      throw new Error(`持久 backend 事件缺少有效 turnId：${event.jobId}`);
     }
     return { runGeneration, turnId: event.turnId };
   }

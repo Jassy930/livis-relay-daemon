@@ -72,6 +72,15 @@ export function testConfig(stateDir: string): RelayConfig {
       shutdownTimeoutMs: 5_000,
       acknowledgeRemoteExecution: false,
     },
+    claude: {
+      mode: null,
+      command: "claude",
+      requestTimeoutMs: 30_000,
+      turnTimeoutMs: 900_000,
+      shutdownTimeoutMs: 5_000,
+      maxBudgetUsd: 0.05,
+      acknowledgeRemoteExecution: false,
+    },
   };
 }
 

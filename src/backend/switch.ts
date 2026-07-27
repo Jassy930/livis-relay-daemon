@@ -2,6 +2,10 @@ import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
 import { isAbsolute, join, resolve } from "node:path";
 import {
+  DEFAULT_CLAUDE_MAX_BUDGET_USD,
+  DEFAULT_CLAUDE_REQUEST_TIMEOUT_MS,
+  DEFAULT_CLAUDE_SHUTDOWN_TIMEOUT_MS,
+  DEFAULT_CLAUDE_TURN_TIMEOUT_MS,
   DEFAULT_CODEX_REQUEST_TIMEOUT_MS,
   DEFAULT_CODEX_SHUTDOWN_TIMEOUT_MS,
   DEFAULT_CODEX_TURN_TIMEOUT_MS,
@@ -22,7 +26,7 @@ import {
   sha256,
 } from "../util.ts";
 
-export type SwitchableBackend = "hermes" | "codex";
+export type SwitchableBackend = "hermes" | "codex" | "claude";
 
 interface BacklogRow {
   backend: string;
@@ -33,6 +37,7 @@ interface DatabaseInspection {
   schemaVersion: number | null;
   backlog: BacklogRow[];
   accountBoundCodexSessions: number;
+  incompatibleClaudeSessions: number;
   quarantinedSessions: number;
 }
 
@@ -41,6 +46,8 @@ export interface BackendSwitchOptions {
   targetBackend: SwitchableBackend;
   codexMode?: "native-current";
   codexCommand?: string;
+  claudeMode?: "native-current";
+  claudeCommand?: string;
   apply: boolean;
   acknowledgeDaemonStopped: boolean;
   acknowledgeRemoteExecution: boolean;
@@ -53,6 +60,7 @@ export interface BackendSwitchResult {
   previousBackend: "hermes" | "codex" | "claude";
   targetBackend: SwitchableBackend;
   codexMode: "native-current" | null;
+  claudeMode: "native-current" | null;
   configPath: string;
   previousConfigSha256: string;
   configSha256: string;
@@ -77,6 +85,7 @@ async function inspectDatabase(stateDir: string): Promise<DatabaseInspection> {
       schemaVersion: null,
       backlog: [],
       accountBoundCodexSessions: 0,
+      incompatibleClaudeSessions: 0,
       quarantinedSessions: 0,
     };
   }
@@ -108,12 +117,25 @@ async function inspectDatabase(stateDir: string): Promise<DatabaseInspection> {
     const quarantine = database.query<{ count: number }, []>(`
       SELECT COUNT(*) AS count FROM session_quarantine
     `).get();
+    const incompatibleClaude = database.query<{ count: number }, []>(`
+      SELECT COUNT(*) AS count
+      FROM backend_sessions
+      WHERE backend='claude' AND (
+        COALESCE(state_ownership,'')<>'local-state-opaque'
+        OR thread_id IS NULL
+        OR thread_id NOT LIKE 'claude-stateless:%'
+      )
+    `).get();
     return {
       schemaVersion,
       backlog,
       accountBoundCodexSessions: nonNegativeInteger(
         accountBound?.count,
         "account-bound Codex session count",
+      ),
+      incompatibleClaudeSessions: nonNegativeInteger(
+        incompatibleClaude?.count,
+        "incompatible Claude session count",
       ),
       quarantinedSessions: nonNegativeInteger(
         quarantine?.count,
@@ -158,6 +180,22 @@ function buildTargetConfig(
       // dry-run 与 apply 必须生成同一目标配置；flag 只授权写操作，不改变计划内容。
       acknowledgeRemoteExecution: true,
     };
+  } else if (options.targetBackend === "claude") {
+    if (options.claudeMode !== "native-current") {
+      throw new Error("CLI backend switch 只允许显式 claude --mode native-current");
+    }
+    if (!options.claudeCommand || !isAbsolute(options.claudeCommand)) {
+      throw new Error("切换到 Claude native-current 必须传入 --command 绝对路径");
+    }
+    root.claude = {
+      mode: "native-current",
+      command: options.claudeCommand,
+      requestTimeoutMs: DEFAULT_CLAUDE_REQUEST_TIMEOUT_MS,
+      turnTimeoutMs: DEFAULT_CLAUDE_TURN_TIMEOUT_MS,
+      shutdownTimeoutMs: DEFAULT_CLAUDE_SHUTDOWN_TIMEOUT_MS,
+      maxBudgetUsd: DEFAULT_CLAUDE_MAX_BUDGET_USD,
+      acknowledgeRemoteExecution: true,
+    };
   }
   const text = `${JSON.stringify(root, null, 2)}\n`;
   parseRelayConfig(text, configPath);
@@ -186,6 +224,7 @@ async function buildResult(
     previousBackend: loaded.config.execution.backend,
     targetBackend: options.targetBackend,
     codexMode: options.targetBackend === "codex" ? "native-current" : null,
+    claudeMode: options.targetBackend === "claude" ? "native-current" : null,
     configPath: loaded.path,
     previousConfigSha256: sha256(sourceText),
     configSha256: sha256(targetText),
@@ -213,6 +252,9 @@ function assertSwitchableDatabase(
       "当前 stateDir 含 private-api-key/account-bound Codex session；禁止原地改为 native-current",
     );
   }
+  if (targetBackend === "claude" && database.incompatibleClaudeSessions > 0) {
+    throw new Error("当前 stateDir 含不兼容 Claude session anchor；禁止原地切换");
+  }
   if (database.quarantinedSessions > 0) {
     throw new Error("当前 stateDir 含 quarantined session；必须先保留证据并人工处置");
   }
@@ -228,8 +270,8 @@ export async function switchBackend(options: BackendSwitchOptions): Promise<Back
   if (!options.acknowledgeDaemonStopped) {
     throw new Error("backend switch 写操作必须传入 --acknowledge-daemon-stopped");
   }
-  if (options.targetBackend === "codex" && !options.acknowledgeRemoteExecution) {
-    throw new Error("切换到 Codex 必须传入 --acknowledge-remote-execution");
+  if (options.targetBackend !== "hermes" && !options.acknowledgeRemoteExecution) {
+    throw new Error(`切换到 ${options.targetBackend} 必须传入 --acknowledge-remote-execution`);
   }
 
   const profileGuard = await ProfileOperationGuard.acquire(initial.config.stateDir, "backend-switch");
@@ -278,6 +320,7 @@ export async function switchBackend(options: BackendSwitchOptions): Promise<Back
       previousBackend: current.config.execution.backend,
       targetBackend: options.targetBackend,
       codexMode: options.targetBackend === "codex" ? "native-current" : null,
+      claudeMode: options.targetBackend === "claude" ? "native-current" : null,
       previousConfigSha256: sha256(currentText),
       targetConfigSha256: sha256(targetText),
       backupConfigPath,
@@ -303,7 +346,8 @@ export async function switchBackend(options: BackendSwitchOptions): Promise<Back
       const committed = await loadRelayConfig(current.path);
       if (
         committed.config.execution.backend !== options.targetBackend ||
-        (options.targetBackend === "codex" && committed.config.codex.mode !== "native-current")
+        (options.targetBackend === "codex" && committed.config.codex.mode !== "native-current") ||
+        (options.targetBackend === "claude" && committed.config.claude.mode !== "native-current")
       ) {
         throw new Error("backend switch 配置提交后语义读回不一致");
       }
@@ -341,6 +385,7 @@ export async function switchBackend(options: BackendSwitchOptions): Promise<Back
       previousBackend: current.config.execution.backend,
       targetBackend: options.targetBackend,
       codexMode: options.targetBackend === "codex" ? "native-current" : null,
+      claudeMode: options.targetBackend === "claude" ? "native-current" : null,
       configPath: current.path,
       previousConfigSha256: sha256(currentText),
       configSha256: sha256(targetText),

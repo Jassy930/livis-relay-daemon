@@ -4,7 +4,8 @@ import type { ExecutionBackendKind, StoredJob } from "../types.ts";
  * daemon 当前选择的本地执行后端。
  *
  * `hermes` 仍通过 connector v1 接入；`codex` 使用 daemon 持有的
- * app-server 子进程。这个类型不代表两种后端共享传输协议。
+ * app-server 子进程；`claude` 使用每 job 独立 CLI 子进程。这个类型不代表
+ * 三种后端共享传输协议。
  */
 export type { ExecutionBackendKind } from "../types.ts";
 
@@ -26,23 +27,23 @@ export interface ExecutionJobEvent {
   executionId: string;
   jobId: string;
   leaseId: string;
-  /** Codex attempt 的持久化 fencing 字段；Hermes connector v1 不携带。 */
+  /** Codex/Claude attempt 的持久化 fencing 字段；Hermes connector v1 不携带。 */
   runGeneration?: number;
 }
 
 export interface ExecutionAcceptedEvent extends ExecutionJobEvent {
-  /** Codex turn/start 返回值；Hermes connector v1 不携带。 */
+  /** Codex turn/start 或 Claude system/init 返回值；Hermes connector v1 不携带。 */
   turnId?: string;
 }
 
 export interface ExecutionResultEvent extends ExecutionJobEvent {
-  /** Codex terminal notification 对应的 turn；Hermes connector v1 不携带。 */
+  /** 持久 backend terminal 对应的 operation；Hermes connector v1 不携带。 */
   turnId?: string;
   text: string;
 }
 
 export interface ExecutionFailedEvent extends ExecutionJobEvent {
-  /** Codex terminal notification 对应的 turn；Hermes connector v1 不携带。 */
+  /** 持久 backend terminal 对应的 operation；Hermes connector v1 不携带。 */
   turnId?: string;
   error: string;
   retryable?: boolean;

@@ -687,11 +687,58 @@ bun run src/index.ts backend switch hermes \
 
 `doctor --online` 通过后按 Relay → 专用 Hermes Gateway 顺序启动。
 
+### 6.4 使用本机当前 Claude Code runtime
+
+Claude 首版只开放无工具、无持久会话的单任务纯文本路径。Relay 不执行 Claude 登录、账号查询或
+状态修复；本机当前状态正确或错误都直接交给 Claude Code。先运行不发送模型 turn 的能力探针：
+
+```bash
+command -v claude
+bun run src/index.ts claude probe-native-cli \
+  --command /绝对路径/claude \
+  --state-dir /绝对路径/已有私有状态目录
+```
+
+版本只用于观测；实际门禁是必需安全参数和运行期 `stream-json` 事件。切换前读回当前 `status`，
+确认全 backend 零非终态 backlog、零 quarantine，完整备份 config、SQLite 与 WAL/SHM。先做零写入计划：
+
+```bash
+bun run src/index.ts backend switch claude \
+  --mode native-current \
+  --command /绝对路径/claude \
+  --config /绝对路径/config.json
+```
+
+保持当前健康 backend 运行，直到计划、备份和停服窗口都准备完成。停掉当前 Relay 及其 backend
+常驻依赖后执行：
+
+```bash
+bun run src/index.ts backend switch claude \
+  --mode native-current \
+  --command /绝对路径/claude \
+  --apply \
+  --acknowledge-daemon-stopped \
+  --acknowledge-remote-execution \
+  --config /绝对路径/config.json
+```
+
+要求 dry-run/apply `configSha256` 一致，PREPARED 收据包含
+`credentialsReadOrMigrated=false`。配置提交后在 daemon 仍停止时运行 `doctor --online`；通过后只
+启动 `livis-relayd`，不启动 Hermes Gateway，也不触碰 Codex Desktop daemon。`status` 应显示
+`execution.kind=claude`、`mode=native-current`、`transport=cli-stream-json`、
+`stateOwnership=local-state-opaque`、`sessionPersistence=false` 和
+`credentialStateInspected=false`，同时 backlog/quarantine 为空。
+
+服务 ready 只证明连接态。随后由操作者从 LiViS App 发送唯一文本 canary，并核对同一 job 的
+`Succeeded`、outbox `Delivered`、远端 ACK 和 App 唯一回显；完成前不得把 Claude 能力写成真实
+链路已验证。错误态不登录、不修改本机 Claude 状态、不 fallback。完整边界见
+[Claude Code 原生当前状态后端](CLAUDE-NATIVE.md)。
+
 ## 7. 启动顺序
 
-Hermes 模式：先启动 `livis-relayd`，再启动专用 Hermes Gateway。Codex 模式只启动
-`livis-relayd`；daemon 会自行创建/恢复 thread 并管理 app-server 子进程，不得另行
-常驻启动第二个 app-server。
+Hermes 模式：先启动 `livis-relayd`，再启动专用 Hermes Gateway。Codex 与 Claude 模式只启动
+`livis-relayd`；daemon 会自行管理 app-server 或每 job Claude CLI 子进程，不得另行常驻启动
+第二套执行 transport。
 
 ```bash
 bun run src/index.ts serve
@@ -1608,7 +1655,7 @@ Codex 账号/模型/安全摘要和 thread-tail checkpoint；v7 以 trigger 强�
 6. 若准备切换 backend，先继续使用原 backend，直到它不再有
    `Received/Acked/Dispatching/Running/Cancelling` job，再按第 6.3 节停服并使用
    `backend switch`；不要手工覆盖 config。CLI 会跨全部 scope 重查 backlog，并对
-   `native-current` 额外拒绝 account-bound Codex session 与 quarantine。提交后用目标 backend
+   `native-current` 额外拒绝 account-bound Codex session、不兼容 Claude anchor 与 quarantine。提交后用目标 backend
    运行 `doctor`，确认 `execution_backend_backlog` 通过后才允许 `serve`。`serve` 会在启动
    execution backend 或 Relay 前重复 backlog 门禁，不能靠直接编辑 SQLite 或填写
    `legacyV4JobBackend` 绕过。
@@ -1617,7 +1664,8 @@ Codex 账号/模型/安全摘要和 thread-tail checkpoint；v7 以 trigger 强�
 `CancelUnknown` 历史不会阻止切换；它们的账本和 job 归属仍保留，尚未 `Delivered` 的
 outbox 则由独立 Relay 投递状态机继续处理，不会交给新 provider 重跑。
 
-当前 `backend switch` CLI 只支持已实现的 `hermes | codex`，`claude` 继续失败关闭。Codex
+当前 `backend switch` CLI 支持 `hermes | codex | claude`。Claude 只支持显式
+`native-current` 无状态纯文本路径；Codex
 `private-api-key` 内部的 OpenAI/custom model provider 不受 `execution_backend_backlog` 完整保护：job 行当前只保存
 `target_backend=codex`。因此不得在同一 `stateDir` 修改 `codex.provider`，也不得用
 `session release`、清空 backlog 或 `legacyV4JobBackend` 绕过；provider/key 变更必须按

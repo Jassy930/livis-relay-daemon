@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   CODEX_MAXIMUM_EXCLUSIVE_VERSION,
   CODEX_MINIMUM_VERSION,
+  DEFAULT_CLAUDE_REQUEST_TIMEOUT_MS,
   DEFAULT_CODEX_REQUEST_TIMEOUT_MS,
   DEFAULT_CODEX_SHUTDOWN_TIMEOUT_MS,
   loadRelayConfig,
@@ -26,6 +27,10 @@ import {
   pinCodexCommand,
   pinCodexCommandForStateDir,
 } from "./backends/codex/runtime-layout.ts";
+import {
+  ClaudeNativeCliError,
+  prepareClaudeNativeCli,
+} from "./backends/claude/native-cli.ts";
 import { validateCapabilityManifest } from "./capabilities.ts";
 import { IdaasClient } from "./auth/idaas.ts";
 import { IdentityStore } from "./identity.ts";
@@ -266,11 +271,6 @@ async function commandServe(args: string[]): Promise<void> {
   const { context, guard } = await loadProfileOperationContext(args, "serve-start");
   let daemon: RelayDaemon | null = null;
   try {
-    if (context.config.execution.backend === "claude") {
-      throw new Error(
-        "Claude backend 尚未实现；execution.backend=claude 时 serve 失败关闭，不会退回 Hermes 或 Codex",
-      );
-    }
     const upstreamProof = await refreshOrRequireSupportedProof(context, guard);
     daemon = RelayDaemon.create({
       config: context.config,
@@ -487,10 +487,8 @@ async function commandDoctor(args: string[]): Promise<void> {
     checks.push({ name: "profile", ok: true, detail: context.profile.id });
     checks.push({
       name: "execution_backend",
-      ok: context.config.execution.backend !== "claude",
-      detail: context.config.execution.backend === "claude"
-        ? "claude（尚未实现；serve 将失败关闭，不会回退到其他 backend）"
-        : context.config.execution.backend,
+      ok: true,
+      detail: context.config.execution.backend,
     });
     checks.push({
       name: "protocol_acknowledgement",
@@ -504,19 +502,49 @@ async function commandDoctor(args: string[]): Promise<void> {
         detail: String(context.config.codex.acknowledgeRemoteExecution),
       });
     }
+    if (context.config.execution.backend === "claude") {
+      checks.push({
+        name: "claude_remote_execution_acknowledgement",
+        ok: context.config.claude.acknowledgeRemoteExecution,
+        detail: String(context.config.claude.acknowledgeRemoteExecution),
+      });
+    }
   } catch (error) {
     checks.push({ name: "config", ok: false, detail: errorMessage(error) });
     process.stdout.write(`${JSON.stringify({ ok: false, checks }, null, 2)}\n`);
     process.exitCode = 1;
     return;
   }
-  if (context.config.execution.backend === "claude") {
-    process.stdout.write(`${JSON.stringify({ ok: false, checks }, null, 2)}\n`);
-    process.exitCode = 1;
-    return;
-  }
   const backendKind = context.config.execution.backend;
-  if (backendKind === "codex" && context.config.codex.mode === "native-current") {
+  if (backendKind === "claude") {
+    try {
+      const canonicalStateDir = await realpath(context.config.stateDir);
+      const preparation = await prepareClaudeNativeCli({
+        command: context.config.claude.command,
+        stateDir: canonicalStateDir,
+        runtimeTmpDir: canonicalStateDir,
+        cwd: PROJECT_ROOT,
+        requestTimeoutMs: context.config.claude.requestTimeoutMs,
+      });
+      checks.push({
+        name: "claude_native_cli",
+        ok: preparation.report.ok,
+        detail: JSON.stringify(preparation.report),
+      });
+    } catch (error) {
+      checks.push({
+        name: "claude_native_cli",
+        ok: false,
+        detail: JSON.stringify({
+          compatibilityBasis: "capability-probe",
+          reasonCode: error instanceof ClaudeNativeCliError ? error.code : "native_probe_preflight_failed",
+          error: errorMessage(error),
+          sentModelTurn: false,
+          credentialStateInspected: false,
+        }),
+      });
+    }
+  } else if (backendKind === "codex" && context.config.codex.mode === "native-current") {
     try {
       const canonicalStateDir = await realpath(context.config.stateDir);
       const command = await pinCodexCommandForStateDir(
@@ -827,10 +855,53 @@ async function commandCodexProbeNativeAppServer(args: string[]): Promise<void> {
   if (!ok) process.exitCode = 1;
 }
 
+async function commandClaudeProbeNativeCli(args: string[]): Promise<void> {
+  const explicitConfigPath = optionValue(args, "--config");
+  const configPath = explicitConfigPath ?? process.env.LIVIS_RELAY_CONFIG ?? DEFAULT_CONFIG_PATH;
+  const explicitCommand = optionValue(args, "--command");
+  const explicitStateDir = optionValue(args, "--state-dir");
+  if ((explicitCommand === undefined) !== (explicitStateDir === undefined)) {
+    throw new Error("Claude probe 显式模式必须同时传入 --command 与 --state-dir");
+  }
+  if (explicitConfigPath !== undefined && explicitCommand !== undefined) {
+    throw new Error("Claude probe 的 --config 不能与 --command/--state-dir 同时提供");
+  }
+  if (explicitCommand !== undefined && !isAbsolute(expandHome(explicitCommand))) {
+    throw new Error("Claude probe --command 必须是绝对路径");
+  }
+  if (explicitStateDir !== undefined && !isAbsolute(expandHome(explicitStateDir))) {
+    throw new Error("Claude probe --state-dir 必须是绝对路径");
+  }
+  const loaded = explicitCommand === undefined ? await loadRelayConfig(configPath) : null;
+  const stateDir = await realpath(expandHome(explicitStateDir ?? loaded!.config.stateDir));
+  try {
+    const preparation = await prepareClaudeNativeCli({
+      command: expandHome(explicitCommand ?? loaded!.config.claude.command),
+      stateDir,
+      runtimeTmpDir: stateDir,
+      cwd: PROJECT_ROOT,
+      requestTimeoutMs: loaded?.config.claude.requestTimeoutMs ?? DEFAULT_CLAUDE_REQUEST_TIMEOUT_MS,
+    });
+    process.stdout.write(`${JSON.stringify(preparation.report, null, 2)}\n`);
+  } catch (error) {
+    process.stdout.write(`${JSON.stringify({
+      ok: false,
+      readiness: "incompatible",
+      transport: "cli-stream-json",
+      compatibilityBasis: "capability-probe",
+      reasonCode: error instanceof ClaudeNativeCliError ? error.code : "native_probe_preflight_failed",
+      detail: errorMessage(error),
+      sentModelTurn: false,
+      credentialStateInspected: false,
+    }, null, 2)}\n`);
+    process.exitCode = 1;
+  }
+}
+
 async function commandBackendSwitch(args: string[]): Promise<void> {
   const target = args[2];
-  if (target !== "hermes" && target !== "codex") {
-    throw new Error("backend switch 只支持 hermes 或 codex；Claude 尚未实现");
+  if (target !== "hermes" && target !== "codex" && target !== "claude") {
+    throw new Error("backend switch 只支持 hermes、codex 或 claude");
   }
   const valueOptions = new Set(["--config", "--mode", "--command"]);
   const flags = new Set([
@@ -858,15 +929,15 @@ async function commandBackendSwitch(args: string[]): Promise<void> {
 
   const mode = optionValue(args, "--mode");
   const command = optionValue(args, "--command");
-  if (target === "codex") {
+  if (target === "codex" || target === "claude") {
     if (mode !== "native-current") {
-      throw new Error("切换到 Codex 必须显式传入 --mode native-current");
+      throw new Error(`切换到 ${target} 必须显式传入 --mode native-current`);
     }
     if (!command) {
-      throw new Error("切换到 Codex native-current 必须传入 --command 绝对路径");
+      throw new Error(`切换到 ${target} native-current 必须传入 --command 绝对路径`);
     }
     if (!isAbsolute(command)) {
-      throw new Error("切换到 Codex native-current 必须传入 --command 绝对路径");
+      throw new Error(`切换到 ${target} native-current 必须传入 --command 绝对路径`);
     }
   } else if (
     mode !== undefined || command !== undefined ||
@@ -881,7 +952,9 @@ async function commandBackendSwitch(args: string[]): Promise<void> {
       DEFAULT_CONFIG_PATH,
     targetBackend: target as SwitchableBackend,
     codexMode: target === "codex" ? "native-current" : undefined,
-    codexCommand: command === undefined ? undefined : expandHome(command),
+    codexCommand: target === "codex" && command !== undefined ? expandHome(command) : undefined,
+    claudeMode: target === "claude" ? "native-current" : undefined,
+    claudeCommand: target === "claude" && command !== undefined ? expandHome(command) : undefined,
     apply: hasFlag(args, "--apply"),
     acknowledgeDaemonStopped: hasFlag(args, "--acknowledge-daemon-stopped"),
     acknowledgeRemoteExecution: hasFlag(args, "--acknowledge-remote-execution"),
@@ -901,6 +974,7 @@ function printHelp(): void {
   process.stdout.write("  doctor [--online] [--config PATH]\n");
   process.stdout.write("  backend switch hermes [--apply --acknowledge-daemon-stopped] [--config PATH]\n");
   process.stdout.write("  backend switch codex --mode native-current --command PATH [--apply --acknowledge-daemon-stopped --acknowledge-remote-execution] [--config PATH]\n");
+  process.stdout.write("  backend switch claude --mode native-current --command PATH [--apply --acknowledge-daemon-stopped --acknowledge-remote-execution] [--config PATH]\n");
   process.stdout.write("  upstream check [--config PATH]\n");
   process.stdout.write("  upstream activate --profile PATH --acknowledge-reviewed-profile [--config PATH]\n");
   process.stdout.write("  upstream rollback --backup PATH --acknowledge-rollback [--config PATH]\n");
@@ -913,6 +987,9 @@ function printHelp(): void {
   process.stdout.write(
     "  codex probe-native-app-server " +
       "[--config PATH | --command PATH --state-dir PATH]\n",
+  );
+  process.stdout.write(
+    "  claude probe-native-cli [--config PATH | --command PATH --state-dir PATH]\n",
   );
 }
 
@@ -973,6 +1050,10 @@ async function main(): Promise<void> {
           "只支持 codex smoke-app-server / codex probe-native-app-server",
         );
       }
+      break;
+    case "claude":
+      if (subcommand === "probe-native-cli") await commandClaudeProbeNativeCli(args);
+      else throw new Error("只支持 claude probe-native-cli");
       break;
     case "version":
     case "--version":

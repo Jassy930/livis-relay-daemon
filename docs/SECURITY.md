@@ -18,10 +18,9 @@
 
 - `allowAllNodes=false`；进入 `serve` 或实网 canary 前，`security.allowedNodeIds` 必须恰好包含一个获准 `node_id`。
 - `execution.backend` 缺省为 `hermes`，显式值只能是 `hermes | codex | claude`，且
-  一套 daemon 同时只启用一个。`claude` 尚未实现，`doctor` 与 `serve` 均失败关闭，
-  不会静默回退。切换为 `codex` 时，代码会拒绝
+  一套 daemon 同时只启用一个，失败不会静默回退。切换为 `codex` 或 `claude` 时，代码会拒绝
   `allowAllNodes=true` 或不等于一个元素的 `allowedNodeIds`，并且还必须显式设置
-  `codex.mode=native-current | private-api-key` 与 `codex.acknowledgeRemoteExecution=true`。
+  对应 mode 与 `acknowledgeRemoteExecution=true`。
   缺少 mode 或任一模式失败都不会静默回退到另一模式。
 - `LIVIS_ALLOW_ALL_USERS` 必须为空/false；`LIVIS_ALLOWED_USERS` 必须只包含与 daemon 完全相同的唯一 `node_id`，`*` 和多个值都不属于一期受支持配置。
 - `LIVIS_PHASE1_READ_ONLY_ACK=true` 只在专用 Hermes profile 已关闭写工具后设置。
@@ -32,7 +31,13 @@
 - `codex.mode=native-current` 只把本机 HOME/CODEX_HOME 当作 Codex runtime 选择器，Relay
   不打开其账号文件、不调用账号接口、不分类认证错误，也不把状态复制进 state directory。
   CLI/app-server 版本只观测为有界 semver，兼容性由真实 initialize 与 thread policy 回读裁决；
-  本地错误按普通 failed 结算。该模式不接受 `provider`、`model` 或 `toolchainReadRoots` 配置。
+  权威 terminal error 按普通 failed 结算，缺少完整 terminal 仍按 ambiguous execution 隔离。该模式
+  不接受 `provider`、`model` 或 `toolchainReadRoots` 配置。
+- `claude.mode=native-current` 从空环境按白名单构造 HOME、PATH、TMPDIR 和 locale/terminal，
+  不整体继承 daemon 环境。版本只作观察；必需 CLI 参数和 `system/init` 回读共同裁决兼容性。
+  执行固定 safe-mode、空 tools/MCP/skills/slash commands、`dontAsk` 与无 session persistence；
+  若 init 暴露 plugins/agents 也必须为空，后续 stream 中的实际 tool/hook/user 回注事件会再次
+  失败关闭。本地错误不分类账号状态，断连和收口不确定进入 quarantine。
 - `codex.mode=private-api-key` 的 CLI 审核范围固定为 `[0.145.0, 0.146.0)`；必须使用 daemon
   state directory 内通过标准输入单独写入 API key 的 `CODEX_HOME`，不得复用 `~/.codex`。
   该模式只接受 `account.type=apiKey`；OAuth/ChatGPT、Bedrock、空账号和未知类型都必须在
@@ -63,8 +68,8 @@
   provider、安全配置和 feature snapshot SHA-256，以及单调 thread-tail checkpoint；
   旧 v5 session 仅在没有 active/recovery/quarantine 时允许一次性安全补绑。v8 新增
   `account-bound | local-state-opaque` 状态所有权；本地状态不透明行的账号字段必须为 `NULL`。
-- v8 的 `execution_attempt_events` 永久记录 job/backend/session/lease/execution、Codex
-  thread/turn、runtime/model/account/安全摘要与 attempt 事件；UPDATE 和 DELETE 都由
+- v8 的 `execution_attempt_events` 永久记录 job/backend/session/lease/execution、持久 backend
+  session/operation、runtime/model/account/安全摘要与 attempt 事件；UPDATE 和 DELETE 都由
   SQLite trigger 拒绝。`backend_sessions` 仍是可变的当前 session/recovery anchor，只有
   账本用于 terminal 或人工 release 后的历史追溯，`jobs/outbox` 仍负责状态裁决。
 - append-only 是当前 SQLite schema 内的防误改约束，不是密码学签名或外部 WORM。拥有
@@ -221,11 +226,13 @@ state，也不得把本次结果表述为凭据已撤销。
 ## 原生本地状态不透明边界
 
 - LiViS OAuth 始终只属于 daemon；目标本地 adapter 不携带 token、cookie、scope、账号详情、认证环境变量或原生 session 文件。
-- daemon 不读取或判断本地账号状态。只要 transport 可用就调用；本地 backend 错误按普通 failed 结算，不静默切换后端。
+- daemon 不读取或判断本地账号状态。只要 transport 可用就调用；权威 terminal error 按普通
+  failed 结算，缺少完整 terminal 则按提交可证明性隔离，且都不静默切换后端。
 - Codex `native-current` 已按本地状态不透明边界接入 `serve`，当前仅为 `operator-only`；旧
   `private-api-key` 仍使用 daemon 私有 `CODEX_HOME` 与专用 API key，必须显式选择且不会 fallback。
-- 停服 `backend switch` 已有守卫与原子配置提交；Claude 以及同一 daemon 在线按请求切换 backend
-  仍必须先完成独立 adapter、并发所有权和实网 canary，不能仅凭中立类型契约宣称完成。
+- Claude `native-current` 的无状态纯文本 adapter、环境白名单、进程组、JobStore attempt 和停服
+  `backend switch` 已接入，当前同为 `operator-only`；真实 LiViS canary 尚未完成。
+- 同一 daemon 在线按请求切换 backend 仍未实现，不能用三个 adapter 的离线通过替代该能力。
 
 详细设计和分阶段验证见[本地多后端架构与状态边界](LOCAL-BACKENDS.md)。
 

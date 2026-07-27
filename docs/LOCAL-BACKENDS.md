@@ -2,10 +2,11 @@
 
 本文定义 `livis-relayd` 调用本机 Hermes、Codex 和 Claude 的当前基线与目标架构。Hermes
 connector 已实现；Codex 现在有显式 `native-current` 与 `private-api-key` 两条互斥路径，前者只调用
-操作者当前本地 runtime，后者保留 daemon 私有 `CODEX_HOME` 兼容实现。Claude 才是
-`contract-only`。原生 adapter 不复用或处理
-“认证信息”，而是把本地 backend 的当前状态视为完全不透明：能连接就调用，执行错误就按普通
-backend failed 处理。
+操作者当前本地 runtime，后者保留 daemon 私有 `CODEX_HOME` 兼容实现。Claude 已实现首版
+`native-current` 无状态纯文本路径。原生 adapter 不复用或处理
+“认证信息”，而是把本地 backend 的当前状态视为完全不透明：不做账号预检，能启动 transport
+就直接调用；具备完整 terminal 证据的执行错误按普通 backend failed 处理，提交后缺少完整 terminal
+证据则只按 ambiguous execution 隔离，不能猜测错误是否与账号有关。
 
 ## 1. 目标与非目标
 
@@ -15,7 +16,9 @@ backend failed 处理。
 - Codex 由 `codex app-server` 或后续审核通过的等价本地接口按本地当前状态执行。
 - Claude 由 Claude Code 的稳定非交互接口或官方 SDK 按本地当前状态执行。
 - 切换后端只改变路由，不触发登录、注销、token 导入或凭据迁移。
-- 本地未登录、账号切换或 provider 错误不构成 daemon readiness 门禁；调用失败只结算当前 job。
+- 本地未登录、账号切换或 provider 错误不构成 daemon readiness 门禁；daemon 仍直接调用。只有
+  runtime 给出完整 terminal failure 时才结算普通 Failed；若 spawn 后在安全 init/terminal 前退出，
+  仍按提交状态不明进入 Interrupted/quarantine，而不分类成本地认证问题。
 
 非目标：
 
@@ -31,7 +34,7 @@ backend failed 处理。
 | Hermes | daemon → UDS connector → 专用 Hermes Gateway | Hermes 专用 profile | 已实现；远程输入门禁与 canary 已落地 |
 | Codex `native-current` | daemon → 自有 stdio JSON-RPC → `codex app-server` | Codex 当前本地 runtime；对 daemon 不透明 | `operator-only`；已接入 `serve` 并完成真实 LiViS 文本闭环，异常路径/长时并发待验证 |
 | Codex `private-api-key` | daemon → stdio JSON-RPC → `codex app-server` | `<stateDir>/backends/codex/home` 中由 Codex 管理的专用 API key | 已实现的旧兼容路径；必须显式选择 |
-| Claude | 尚无 transport | 尚未定义 | `contract-only`；`execution.backend=claude` 可被配置解析，但 `serve` 明确失败关闭 |
+| Claude `native-current` | daemon → 每 job 独立 CLI `stream-json` 进程组 | Claude Code 当前本地 runtime；对 daemon 不透明 | `operator-only`；纯文本生产接线、离线门禁和原子切换已完成，真实 LiViS canary 待验证 |
 
 当前 `execution.backend` 是 daemon 级三选一配置；切换需要停服、排空异 backend 非终态 job
 并重启。它不是“同一 daemon 在线同时连接三个后端、每次请求只切路由”的最终形态。
@@ -51,9 +54,9 @@ flowchart LR
 | --- | --- | --- | --- |
 | LiViS access/refresh token | `livis-relayd` | 获取、刷新、撤销并以 `0600` 保存 | 终止 LiViS 连接并要求操作者重新登录 |
 | connector Bearer 与 lease | `livis-relayd` 和已审核 connector | 本机 IPC 鉴权与执行 fencing | 拒绝连接或迟到结果 |
-| Hermes 本地运行状态 | Hermes 原生 runtime | 不读取、不分类，直接调用 | 普通 backend failed |
-| Codex 本地运行状态 | Codex 原生 runtime | 不读取、不分类，直接调用 | 普通 backend failed |
-| Claude 本地运行状态 | Claude Code/SDK | 不读取、不分类，直接调用 | 普通 backend failed |
+| Hermes 本地运行状态 | Hermes 原生 runtime | 不读取、不分类，直接调用 | 权威 terminal 为普通 failed；无完整 terminal 则失败关闭 |
+| Codex 本地运行状态 | Codex 原生 runtime | 不读取、不分类，直接调用 | 权威 terminal 为普通 failed；无完整 terminal 则失败关闭 |
+| Claude 本地运行状态 | Claude Code/SDK | 不读取、不分类，直接调用 | 权威 terminal 为普通 failed；无完整 terminal 则失败关闭 |
 | 本地 session/thread ID | 对应 backend adapter | 作为不透明引用保存和回传 | 新建会话或失败关闭 |
 
 LiViS OAuth 与本地推理后端认证是两个独立安全域。backend adapter 不得导入 `IdaasClient`
@@ -70,7 +73,8 @@ daemon 和 backend adapter 必须遵守以下规则：
 4. 不通过 argv、环境变量、IPC payload、日志、SQLite 或错误详情传递后端 token。
 5. 不调用账号状态接口，不比较主体、登录方式或 provider 认证类型，也不把这些数据写入状态、日志或 SQLite。
 6. readiness 只描述 transport：`ready`、`offline` 或 `incompatible`。`ready` 不代表本地执行一定成功。
-7. 本地 backend 返回的错误按普通 failed 结算，不识别“认证不可用”，不据此阻止后续调用或隔离 session。
+7. 本地 backend 的权威 terminal error 按普通 failed 结算，不识别“认证不可用”，也不因错误内容
+   隔离 session；但提交后没有完整 terminal、协议漂移或进程收口不确定仍必须按执行可证明性隔离。
 8. 后端切换不得删除、覆盖或迁移任何后端的现有本地状态。
 9. 原生 adapter 记录 backend/transport 版本用于观测和漂移审计，但不能只因版本不同就判定不可用；
    readiness 应由实际 capability/协议握手裁决。只有已经证明某个精确版本存在不可安全兼容的行为时，
@@ -131,7 +135,7 @@ adapter 还必须提供断连事件通道；在这些字段和映射测试落地
 
 ### 7.1 当前收口状态
 
-- 本地状态不透明的静态声明、执行生命周期、持久 session coordinator、生产 adapter、显式模式路由与原子切换 CLI 已完成；提交可证明性、断连和 ambiguous execution 已映射到 `ExecutionBackend`。Claude 仍明确为 `contract-only`。
+- Codex 与 Claude 的本地状态不透明声明、执行生命周期、生产 adapter、显式模式路由与原子切换 CLI 已完成；提交可证明性、断连和 ambiguous execution 已映射到 `ExecutionBackend`。Claude 首版刻意使用 stateless-per-job，不宣称原生 session resume。
 - 当前只有 `bun run src/index.ts ...` 和 package script，没有安装后可直接调用的稳定 `livis-relay` / `livis-relayd` bin 入口。
 - 当前 `main` 使用 `livis-relay-v1-access-only-r2`，本地 S2 门禁已闭合；最终组合 head 的真实 Relay access-only canary 仍是正式启用阻塞项。
 - 旧 `worktree-arch-refactor` 的多 connector/outbox pump 原型假设与当前 JobStore v8、ExecutionBackend 和单 backend 失败关闭边界不同，只能作为设计输入，不能直接 cherry-pick。旧 Hermes 0.18.2 / connector v2 / 远程 `/sethome` 路线同样不得进入当前基线。
@@ -242,19 +246,27 @@ Codex Desktop 生命周期或状态、日常 Codex 仍可用，并核对同一 j
 
 ### 7.4 阶段 C：Claude adapter
 
-先做只读协议 PoC，再选择 Claude Code 的稳定非交互接口或官方 SDK；不能先假设 CLI 文本输出就是长期协议。
+首版已选择 Claude Code `--print --output-format stream-json` 的无状态纯文本路径。它不是把 CLI
+自由文本当稳定协议：启动前以 `--version + --help` 检查必需能力，执行期严格验证
+`system/init → result` 结构、安全回读与进程组收口。版本只作观察，不设固定窗口。
 
-工作包：
+已完成：
 
-1. 固定 transport identity 并记录版本，通过 capability/协议握手定义 initialize/readiness、invoke、
-   唯一 final、session ref、cancel、timeout 与进程收口语义；不设置仅凭版本差异失败的静态窗口。
-2. Claude 本地状态对 daemon 完全不透明：不执行登录、不接收 API key、不解析凭据文件、不调用账号状态接口。
-3. 为 Claude 子进程建立独立 runtime layout 和 spawn 环境白名单；禁止整体继承 daemon 的 `process.env`，显式清除 API key、OAuth token 和其他未审核凭据变量，只透传固定的非敏感 locale/terminal 与经审核路径。
-4. 将 Claude 事件映射到现有 job、lease、run generation、提交可证明性、append-only attempt ledger 与 disconnect/ambiguous execution 隔离，不识别账号错误，也不伪装成 Codex JSON-RPC。
-5. 覆盖成功、普通 backend failed、环境变量污染、超时、取消、崩溃、迟到事件、resume 和版本漂移；
-   版本漂移只有在 capability/协议行为实际不兼容时才失败，再完成受控本机 canary。
+1. 固定绝对 command 并记录观察版本；readiness 由必需安全 flag 与 `stream-json` 事件契约裁决。
+2. Claude 本地状态对 daemon 完全不透明：不执行登录、不接收 key、不解析状态文件、不调用账号接口。
+3. 建立 `<stateDir>/backends/claude/native-sessions/<hash>` 私有 layout；spawn 环境从空对象按
+   HOME、PATH、TMPDIR 和固定 locale/terminal 白名单重建，不整体继承 `process.env`。
+4. 固定 `safe-mode`、空 tools/MCP/skills/slash commands、`dontAsk` 与
+   `no-session-persistence`，并在 `system/init` 回读中再次验证。
+5. 把每次真实 `session_id` 映射为 attempt operation ID；job、lease、run generation、提交状态、
+   append-only ledger、取消和 disconnect 继续使用 JobStore v8 durable 语义。
+6. `backend switch claude`、`doctor` 和 `claude probe-native-cli` 已接入；dry-run/apply SHA 一致，
+   收据保持 `credentialsReadOrMigrated=false`。
 
-完成定义：transport、状态不透明边界和 session 恢复分别有证据后，才将 `claude_execution` 从 `unsupported` 提升；任一缺失都不能因“命令能返回文本”而标为已实现。
+当前 `claude_execution=operator-only`。尚未闭合的是：真实 LiViS App 文本 canary、本地错误态、
+取消/超时/崩溃长跑 canary，以及工具/编码和原生会话恢复。首版明确不提供 resume，因此不能用
+“单条命令返回文本”推导会话能力；详细边界和操作步骤见
+[Claude Code 原生当前状态后端](CLAUDE-NATIVE.md)。
 
 ### 7.5 阶段 D：稳定本地 CLI 与可观测面
 

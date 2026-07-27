@@ -62,6 +62,8 @@ describe("本地后端认证所有权边界", () => {
       "src/backends/codex/native-session-coordinator.ts",
       "src/backends/codex/native-session-harness.ts",
       "src/backends/codex/native-execution-backend.ts",
+      "src/backends/claude/native-cli.ts",
+      "src/backends/claude/native-execution-backend.ts",
     ]) {
       const source = await Bun.file(resolve(PROJECT_ROOT, path)).text();
       expect(source, `${path} 不得读取或绑定账号状态`).not.toMatch(
@@ -77,11 +79,17 @@ describe("本地后端认证所有权边界", () => {
       PROJECT_ROOT,
       "src/backends/codex/native-execution-backend.ts",
     )).text();
+    const claudeAdapter = await Bun.file(resolve(
+      PROJECT_ROOT,
+      "src/backends/claude/native-execution-backend.ts",
+    )).text();
     expect(daemon).toContain('dependencies.config.codex.mode === "native-current"');
     expect(daemon).toContain("new CodexNativeExecutionBackend");
+    expect(daemon).toContain("new ClaudeNativeExecutionBackend");
     expect(config).toContain("禁止在 native-current 与 private-api-key 之间静默选择");
     expect(adapter).not.toMatch(/CodexExecutionBackend|ensureCodexRuntimeLayout|buildCodexEnvironment/);
     expect(adapter).not.toMatch(/account\/read|credential_rejected|apiKey/);
+    expect(claudeAdapter).not.toMatch(/account\/read|credential_rejected|apiKey/);
     const manifest = await Bun.file(resolve(PROJECT_ROOT, "capabilities.json")).json() as {
       capabilities: Array<{ id: string; status: string }>;
       safetyDefaults: { nativeBackendCredentialReuse?: boolean };

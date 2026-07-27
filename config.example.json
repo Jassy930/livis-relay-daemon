@@ -48,5 +48,14 @@
     "interruptGraceMs": 5000,
     "shutdownTimeoutMs": 5000,
     "acknowledgeRemoteExecution": false
+  },
+  "claude": {
+    "mode": null,
+    "command": "claude",
+    "requestTimeoutMs": 30000,
+    "turnTimeoutMs": 900000,
+    "shutdownTimeoutMs": 5000,
+    "maxBudgetUsd": 0.05,
+    "acknowledgeRemoteExecution": false
   }
 }

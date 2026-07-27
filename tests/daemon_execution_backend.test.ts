@@ -44,6 +44,23 @@ class FakeCodexBackend implements ExecutionBackend {
   }
 }
 
+class FakeClaudeBackend implements ExecutionBackend {
+  readonly kind = "claude" as const;
+  ready = true;
+  executionId: string | null = "claude:native-test";
+  dispatched: StoredJob[] = [];
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  async dispatch(job: StoredJob): Promise<ExecutionSubmission> {
+    this.dispatched.push(job);
+    return "submitted";
+  }
+  async cancel(): Promise<ExecutionSubmission> { return "submitted"; }
+  status(): Record<string, unknown> {
+    return { kind: this.kind, ready: this.ready, executionId: this.executionId };
+  }
+}
+
 interface DaemonInternals {
   connector: { start(): void };
   executionBackend: ExecutionBackend;
@@ -178,6 +195,76 @@ function seedInactiveHermesTerminal(
 }
 
 describe("RelayDaemon execution backend 接线", () => {
+  test("Claude claim、accepted 与 final 复用 durable backend attempt 语义", async () => {
+    const fixture = await daemonFixture("livis-daemon-claude-durable-");
+    try {
+      const backend = new FakeClaudeBackend();
+      fixture.internals.executionBackend = backend;
+      fixture.internals.store.createLocalOpaqueBackendSession({
+        backend: "claude",
+        sessionKey: fixture.sessionKey,
+        sessionHash: "1".repeat(64),
+        threadId: "claude-stateless:test-anchor",
+        cwd: "/tmp/livis-daemon-claude-durable-workspace",
+        cliVersion: "claude-native-stateless-v1",
+        requestedModel: null,
+        effectiveModel: "native-current-opaque",
+        modelProvider: "claude-code-native-opaque",
+        securityConfigSha256: "2".repeat(64),
+        featureSnapshotSha256: "3".repeat(64),
+        checkpointTurnId: null,
+        checkpointTurnStatus: null,
+        checkpointTurnCount: 0,
+        checkpointTurnsSha256: sha256("[]"),
+        checkpointedAt: 1,
+      });
+      fixture.internals.store.ingest(
+        incomingJob("claude-daemon-job"),
+        fixture.sessionKey,
+        "claude",
+      );
+      fixture.internals.store.markAcked("claude-daemon-job");
+      await fixture.internals.dispatchPending();
+      const claimed = fixture.internals.store.require("claude-daemon-job");
+      expect(claimed).toMatchObject({
+        status: "Dispatching",
+        targetBackend: "claude",
+        connectorId: "claude:native-test",
+        runGeneration: 1,
+      });
+      await fixture.internals.onExecutionAccepted({
+        kind: "claude",
+        executionId: "claude:native-test",
+        jobId: claimed.jobId,
+        leaseId: claimed.leaseId!,
+        runGeneration: claimed.runGeneration,
+        turnId: "claude-turn-daemon",
+      });
+      await fixture.internals.onExecutionResult({
+        kind: "claude",
+        executionId: "claude:native-test",
+        jobId: claimed.jobId,
+        leaseId: claimed.leaseId!,
+        runGeneration: claimed.runGeneration,
+        turnId: "claude-turn-daemon",
+        text: "CLAUDE_DAEMON_OK",
+      });
+      expect(fixture.internals.store.require(claimed.jobId)).toMatchObject({
+        status: "Succeeded",
+        outbox: { status: "Pending" },
+      });
+      expect(fixture.internals.store.latestExecutionAttemptEvent(claimed.jobId)).toMatchObject({
+        backend: "claude",
+        providerSessionId: "claude-stateless:test-anchor",
+        providerOperationId: "claude-turn-daemon",
+        eventType: "succeeded",
+        stateOwnership: "local-state-opaque",
+        accountType: null,
+      });
+    } finally {
+      await fixture.cleanup();
+    }
+  });
   test("native-current 显式路由到本地状态不透明 adapter", async () => {
     const directory = await temporaryDirectory("livis-daemon-native-route-");
     const profile = await testProfile();
